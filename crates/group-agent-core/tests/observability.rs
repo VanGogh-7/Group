@@ -8,6 +8,7 @@ use group_agent_core::{
     GraphState, Node, NodeContext, NodeError, NodeId, RouteError, RunConfig, RunFailure, START,
     StateError, StateGraph,
 };
+use tokio::sync::Notify;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum FailureMode {
@@ -178,6 +179,21 @@ async fn disabling_retention_leaves_report_empty_while_sink_receives_events() {
 }
 
 #[tokio::test]
+async fn disabling_retention_without_a_sink_returns_an_empty_event_report() {
+    let report = observed_graph()
+        .invoke_with_events(
+            ObservedState::default(),
+            RunConfig::default(),
+            EventConfig::new(EventRetention::None),
+        )
+        .await
+        .expect("run should succeed");
+
+    assert!(report.events().is_empty());
+    assert_eq!(report.final_state().value, 1);
+}
+
+#[tokio::test]
 async fn every_runtime_failure_emits_partial_events_then_run_failed() {
     let compiled = observed_graph();
     let cases = [
@@ -272,38 +288,137 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
     }
 }
 
+#[derive(Debug)]
+struct InterleaveState {
+    value: usize,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl GraphState for InterleaveState {
+    type Update = Increment;
+
+    fn apply(&mut self, Increment: Self::Update) -> Result<(), StateError> {
+        self.value += 1;
+        Ok(())
+    }
+}
+
+struct InterleaveNode;
+
+#[async_trait]
+impl Node<InterleaveState> for InterleaveNode {
+    async fn run(
+        &self,
+        state: &InterleaveState,
+        _context: &NodeContext,
+    ) -> Result<Increment, NodeError> {
+        state.started.notify_one();
+        state.release.notified().await;
+        Ok(Increment)
+    }
+}
+
+fn interleaving_graph() -> CompiledGraph<InterleaveState> {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node("interleave", InterleaveNode)
+        .expect("node should register");
+    graph
+        .add_edge(START, "interleave")
+        .add_edge("interleave", END);
+    graph.compile().expect("graph should compile")
+}
+
 #[tokio::test]
-async fn concurrent_runs_using_one_sink_remain_distinguishable() {
-    let compiled = Arc::new(observed_graph());
+async fn concurrent_runs_using_one_sink_are_deterministically_interleaved() {
+    let compiled = Arc::new(interleaving_graph());
     let sink = Arc::new(RecordingSink::default());
     let config = event_config(EventRetention::None, &sink);
+    let first_started = Arc::new(Notify::new());
+    let first_release = Arc::new(Notify::new());
+    let second_started = Arc::new(Notify::new());
+    let second_release = Arc::new(Notify::new());
 
-    let (first, second) = tokio::join!(
-        compiled.invoke_with_events(
-            ObservedState::default(),
-            RunConfig::default(),
-            config.clone(),
-        ),
-        compiled.invoke_with_events(
-            ObservedState {
-                value: 40,
-                failure: FailureMode::None,
-            },
-            RunConfig::default(),
-            config,
-        )
+    let first = {
+        let compiled = Arc::clone(&compiled);
+        let started = Arc::clone(&first_started);
+        let release = Arc::clone(&first_release);
+        let config = config.clone();
+        tokio::spawn(async move {
+            compiled
+                .invoke_with_events(
+                    InterleaveState {
+                        value: 0,
+                        started,
+                        release,
+                    },
+                    RunConfig::default(),
+                    config,
+                )
+                .await
+        })
+    };
+    first_started.notified().await;
+    let after_first_started = sink.snapshot();
+    assert_eq!(
+        event_kinds(&after_first_started),
+        ["run_started", "node_started"]
     );
-    let first = first.expect("first run should succeed");
-    let second = second.expect("second run should succeed");
+    let first_run_id = after_first_started[0].run_id();
 
-    assert_ne!(first.run_id(), second.run_id());
+    let second = {
+        let compiled = Arc::clone(&compiled);
+        let started = Arc::clone(&second_started);
+        let release = Arc::clone(&second_release);
+        tokio::spawn(async move {
+            compiled
+                .invoke_with_events(
+                    InterleaveState {
+                        value: 40,
+                        started,
+                        release,
+                    },
+                    RunConfig::default(),
+                    config,
+                )
+                .await
+        })
+    };
+    second_started.notified().await;
+    let interleaved = sink.snapshot();
+    assert_eq!(
+        event_kinds(&interleaved),
+        ["run_started", "node_started", "run_started", "node_started",]
+    );
+    let second_run_id = interleaved[2].run_id();
+    assert_ne!(first_run_id, second_run_id);
+    assert_eq!(interleaved[1].run_id(), first_run_id);
+    assert_eq!(interleaved[3].run_id(), second_run_id);
+
+    first_release.notify_one();
+    let first = first
+        .await
+        .expect("first task should not panic")
+        .expect("first run should succeed");
+    assert_eq!(first.run_id(), first_run_id);
+    assert_eq!(first.final_state().value, 1);
+
+    second_release.notify_one();
+    let second = second
+        .await
+        .expect("second task should not panic")
+        .expect("second run should succeed");
+    assert_eq!(second.run_id(), second_run_id);
+    assert_eq!(second.final_state().value, 41);
+
     let events = sink.snapshot();
-    for run_id in [first.run_id(), second.run_id()] {
+    for run_id in [first_run_id, second_run_id] {
         let run_events = events
             .iter()
             .filter(|event| event.run_id() == run_id)
             .collect::<Vec<_>>();
-        assert_eq!(run_events.len(), 6);
+        assert_eq!(run_events.len(), 5);
         assert!(matches!(
             run_events.first(),
             Some(GraphEvent::RunStarted { .. })
@@ -313,7 +428,23 @@ async fn concurrent_runs_using_one_sink_remain_distinguishable() {
             Some(GraphEvent::RunCompleted { .. })
         ));
     }
-    assert_eq!(events.len(), 12);
+    assert_eq!(events.len(), 10);
+}
+
+#[tokio::test]
+#[should_panic(expected = "sink panic")]
+async fn sink_panic_propagates_directly() {
+    let sink: Arc<dyn EventSink> = Arc::new(|_event: &GraphEvent| {
+        panic!("sink panic");
+    });
+
+    let _ = observed_graph()
+        .invoke_with_events(
+            ObservedState::default(),
+            RunConfig::default(),
+            EventConfig::new(EventRetention::None).with_sink(sink),
+        )
+        .await;
 }
 
 #[tokio::test]

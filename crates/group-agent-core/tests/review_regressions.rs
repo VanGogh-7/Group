@@ -70,10 +70,12 @@ impl std::error::Error for TestCause {}
 
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_clone<T: Clone>() {}
+fn assert_clone_eq<T: Clone + Eq + PartialEq>() {}
 
 #[test]
 fn compiled_graph_is_send_and_sync() {
     assert_send_sync::<CompiledGraph<RunState>>();
+    assert_clone_eq::<NodeContext>();
 }
 
 #[test]

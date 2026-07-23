@@ -13,7 +13,7 @@ mod node;
 mod runtime;
 mod state;
 
-pub use context::{NodeContext, RunConfig};
+pub use context::{NodeContext, RunConfig, RunControl};
 pub use edge::{END, NodeId, START};
 pub use error::{
     GraphBuildError, GraphCompileError, GraphRunError, NodeError, RouteError, StateError,

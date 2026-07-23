@@ -1,12 +1,14 @@
 use std::hint::black_box;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use criterion::{Criterion, criterion_group, criterion_main};
 use group_agent_core::{
-    CompiledGraph, END, GraphState, Node, NodeContext, NodeError, NodeId, START, StateError,
-    StateGraph,
+    CompiledGraph, END, EventConfig, EventRetention, GraphState, Node, NodeContext, NodeError,
+    NodeId, RunConfig, RunControl, START, StateError, StateGraph,
 };
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct BenchState {
@@ -94,6 +96,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let conditional_1_000 = conditional_loop_graph();
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
+    let uncancelled_token = CancellationToken::new();
 
     criterion.bench_function("compile_fixed_linear_100_nodes", |bencher| {
         bencher.iter(|| {
@@ -115,10 +118,54 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         });
     });
 
-    criterion.bench_function("fixed_linear_10_nodes", |bencher| {
+    criterion.bench_function("invoke_default_no_control_10_nodes", |bencher| {
         bencher.to_async(&runtime).iter(|| async {
             let report = fixed_10
                 .invoke(BenchState::default())
+                .await
+                .expect("benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("invoke_uncancelled_token_10_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = fixed_10
+                .invoke_with_control(
+                    BenchState::default(),
+                    RunConfig::default(),
+                    EventConfig::default(),
+                    RunControl::new().with_cancellation_token(uncancelled_token.clone()),
+                )
+                .await
+                .expect("benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("invoke_no_retention_no_sink_10_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = fixed_10
+                .invoke_with_events(
+                    BenchState::default(),
+                    RunConfig::default(),
+                    EventConfig::new(EventRetention::None),
+                )
+                .await
+                .expect("benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("invoke_node_timeout_immediate_10_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = fixed_10
+                .invoke_with_control(
+                    BenchState::default(),
+                    RunConfig::default(),
+                    EventConfig::default(),
+                    RunControl::new().with_node_timeout(Duration::from_secs(1)),
+                )
                 .await
                 .expect("benchmark invocation should succeed");
             black_box(report.steps());

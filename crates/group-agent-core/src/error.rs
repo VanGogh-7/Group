@@ -1,8 +1,9 @@
 use std::error::Error as StdError;
+use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::NodeId;
+use crate::{NodeId, RunId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -140,6 +141,29 @@ define_source_error!(
 /// An error raised during graph execution.
 #[derive(Debug, Error)]
 pub enum GraphRunError {
+    /// Cancellation was requested for the invocation.
+    #[error("run `{run_id}` was cancelled at step {step} near node {node_id:?}")]
+    Cancelled {
+        run_id: RunId,
+        node_id: Option<NodeId>,
+        step: usize,
+    },
+    /// The configured run timeout elapsed.
+    #[error("run `{run_id}` timed out after {timeout:?} at step {step} near node {node_id:?}")]
+    RunTimedOut {
+        run_id: RunId,
+        timeout: Duration,
+        node_id: Option<NodeId>,
+        step: usize,
+    },
+    /// The configured timeout for one node elapsed.
+    #[error("node `{node_id}` in run `{run_id}` timed out after {timeout:?} at step {step}")]
+    NodeTimedOut {
+        run_id: RunId,
+        timeout: Duration,
+        node_id: NodeId,
+        step: usize,
+    },
     /// The configured step limit was reached before `END`.
     #[error(
         "maximum step count {max_steps} reached before executing node `{node_id}` at step {step}"

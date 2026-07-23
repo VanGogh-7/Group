@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::NodeId;
 
@@ -91,6 +92,10 @@ impl EventConfig {
     pub(crate) fn sink(&self) -> Option<&dyn EventSink> {
         self.sink.as_deref()
     }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.retention == EventRetention::All || self.sink.is_some()
+    }
 }
 
 impl Default for EventConfig {
@@ -116,6 +121,23 @@ impl fmt::Debug for EventConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RunFailure {
+    /// Cancellation was requested for the invocation.
+    Cancelled {
+        node_id: Option<NodeId>,
+        step: usize,
+    },
+    /// The configured run timeout elapsed.
+    RunTimedOut {
+        timeout: Duration,
+        node_id: Option<NodeId>,
+        step: usize,
+    },
+    /// The configured timeout for one node elapsed.
+    NodeTimedOut {
+        timeout: Duration,
+        node_id: NodeId,
+        step: usize,
+    },
     /// The next node would exceed the configured step limit.
     MaxStepsExceeded {
         max_steps: usize,

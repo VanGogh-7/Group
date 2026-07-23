@@ -17,7 +17,13 @@ criterion = { version = "0.7.0", default-features = false, features = [
 indexmap = "2.14.0"
 petgraph = "0.8.3"
 thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
 tracing = "0.1.44"
 
 [workspace.lints.rust]

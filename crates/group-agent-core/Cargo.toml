@@ -11,11 +11,13 @@ async-trait.workspace = true
 indexmap.workspace = true
 petgraph.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "runtime"
