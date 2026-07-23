@@ -100,35 +100,45 @@ async fn linear_graph_executes_in_edge_order_and_applies_updates() {
         report.visited_nodes(),
         [NodeId::from("first"), NodeId::from("second")]
     );
+    let run_id = report.run_id();
     assert_eq!(
         report.events(),
         [
-            GraphEvent::RunStarted { max_steps: 1_000 },
+            GraphEvent::RunStarted {
+                run_id,
+                max_steps: 1_000,
+            },
             GraphEvent::NodeStarted {
+                run_id,
                 node_id: NodeId::from("first"),
                 step: 1,
             },
             GraphEvent::NodeCompleted {
+                run_id,
                 node_id: NodeId::from("first"),
                 step: 1,
             },
             GraphEvent::StateUpdated {
+                run_id,
                 node_id: NodeId::from("first"),
                 step: 1,
             },
             GraphEvent::NodeStarted {
+                run_id,
                 node_id: NodeId::from("second"),
                 step: 2,
             },
             GraphEvent::NodeCompleted {
+                run_id,
                 node_id: NodeId::from("second"),
                 step: 2,
             },
             GraphEvent::StateUpdated {
+                run_id,
                 node_id: NodeId::from("second"),
                 step: 2,
             },
-            GraphEvent::RunCompleted { steps: 2 },
+            GraphEvent::RunCompleted { run_id, steps: 2 },
         ]
     );
 }
@@ -188,7 +198,7 @@ async fn node_error_preserves_node_id_and_step() {
         Err(GraphRunError::NodeFailed {
             node_id,
             step: 1,
-            source: NodeError::Failed { message },
-        }) if node_id == NodeId::from("fails") && message == "intentional failure"
+            source,
+        }) if node_id == NodeId::from("fails") && source.as_message() == "intentional failure"
     ));
 }

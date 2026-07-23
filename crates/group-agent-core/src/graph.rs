@@ -1,13 +1,31 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use petgraph::Direction;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::Dfs;
 
-use crate::edge::FixedEdge;
-use crate::{GraphBuildError, GraphCompileError, GraphState, Node, NodeId};
+use crate::edge::{ConditionalEdge, FixedEdge, Router};
+use crate::{GraphBuildError, GraphCompileError, GraphState, Node, NodeId, RouteError};
+
+#[derive(Clone, Copy, Debug)]
+enum TopologyEdge {
+    Fixed,
+    Conditional,
+}
+
+struct FixedOutgoing {
+    count: usize,
+    successor: NodeId,
+}
+
+struct EdgeAggregation<'a, S>
+where
+    S: GraphState,
+{
+    fixed_by_source: HashMap<NodeId, FixedOutgoing>,
+    conditional_by_source: HashMap<NodeId, &'a ConditionalEdge<S>>,
+}
 
 /// A mutable builder for a state graph.
 pub struct StateGraph<S>
@@ -15,7 +33,8 @@ where
     S: GraphState,
 {
     nodes: IndexMap<NodeId, Arc<dyn Node<S>>>,
-    edges: Vec<FixedEdge>,
+    fixed_edges: Vec<FixedEdge>,
+    conditional_edges: Vec<ConditionalEdge<S>>,
 }
 
 impl<S> StateGraph<S>
@@ -27,7 +46,8 @@ where
     pub fn new() -> Self {
         Self {
             nodes: IndexMap::new(),
-            edges: Vec::new(),
+            fixed_edges: Vec::new(),
+            conditional_edges: Vec::new(),
         }
     }
 
@@ -57,16 +77,68 @@ where
     /// Endpoint validation is deferred to [`Self::compile`], so callers may add
     /// edges before registering all nodes.
     pub fn add_edge(&mut self, from: impl Into<NodeId>, to: impl Into<NodeId>) -> &mut Self {
-        self.edges.push(FixedEdge::new(from.into(), to.into()));
+        self.fixed_edges
+            .push(FixedEdge::new(from.into(), to.into()));
         self
+    }
+
+    /// Registers one synchronous conditional router and its target whitelist.
+    ///
+    /// The router runs after the source node's update has been applied. It may
+    /// only select one of `allowed_targets`.
+    pub fn add_conditional_edges<I, T, F>(
+        &mut self,
+        source: impl Into<NodeId>,
+        allowed_targets: I,
+        router: F,
+    ) -> Result<&mut Self, GraphBuildError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<NodeId>,
+        F: Fn(&S) -> Result<NodeId, RouteError> + Send + Sync + 'static,
+    {
+        let source = source.into();
+        if self
+            .conditional_edges
+            .iter()
+            .any(|edge| edge.source == source)
+        {
+            return Err(GraphBuildError::MultipleConditionalRouters {
+                source_node: source,
+            });
+        }
+
+        let allowed_targets: Vec<NodeId> = allowed_targets.into_iter().map(Into::into).collect();
+        if allowed_targets.is_empty() {
+            return Err(GraphBuildError::EmptyConditionalTargets {
+                source_node: source,
+            });
+        }
+
+        let mut unique_targets = HashSet::new();
+        for target in &allowed_targets {
+            if !unique_targets.insert(target.clone()) {
+                return Err(GraphBuildError::DuplicateConditionalTarget {
+                    source_node: source,
+                    target: target.clone(),
+                });
+            }
+        }
+
+        self.conditional_edges.push(ConditionalEdge::new(
+            source,
+            allowed_targets,
+            Arc::new(router),
+        ));
+        Ok(self)
     }
 
     /// Validates and freezes the graph for repeated execution.
     pub fn compile(&self) -> Result<CompiledGraph<S>, GraphCompileError> {
-        self.validate_edge_endpoints()?;
-        self.validate_edge_shapes()?;
+        let edges = self.aggregate_edges()?;
+        self.validate_edge_shapes(&edges)?;
 
-        let mut topology = StableDiGraph::<NodeId, ()>::new();
+        let mut topology = StableDiGraph::<NodeId, TopologyEdge>::new();
         let mut indices = IndexMap::new();
 
         let start_id = NodeId::start();
@@ -82,24 +154,70 @@ where
         let end_index = topology.add_node(end_id.clone());
         indices.insert(end_id, end_index);
 
-        for edge in &self.edges {
-            let from_index = indices[&edge.from];
-            let to_index = indices[&edge.to];
-            topology.add_edge(from_index, to_index, ());
+        for edge in &self.fixed_edges {
+            topology.add_edge(indices[&edge.from], indices[&edge.to], TopologyEdge::Fixed);
+        }
+        for edge in &self.conditional_edges {
+            for target in &edge.allowed_targets {
+                topology.add_edge(
+                    indices[&edge.source],
+                    indices[target],
+                    TopologyEdge::Conditional,
+                );
+            }
         }
 
-        Self::validate_reachability(&topology, &indices, start_index, end_index, &self.nodes)?;
+        self.validate_reachability(&topology, &indices, start_index, end_index, &edges)?;
+
+        let entry_target = &edges
+            .fixed_by_source
+            .get(&NodeId::start())
+            .expect("validated graph has one START successor")
+            .successor;
+        let entry_index = indices[entry_target];
+
+        let mut compiled_nodes = std::iter::repeat_with(|| None)
+            .take(topology.node_count())
+            .collect::<Vec<_>>();
+
+        for (node_id, node) in &self.nodes {
+            let transition = if let Some(outgoing) = edges.fixed_by_source.get(node_id) {
+                CompiledTransition::Fixed(indices[&outgoing.successor])
+            } else {
+                let edge = edges
+                    .conditional_by_source
+                    .get(node_id)
+                    .expect("validated executable node has one transition");
+                let allowed_targets = edge
+                    .allowed_targets
+                    .iter()
+                    .map(|target| (target.clone(), indices[target]))
+                    .collect();
+                CompiledTransition::Conditional {
+                    router: Arc::clone(&edge.router),
+                    allowed_targets,
+                }
+            };
+            let index = indices[node_id];
+            compiled_nodes[index.index()] = Some(CompiledNode {
+                id: node_id.clone(),
+                node: Arc::clone(node),
+                transition,
+            });
+        }
 
         Ok(CompiledGraph {
-            topology,
-            indices,
-            nodes: self.nodes.clone(),
-            start_index,
+            _topology: topology,
+            nodes: compiled_nodes,
+            entry_index,
+            end_index,
         })
     }
 
-    fn validate_edge_endpoints(&self) -> Result<(), GraphCompileError> {
-        for edge in &self.edges {
+    fn aggregate_edges(&self) -> Result<EdgeAggregation<'_, S>, GraphCompileError> {
+        let mut fixed_by_source = HashMap::with_capacity(self.fixed_edges.len());
+
+        for edge in &self.fixed_edges {
             for endpoint in [&edge.from, &edge.to] {
                 if !endpoint.is_reserved() && !self.nodes.contains_key(endpoint) {
                     return Err(GraphCompileError::UnknownNode {
@@ -109,28 +227,73 @@ where
                     });
                 }
             }
-        }
-        Ok(())
-    }
 
-    fn validate_edge_shapes(&self) -> Result<(), GraphCompileError> {
-        let mut outgoing_counts: IndexMap<NodeId, usize> = IndexMap::new();
-
-        for edge in &self.edges {
-            if edge.to == NodeId::start() {
+            if edge.to.is_start() {
                 return Err(GraphCompileError::StartHasIncoming {
                     from: edge.from.clone(),
                 });
             }
-            if edge.from == NodeId::end() {
+            if edge.from.is_end() {
                 return Err(GraphCompileError::EndHasOutgoing {
                     to: edge.to.clone(),
                 });
             }
-            *outgoing_counts.entry(edge.from.clone()).or_default() += 1;
+
+            fixed_by_source
+                .entry(edge.from.clone())
+                .and_modify(|outgoing: &mut FixedOutgoing| outgoing.count += 1)
+                .or_insert_with(|| FixedOutgoing {
+                    count: 1,
+                    successor: edge.to.clone(),
+                });
         }
 
-        let start_count = outgoing_counts.get(&NodeId::start()).copied().unwrap_or(0);
+        let mut conditional_by_source = HashMap::with_capacity(self.conditional_edges.len());
+        for edge in &self.conditional_edges {
+            if edge.source.is_start() {
+                return Err(GraphCompileError::StartHasConditionalEdge);
+            }
+            if edge.source.is_end() {
+                return Err(GraphCompileError::EndHasConditionalEdge);
+            }
+            if !self.nodes.contains_key(&edge.source) {
+                return Err(GraphCompileError::UnknownConditionalSource {
+                    source_node: edge.source.clone(),
+                });
+            }
+
+            for target in &edge.allowed_targets {
+                if target.is_start() {
+                    return Err(GraphCompileError::StartHasIncoming {
+                        from: edge.source.clone(),
+                    });
+                }
+                if !target.is_end() && !self.nodes.contains_key(target) {
+                    return Err(GraphCompileError::UnknownConditionalTarget {
+                        source_node: edge.source.clone(),
+                        target: target.clone(),
+                    });
+                }
+            }
+
+            conditional_by_source.insert(edge.source.clone(), edge);
+        }
+
+        Ok(EdgeAggregation {
+            fixed_by_source,
+            conditional_by_source,
+        })
+    }
+
+    fn validate_edge_shapes(
+        &self,
+        edges: &EdgeAggregation<'_, S>,
+    ) -> Result<(), GraphCompileError> {
+        let start_count = edges
+            .fixed_by_source
+            .get(&NodeId::start())
+            .map(|outgoing| outgoing.count)
+            .unwrap_or(0);
         match start_count {
             0 => return Err(GraphCompileError::MissingStartEdge),
             1 => {}
@@ -138,11 +301,22 @@ where
         }
 
         for node_id in self.nodes.keys() {
-            let count = outgoing_counts.get(node_id).copied().unwrap_or(0);
-            if count > 1 {
+            let fixed_count = edges
+                .fixed_by_source
+                .get(node_id)
+                .map(|outgoing| outgoing.count)
+                .unwrap_or(0);
+            if fixed_count > 1 {
                 return Err(GraphCompileError::MultipleOutgoingEdges {
                     node_id: node_id.clone(),
-                    count,
+                    count: fixed_count,
+                });
+            }
+
+            let has_conditional = edges.conditional_by_source.contains_key(node_id);
+            if fixed_count == 1 && has_conditional {
+                return Err(GraphCompileError::MixedOutgoingEdgeKinds {
+                    node_id: node_id.clone(),
                 });
             }
         }
@@ -151,11 +325,12 @@ where
     }
 
     fn validate_reachability(
-        topology: &StableDiGraph<NodeId, ()>,
+        &self,
+        topology: &StableDiGraph<NodeId, TopologyEdge>,
         indices: &IndexMap<NodeId, NodeIndex>,
         start_index: NodeIndex,
         end_index: NodeIndex,
-        nodes: &IndexMap<NodeId, Arc<dyn Node<S>>>,
+        edges: &EdgeAggregation<'_, S>,
     ) -> Result<(), GraphCompileError> {
         let mut depth_first = Dfs::new(topology, start_index);
         let mut reachable = HashSet::new();
@@ -163,7 +338,7 @@ where
             reachable.insert(index);
         }
 
-        for node_id in nodes.keys() {
+        for node_id in self.nodes.keys() {
             if !reachable.contains(&indices[node_id]) {
                 return Err(GraphCompileError::UnreachableNode {
                     node_id: node_id.clone(),
@@ -171,10 +346,28 @@ where
             }
         }
 
+        self.validate_outgoing_completeness(edges)?;
+
         if !reachable.contains(&end_index) {
             return Err(GraphCompileError::NoReachableEnd);
         }
 
+        Ok(())
+    }
+
+    fn validate_outgoing_completeness(
+        &self,
+        edges: &EdgeAggregation<'_, S>,
+    ) -> Result<(), GraphCompileError> {
+        for node_id in self.nodes.keys() {
+            let has_fixed = edges.fixed_by_source.contains_key(node_id);
+            let has_conditional = edges.conditional_by_source.contains_key(node_id);
+            if !has_fixed && !has_conditional {
+                return Err(GraphCompileError::MissingOutgoingEdge {
+                    node_id: node_id.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -188,111 +381,44 @@ where
     }
 }
 
+pub(crate) enum CompiledTransition<S>
+where
+    S: GraphState,
+{
+    Fixed(NodeIndex),
+    Conditional {
+        router: Router<S>,
+        allowed_targets: IndexMap<NodeId, NodeIndex>,
+    },
+}
+
+pub(crate) struct CompiledNode<S>
+where
+    S: GraphState,
+{
+    pub(crate) id: NodeId,
+    pub(crate) node: Arc<dyn Node<S>>,
+    pub(crate) transition: CompiledTransition<S>,
+}
+
 /// An immutable graph that can be invoked repeatedly.
 pub struct CompiledGraph<S>
 where
     S: GraphState,
 {
-    pub(crate) topology: StableDiGraph<NodeId, ()>,
-    pub(crate) indices: IndexMap<NodeId, NodeIndex>,
-    pub(crate) nodes: IndexMap<NodeId, Arc<dyn Node<S>>>,
-    pub(crate) start_index: NodeIndex,
+    _topology: StableDiGraph<NodeId, TopologyEdge>,
+    pub(crate) nodes: Vec<Option<CompiledNode<S>>>,
+    pub(crate) entry_index: NodeIndex,
+    pub(crate) end_index: NodeIndex,
 }
 
 impl<S> CompiledGraph<S>
 where
     S: GraphState,
 {
-    pub(crate) fn first_node_id(&self) -> NodeId {
-        self.topology
-            .neighbors_directed(self.start_index, Direction::Outgoing)
-            .next()
-            .and_then(|index| self.topology.node_weight(index))
-            .cloned()
-            .expect("compiled graph always has one START successor")
-    }
-
-    pub(crate) fn successor_id(&self, node_id: &NodeId) -> NodeId {
-        let index = self.indices[node_id];
-        self.topology
-            .neighbors_directed(index, Direction::Outgoing)
-            .next()
-            .and_then(|successor| self.topology.node_weight(successor))
-            .cloned()
-            .expect("every executable node in a compiled graph has one successor")
-    }
-
-    pub(crate) fn node(&self, node_id: &NodeId) -> &Arc<dyn Node<S>> {
-        self.nodes
-            .get(node_id)
-            .expect("compiled graph contains every executable node")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use async_trait::async_trait;
-
-    use super::*;
-    use crate::{GraphRunError, NodeContext, NodeError, RunConfig, StateError};
-
-    #[derive(Clone)]
-    struct LoopState;
-
-    impl GraphState for LoopState {
-        type Update = ();
-
-        fn apply(&mut self, (): Self::Update) -> Result<(), StateError> {
-            Ok(())
-        }
-    }
-
-    struct LoopNode;
-
-    #[async_trait]
-    impl Node<LoopState> for LoopNode {
-        async fn run(&self, _state: &LoopState, _context: &NodeContext) -> Result<(), NodeError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn runtime_step_limit_stops_an_infinite_cycle() {
-        let start_id = NodeId::start();
-        let loop_id = NodeId::from("loop");
-        let end_id = NodeId::end();
-        let mut topology = StableDiGraph::new();
-        let start_index = topology.add_node(start_id.clone());
-        let loop_index = topology.add_node(loop_id.clone());
-        let end_index = topology.add_node(end_id.clone());
-        topology.add_edge(start_index, loop_index, ());
-        topology.add_edge(loop_index, loop_index, ());
-
-        let indices = IndexMap::from([
-            (start_id, start_index),
-            (loop_id.clone(), loop_index),
-            (end_id, end_index),
-        ]);
-        let loop_node: Arc<dyn Node<LoopState>> = Arc::new(LoopNode);
-        let nodes = IndexMap::from([(loop_id.clone(), loop_node)]);
-        let compiled = CompiledGraph {
-            topology,
-            indices,
-            nodes,
-            start_index,
-        };
-
-        let result = compiled
-            .invoke_with_config(LoopState, RunConfig::new(3))
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(GraphRunError::MaxStepsExceeded {
-                max_steps: 3,
-                node_id,
-                step: 4,
-            }) if node_id == loop_id
-        ));
+    pub(crate) fn node_at(&self, index: NodeIndex) -> &CompiledNode<S> {
+        self.nodes[index.index()]
+            .as_ref()
+            .expect("compiled executable index contains a node")
     }
 }

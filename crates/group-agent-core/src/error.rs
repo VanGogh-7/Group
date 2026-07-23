@@ -1,9 +1,13 @@
+use std::error::Error as StdError;
+
 use thiserror::Error;
 
 use crate::NodeId;
 
+type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
+
 /// An error raised while modifying a graph builder.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphBuildError {
     /// A node identifier was registered more than once.
     #[error("node `{node_id}` is already registered")]
@@ -11,79 +15,130 @@ pub enum GraphBuildError {
     /// A normal node attempted to use a reserved identifier.
     #[error("node identifier `{node_id}` is reserved")]
     ReservedNodeId { node_id: NodeId },
+    /// A conditional edge declared no possible target.
+    #[error("conditional edge from `{source_node}` must declare at least one allowed target")]
+    EmptyConditionalTargets { source_node: NodeId },
+    /// A conditional edge declared the same target more than once.
+    #[error("conditional edge from `{source_node}` declares duplicate target `{target}`")]
+    DuplicateConditionalTarget { source_node: NodeId, target: NodeId },
+    /// A source attempted to register more than one conditional router.
+    #[error("node `{source_node}` already has a conditional router")]
+    MultipleConditionalRouters { source_node: NodeId },
 }
 
 /// An error found while compiling graph topology.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphCompileError {
-    /// An edge endpoint does not name a registered or reserved node.
+    /// A fixed edge endpoint does not name a registered or reserved node.
     #[error("edge `{from}` -> `{to}` references unknown node `{node_id}`")]
     UnknownNode {
         from: NodeId,
         to: NodeId,
         node_id: NodeId,
     },
-    /// `START` has no outgoing edge.
-    #[error("START must have exactly one outgoing edge")]
+    /// A conditional edge source is not a registered normal node.
+    #[error("conditional edge source `{source_node}` is not a registered node")]
+    UnknownConditionalSource { source_node: NodeId },
+    /// A conditional target does not name a registered node or `END`.
+    #[error("conditional edge from `{source_node}` references unknown target `{target}`")]
+    UnknownConditionalTarget { source_node: NodeId, target: NodeId },
+    /// `START` has no outgoing fixed edge.
+    #[error("START must have exactly one outgoing fixed edge")]
     MissingStartEdge,
     /// `START` has an incoming edge.
     #[error("START cannot have an incoming edge from `{from}`")]
     StartHasIncoming { from: NodeId },
-    /// `END` has an outgoing edge.
+    /// `START` attempted to use conditional routing.
+    #[error("START cannot have a conditional edge")]
+    StartHasConditionalEdge,
+    /// `END` has a fixed outgoing edge.
     #[error("END cannot have an outgoing edge to `{to}`")]
     EndHasOutgoing { to: NodeId },
-    /// `START` has more than one outgoing edge.
-    #[error("START has {count} outgoing edges; exactly one is allowed")]
+    /// `END` attempted to use conditional routing.
+    #[error("END cannot have a conditional edge")]
+    EndHasConditionalEdge,
+    /// `START` has more than one fixed outgoing edge.
+    #[error("START has {count} outgoing fixed edges; exactly one is allowed")]
     MultipleStartEdges { count: usize },
     /// A normal node has more than one fixed successor.
     #[error("node `{node_id}` has {count} outgoing fixed edges; at most one is allowed")]
     MultipleOutgoingEdges { node_id: NodeId, count: usize },
+    /// A node has both fixed and conditional routing.
+    #[error("node `{node_id}` cannot have both fixed and conditional outgoing edges")]
+    MixedOutgoingEdgeKinds { node_id: NodeId },
+    /// A reachable normal node has no successor.
+    #[error("node `{node_id}` has no outgoing fixed or conditional edge")]
+    MissingOutgoingEdge { node_id: NodeId },
     /// A registered node cannot be reached from `START`.
     #[error("node `{node_id}` is unreachable from START")]
     UnreachableNode { node_id: NodeId },
-    /// No directed path from `START` reaches `END`.
+    /// No possible directed route from `START` reaches `END`.
     #[error("END is not reachable from START")]
     NoReachableEnd,
 }
 
-/// An error returned by a node implementation.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum NodeError {
-    /// A node-specific failure with a human-readable message.
-    #[error("{message}")]
-    Failed { message: String },
-}
-
-impl NodeError {
-    /// Creates a node failure.
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self::Failed {
-            message: message.into(),
+macro_rules! define_source_error {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Error)]
+        #[error("{message}")]
+        pub struct $name {
+            message: String,
+            #[source]
+            source: Option<BoxedError>,
         }
-    }
-}
 
-/// An error produced while applying a state update.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum StateError {
-    /// The state rejected an update.
-    #[error("{message}")]
-    UpdateRejected { message: String },
-}
+        impl $name {
+            /// Creates an error containing only a message.
+            #[must_use]
+            pub fn message(message: impl Into<String>) -> Self {
+                Self {
+                    message: message.into(),
+                    source: None,
+                }
+            }
 
-impl StateError {
-    /// Creates an update rejection.
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self::UpdateRejected {
-            message: message.into(),
+            /// Creates an error that preserves an underlying source error.
+            #[must_use]
+            pub fn with_source<E>(message: impl Into<String>, source: E) -> Self
+            where
+                E: Into<Box<dyn StdError + Send + Sync + 'static>>,
+            {
+                Self {
+                    message: message.into(),
+                    source: Some(source.into()),
+                }
+            }
+
+            /// Creates a message-only error.
+            ///
+            /// This is a compatibility alias for [`Self::message`].
+            #[must_use]
+            pub fn new(message: impl Into<String>) -> Self {
+                Self::message(message)
+            }
+
+            /// Returns the framework-level error message.
+            #[must_use]
+            pub fn as_message(&self) -> &str {
+                &self.message
+            }
         }
-    }
+    };
 }
+
+define_source_error!(NodeError, "An error returned by a node implementation.");
+define_source_error!(
+    StateError,
+    "An error produced while applying a state update."
+);
+define_source_error!(
+    RouteError,
+    "An error returned by a synchronous conditional router."
+);
 
 /// An error raised during graph execution.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum GraphRunError {
     /// The configured step limit was reached before `END`.
     #[error(
@@ -109,5 +164,22 @@ pub enum GraphRunError {
         step: usize,
         #[source]
         source: StateError,
+    },
+    /// A conditional router failed.
+    #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]
+    RouteFailed {
+        node_id: NodeId,
+        step: usize,
+        #[source]
+        source: RouteError,
+    },
+    /// A conditional router returned a target outside its declared whitelist.
+    #[error(
+        "conditional router for node `{node_id}` selected undeclared target `{target}` at step {step}"
+    )]
+    InvalidRouteTarget {
+        node_id: NodeId,
+        target: NodeId,
+        step: usize,
     },
 }

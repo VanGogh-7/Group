@@ -4,7 +4,7 @@ use crate::StateError;
 ///
 /// Nodes inspect this state immutably and return an update. Only the runtime
 /// applies updates.
-pub trait GraphState: Clone + Send + Sync + 'static {
+pub trait GraphState: Send + Sync + 'static {
     /// The update produced by a node.
     type Update: Send + Sync + 'static;
 
