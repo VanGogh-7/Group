@@ -18,7 +18,8 @@ The current core supports immutable compiled state graphs with:
 - explicit deterministic parallel update merging through `apply_batch`;
 - optional checkpoint snapshots after successful super-step boundaries;
 - asynchronous replaceable checkpointers and an in-memory implementation;
-- checkpoint latest/history queries and parent chains by logical thread;
+- checkpoint latest/history queries and CAS-protected state lineage by logical
+  thread;
 - synchronous conditional edges with declared target whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
@@ -167,15 +168,32 @@ The current core supports immutable compiled state graphs with:
   succeed. Save before entering the next frontier.
 - `EverySuperstep` saves once per successful super-step. `FinalOnly` saves only
   the completed empty-frontier checkpoint.
+- A legal `START -> END` graph saves exactly one completed checkpoint under
+  either policy, with super-step and step zero and an empty frontier.
 - Checkpoints retain checkpoint/thread/run identifiers, parent, super-step,
   cumulative step count, next frontier, Snapshot, and completed state.
-- Snapshot logic runs before entering storage and never while an in-memory store
-  lock is held.
-- Snapshot or save failure returns structured `GraphRunError`, emits one
-  `RunFailed`, and stops before the next frontier. Runtime does not claim to
-  roll back committed state or external side effects.
+- Parent means the state lineage used by execution, not storage insertion
+  order. A new-state configuration explicitly expects no parent; a run based on
+  a checkpoint must supply that checkpoint as `expected_parent`.
+- Runtime carries the last successful checkpoint within a run as the next
+  expected parent. Checkpointers atomically compare thread latest with
+  `expected_parent` before insertion. A mismatch is `CheckpointConflict`, so
+  concurrent runs on one `ThreadId` do not silently cross-link parent chains.
+- `CheckpointRequest` carries a Runtime-assigned `CheckpointId` operation key.
+  Checkpointers should save idempotently because a dropped save future may have
+  committed an external side effect before returning.
+- Snapshot logic is synchronous and cannot be preempted. It runs before
+  entering storage and never while an in-memory store lock is held.
+- Cancellation and run timeout remain active while save is pending, with
+  cancellation before run timeout before save result. Save-boundary control
+  failures use no node identifier and the cumulative completed step count.
+- Snapshot, conflict, save, cancellation, or timeout failure emits one
+  `RunFailed`, no `CheckpointSaved` for an unconfirmed save, and no
+  `RunCompleted`. Runtime does not claim to roll back committed state, storage
+  effects, or external node side effects.
 - Stage 6 provides no resume, replay, fork, time travel, database persistence,
-  or serialization.
+  or serialization. Future resume work must validate graph version and topology
+  compatibility in addition to stored frontier metadata.
 
 ## Performance principles
 

@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use thiserror::Error;
 
 use crate::{CheckpointerError, GraphState, NodeId, RunId, SnapshotError};
+
+static NEXT_CHECKPOINT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Identifies a durable logical execution thread across one or more runs.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -64,6 +67,10 @@ impl CheckpointId {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    pub(crate) fn next() -> Self {
+        Self(NEXT_CHECKPOINT_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -182,13 +189,17 @@ where
 
 /// A checkpoint write prepared by the Runtime after a successful super-step.
 ///
-/// Checkpointer implementations assign the identifier and parent while saving,
-/// allowing the parent link to be chosen atomically with insertion.
+/// The identifier is an idempotency key for this write. `expected_parent`
+/// names the state lineage on which the Runtime executed. A checkpointer must
+/// compare it with the thread's current latest checkpoint atomically with
+/// insertion.
 #[derive(Debug)]
 pub struct CheckpointRequest<T>
 where
     T: Send + Sync + 'static,
 {
+    checkpoint_id: CheckpointId,
+    expected_parent: Option<CheckpointId>,
     thread_id: ThreadId,
     run_id: RunId,
     superstep: usize,
@@ -198,13 +209,35 @@ where
     completed: bool,
 }
 
+pub(crate) struct CheckpointLineage {
+    checkpoint_id: CheckpointId,
+    expected_parent: Option<CheckpointId>,
+    thread_id: ThreadId,
+    run_id: RunId,
+}
+
+impl CheckpointLineage {
+    pub(crate) fn new(
+        checkpoint_id: CheckpointId,
+        expected_parent: Option<CheckpointId>,
+        thread_id: ThreadId,
+        run_id: RunId,
+    ) -> Self {
+        Self {
+            checkpoint_id,
+            expected_parent,
+            thread_id,
+            run_id,
+        }
+    }
+}
+
 impl<T> CheckpointRequest<T>
 where
     T: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        thread_id: ThreadId,
-        run_id: RunId,
+        lineage: CheckpointLineage,
         superstep: usize,
         step: usize,
         snapshot: Arc<T>,
@@ -212,14 +245,28 @@ where
         completed: bool,
     ) -> Self {
         Self {
-            thread_id,
-            run_id,
+            checkpoint_id: lineage.checkpoint_id,
+            expected_parent: lineage.expected_parent,
+            thread_id: lineage.thread_id,
+            run_id: lineage.run_id,
             superstep,
             step,
             snapshot,
             next_frontier,
             completed,
         }
+    }
+
+    /// Returns the idempotency key assigned to this write.
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> CheckpointId {
+        self.checkpoint_id
+    }
+
+    /// Returns the checkpoint on which this execution was based.
+    #[must_use]
+    pub const fn expected_parent(&self) -> Option<CheckpointId> {
+        self.expected_parent
     }
 
     /// Returns the target logical thread.
@@ -264,18 +311,14 @@ where
         self.completed
     }
 
-    /// Finalizes this request with a store-assigned identifier and parent.
+    /// Finalizes this request after the store has accepted its CAS condition.
     #[must_use]
-    pub fn into_checkpoint(
-        self,
-        id: CheckpointId,
-        parent_id: Option<CheckpointId>,
-    ) -> Checkpoint<T> {
+    pub fn into_checkpoint(self) -> Checkpoint<T> {
         Checkpoint {
-            id,
+            id: self.checkpoint_id,
             thread_id: self.thread_id,
             run_id: self.run_id,
-            parent_id,
+            parent_id: self.expected_parent,
             superstep: self.superstep,
             step: self.step,
             snapshot: self.snapshot,
@@ -283,6 +326,24 @@ where
             completed: self.completed,
         }
     }
+}
+
+/// A failure to atomically write a checkpoint.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CheckpointWriteError {
+    /// The thread advanced beyond the lineage on which this request executed.
+    #[error(
+        "checkpoint parent conflict: expected {expected_parent:?}, current latest is \
+         {actual_parent:?}"
+    )]
+    Conflict {
+        expected_parent: Option<CheckpointId>,
+        actual_parent: Option<CheckpointId>,
+    },
+    /// The storage implementation failed.
+    #[error(transparent)]
+    Failed(#[from] CheckpointerError),
 }
 
 /// Asynchronous, replaceable checkpoint persistence boundary.
@@ -295,7 +356,7 @@ where
     async fn save(
         &self,
         request: CheckpointRequest<T>,
-    ) -> Result<Arc<Checkpoint<T>>, CheckpointerError>;
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError>;
 
     /// Returns the latest checkpoint for a logical thread.
     async fn latest(
@@ -319,13 +380,17 @@ where
     thread_id: ThreadId,
     checkpointer: Arc<dyn Checkpointer<T>>,
     policy: CheckpointPolicy,
+    expected_parent: Option<CheckpointId>,
 }
 
 impl<T> CheckpointConfig<T>
 where
     T: Send + Sync + 'static,
 {
-    /// Creates an opt-in checkpoint configuration.
+    /// Creates an opt-in checkpoint configuration for new state.
+    ///
+    /// The invocation explicitly expects no existing parent checkpoint. Use
+    /// [`Self::with_expected_parent`] when execution is based on a checkpoint.
     #[must_use]
     pub fn new(
         thread_id: impl Into<ThreadId>,
@@ -336,7 +401,15 @@ where
             thread_id: thread_id.into(),
             checkpointer,
             policy,
+            expected_parent: None,
         }
+    }
+
+    /// Sets the checkpoint on which this invocation's state is based.
+    #[must_use]
+    pub fn with_expected_parent(mut self, expected_parent: Option<CheckpointId>) -> Self {
+        self.expected_parent = expected_parent;
+        self
     }
 
     /// Returns the logical execution thread.
@@ -349,6 +422,12 @@ where
     #[must_use]
     pub const fn policy(&self) -> CheckpointPolicy {
         self.policy
+    }
+
+    /// Returns the checkpoint on which this invocation's state is based.
+    #[must_use]
+    pub const fn expected_parent(&self) -> Option<CheckpointId> {
+        self.expected_parent
     }
 
     pub(crate) fn checkpointer(&self) -> &dyn Checkpointer<T> {
@@ -365,6 +444,7 @@ where
             .debug_struct("CheckpointConfig")
             .field("thread_id", &self.thread_id)
             .field("policy", &self.policy)
+            .field("expected_parent", &self.expected_parent)
             .finish_non_exhaustive()
     }
 }
@@ -377,8 +457,15 @@ pub struct InMemoryCheckpointer<T>
 where
     T: Send + Sync + 'static,
 {
-    next_id: AtomicU64,
-    checkpoints: Mutex<HashMap<ThreadId, Vec<Arc<Checkpoint<T>>>>>,
+    state: Mutex<InMemoryState<T>>,
+}
+
+struct InMemoryState<T>
+where
+    T: Send + Sync + 'static,
+{
+    histories: HashMap<ThreadId, Vec<Arc<Checkpoint<T>>>>,
+    by_id: HashMap<CheckpointId, Arc<Checkpoint<T>>>,
 }
 
 impl<T> InMemoryCheckpointer<T>
@@ -389,8 +476,10 @@ where
     #[must_use]
     pub fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(1),
-            checkpoints: Mutex::new(HashMap::new()),
+            state: Mutex::new(InMemoryState {
+                histories: HashMap::new(),
+                by_id: HashMap::new(),
+            }),
         }
     }
 }
@@ -423,16 +512,36 @@ where
     async fn save(
         &self,
         request: CheckpointRequest<T>,
-    ) -> Result<Arc<Checkpoint<T>>, CheckpointerError> {
-        let mut checkpoints = self
-            .checkpoints
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        let history = checkpoints.entry(request.thread_id().clone()).or_default();
-        let parent_id = history.last().map(|checkpoint| checkpoint.id());
-        let id = CheckpointId::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let checkpoint = Arc::new(request.into_checkpoint(id, parent_id));
-        history.push(Arc::clone(&checkpoint));
+
+        if let Some(checkpoint) = state.by_id.get(&request.checkpoint_id()) {
+            return Ok(Arc::clone(checkpoint));
+        }
+
+        let actual_parent = state
+            .histories
+            .get(request.thread_id())
+            .and_then(|history| history.last())
+            .map(|checkpoint| checkpoint.id());
+        if actual_parent != request.expected_parent() {
+            return Err(CheckpointWriteError::Conflict {
+                expected_parent: request.expected_parent(),
+                actual_parent,
+            });
+        }
+
+        let thread_id = request.thread_id().clone();
+        let checkpoint = Arc::new(request.into_checkpoint());
+        state
+            .histories
+            .entry(thread_id)
+            .or_default()
+            .push(Arc::clone(&checkpoint));
+        state.by_id.insert(checkpoint.id(), Arc::clone(&checkpoint));
         Ok(checkpoint)
     }
 
@@ -440,11 +549,12 @@ where
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
-        let checkpoints = self
-            .checkpoints
+        let state = self
+            .state
             .lock()
             .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        Ok(checkpoints
+        Ok(state
+            .histories
             .get(thread_id)
             .and_then(|history| history.last())
             .cloned())
@@ -454,10 +564,10 @@ where
         &self,
         thread_id: &ThreadId,
     ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
-        let checkpoints = self
-            .checkpoints
+        let state = self
+            .state
             .lock()
             .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        Ok(checkpoints.get(thread_id).cloned().unwrap_or_default())
+        Ok(state.histories.get(thread_id).cloned().unwrap_or_default())
     }
 }

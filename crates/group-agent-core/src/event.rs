@@ -156,6 +156,14 @@ pub enum RunFailure {
         superstep: usize,
         step: usize,
     },
+    /// A checkpoint write observed a different current parent.
+    CheckpointConflict {
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        expected_parent: Option<CheckpointId>,
+        actual_parent: Option<CheckpointId>,
+    },
     /// Saving a checkpoint failed.
     CheckpointSaveFailed {
         thread_id: ThreadId,

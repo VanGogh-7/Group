@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use group_agent_core::{
     CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, CompiledGraph, END,
     EventConfig, EventRetention, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError,
@@ -186,24 +186,28 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     criterion.bench_function(
         "invoke_default_no_control_checkpoint_disabled_10_nodes",
         |bencher| {
-            bencher.to_async(&runtime).iter(|| async {
-                let report = fixed_10
-                    .invoke(BenchState::default())
-                    .await
-                    .expect("benchmark invocation should succeed");
-                black_box(report.steps());
-            });
+            bencher.to_async(&runtime).iter_batched(
+                BenchState::default,
+                |initial_state| async {
+                    let report = fixed_10
+                        .invoke(initial_state)
+                        .await
+                        .expect("benchmark invocation should succeed");
+                    black_box(report.steps());
+                },
+                BatchSize::SmallInput,
+            );
         },
     );
 
     criterion.bench_function(
         "invoke_checkpoint_enabled_every_superstep_10_nodes",
         |bencher| {
-            bencher.to_async(&runtime).iter(|| async {
-                let checkpointer: Arc<dyn Checkpointer<usize>> =
-                    Arc::new(InMemoryCheckpointer::new());
-                let report = fixed_10
-                    .invoke_with_checkpoint(
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    let checkpointer: Arc<dyn Checkpointer<usize>> =
+                        Arc::new(InMemoryCheckpointer::new());
+                    (
                         BenchState::default(),
                         RunConfig::default(),
                         EventConfig::default(),
@@ -214,10 +218,22 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
                             CheckpointPolicy::EverySuperstep,
                         ),
                     )
-                    .await
-                    .expect("checkpoint benchmark invocation should succeed");
-                black_box(report.steps());
-            });
+                },
+                |(initial_state, run_config, event_config, control, checkpoint_config)| async {
+                    let report = fixed_10
+                        .invoke_with_checkpoint(
+                            initial_state,
+                            run_config,
+                            event_config,
+                            control,
+                            checkpoint_config,
+                        )
+                        .await
+                        .expect("checkpoint benchmark invocation should succeed");
+                    black_box(report.steps());
+                },
+                BatchSize::SmallInput,
+            );
         },
     );
 

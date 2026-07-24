@@ -7,7 +7,9 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 6 adds an opt-in checkpoint foundation to the parallel super-step Runtime:
+Stage 6.1 hardens the opt-in checkpoint foundation with explicit state lineage,
+atomic expected-parent checks, zero-node terminal checkpoints, and execution
+control during asynchronous saves:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
@@ -33,7 +35,7 @@ The current core includes:
 - explicit, deterministic parallel state-update merging;
 - opt-in snapshots and asynchronous replaceable checkpoint storage;
 - process-local, thread-safe `InMemoryCheckpointer`;
-- latest and ordered history queries with checkpoint parent chains;
+- latest and ordered history queries with CAS-protected checkpoint lineage;
 - explicit loops protected by a per-run `max_steps`;
 - immutable, reusable, concurrently shareable compiled graphs;
 - immediate lifecycle delivery through a thread-safe `EventSink`;
@@ -126,7 +128,9 @@ impl CheckpointState for AgentState {
 ```
 
 `restore` reserves the state boundary required by a later Resume stage. Stage 6
-does not call it and cannot resume, replay, fork, or time-travel.
+does not call it and cannot resume, replay, fork, or time-travel. A future
+Resume design must additionally validate graph version and topology
+compatibility; the stored frontier alone is not sufficient.
 
 Checkpointing is enabled only through `invoke_with_checkpoint`:
 
@@ -155,6 +159,24 @@ let report = compiled
     .await?;
 ```
 
+`CheckpointConfig::new` explicitly starts from state with no parent checkpoint.
+When the supplied state is based on an existing checkpoint, identify that
+lineage rather than allowing storage insertion order to choose it:
+
+```rust
+let base = store
+    .latest(&ThreadId::from("conversation-42"))
+    .await?
+    .expect("base checkpoint")
+    .id();
+let config = CheckpointConfig::new(
+    "conversation-42",
+    Arc::clone(&store) as Arc<dyn Checkpointer<AgentSnapshot>>,
+    CheckpointPolicy::EverySuperstep,
+)
+.with_expected_parent(Some(base));
+```
+
 `CheckpointPolicy::EverySuperstep` saves after every successful super-step.
 `FinalOnly` creates only the final completed checkpoint. Each immutable
 `Checkpoint` records its `CheckpointId`, `ThreadId`, `RunId`, parent,
@@ -162,6 +184,17 @@ super-step, cumulative step count, shared `Arc<Snapshot>`, stable next frontier,
 and completed flag. `Checkpointer::latest` and `history` return shared
 `Arc<Checkpoint<_>>` values, so queries do not deep-copy snapshots. History is
 ordered oldest to newest.
+
+A checkpoint parent represents the state lineage on which execution was based,
+not the previous insertion by wall-clock order. Each write carries both a
+Runtime-assigned `CheckpointId` idempotency key and an `expected_parent`.
+`InMemoryCheckpointer` compares the thread's latest checkpoint with that
+expected parent and inserts atomically under one short lock. A mismatch returns
+`GraphRunError::CheckpointConflict`; it never silently joins unrelated runs.
+Consequently, concurrent runs using the same `ThreadId` and base normally race:
+the first accepted write advances the lineage and the other conflicts.
+Different thread identifiers remain isolated. Within one run, every successful
+save becomes the expected parent of that run's next save.
 
 The exact save boundary is:
 
@@ -172,15 +205,29 @@ The exact save boundary is:
 5. the checkpointer saves it before Runtime enters the next super-step.
 
 A failing node, batch merge, state apply, or router does not create a checkpoint
-for that super-step. Snapshot and save failures return structured
-`GraphRunError::SnapshotFailed` or `CheckpointSaveFailed`, emit one final
-`RunFailed`, and stop execution. State already committed at the boundary and
-external node side effects are not rolled back.
+for that super-step. Snapshot, conflict, and storage failures return structured
+`GraphRunError::SnapshotFailed`, `CheckpointConflict`, or
+`CheckpointSaveFailed`, emit one final `RunFailed`, and stop execution. State
+already committed at the boundary and external node side effects are not rolled
+back.
 
-`InMemoryCheckpointer` joins the new checkpoint to the latest checkpoint for
-the same `ThreadId` while holding one short process-local mutex. Snapshot
-creation never occurs under that lock. It provides no database durability or
-serialization. See
+Run cancellation and run timeout remain active while the asynchronous save
+future is pending. Cancellation has priority over run timeout, and both have
+priority over a simultaneously ready save result. Such failures use checkpoint
+boundary context (`node_id = None`, with the cumulative completed step count),
+emit exactly one `RunFailed`, and emit neither `CheckpointSaved` nor
+`RunCompleted`. Dropping a save future cannot prove that a backend produced no
+side effect: storage may have committed before its future returned. Custom
+checkpointers should therefore treat `CheckpointRequest::checkpoint_id()` as
+an idempotency key. `InMemoryCheckpointer` deduplicates that key.
+
+Snapshot creation is synchronous and cannot be preempted. It occurs before
+entering storage and never under the in-memory store lock. A legal
+`START -> END` graph saves exactly one completed checkpoint under either
+policy, with `superstep = 0`, `step = 0`, an empty frontier, and the configured
+expected parent. Its successful terminal order is `CheckpointSaved` followed
+by `RunCompleted`. The in-memory implementation provides no database durability
+or serialization. See
 [`examples/checkpoint.rs`](crates/group-agent-core/examples/checkpoint.rs).
 
 ## Event observation

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{NodeId, RunId, ThreadId};
+use crate::{CheckpointId, NodeId, RunId, ThreadId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -238,6 +238,20 @@ pub enum GraphRunError {
         step: usize,
         #[source]
         source: SnapshotError,
+    },
+    /// The checkpoint thread advanced beyond this invocation's expected parent.
+    #[error(
+        "checkpoint conflict for thread `{thread_id}` in run `{run_id}` after super-step \
+         {superstep} at step {step}: expected parent {expected_parent:?}, current latest is \
+         {actual_parent:?}"
+    )]
+    CheckpointConflict {
+        run_id: RunId,
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        expected_parent: Option<CheckpointId>,
+        actual_parent: Option<CheckpointId>,
     },
     /// Saving a checkpoint failed.
     #[error(

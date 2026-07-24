@@ -17,7 +17,7 @@ mod state;
 
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
-    CheckpointState, Checkpointer, InMemoryCheckpointer, ThreadId,
+    CheckpointState, CheckpointWriteError, Checkpointer, InMemoryCheckpointer, ThreadId,
 };
 pub use context::{NodeContext, RunConfig, RunControl};
 pub use edge::{END, NodeId, START};

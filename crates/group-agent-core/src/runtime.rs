@@ -8,11 +8,13 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::checkpoint::CheckpointLineage;
 use crate::graph::{CompiledNode, CompiledTransition};
 use crate::{
     CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest, CheckpointState,
-    CompiledGraph, EventConfig, EventRetention, GraphEvent, GraphRunError, GraphState, NodeContext,
-    NodeId, NodeUpdate, RunConfig, RunControl, RunFailure, RunId, ThreadId,
+    CheckpointWriteError, CompiledGraph, EventConfig, EventRetention, GraphEvent, GraphRunError,
+    GraphState, NodeContext, NodeId, NodeUpdate, RunConfig, RunControl, RunFailure, RunId,
+    ThreadId,
 };
 
 /// The outcome of a successful graph invocation.
@@ -156,6 +158,38 @@ where
             control.check(run_id, initial_node, initial_step, control.deadline(None))
         {
             return events.fail(error);
+        }
+
+        if frontier.is_empty() && checkpoints.should_save(true) {
+            let checkpoint_future = checkpoints.save(run_id, 0, 0, &state, Vec::new(), true);
+            let save_result = if control.is_disabled() {
+                checkpoint_future.await
+            } else {
+                tokio::pin!(checkpoint_future);
+                let run_deadline = control.deadline(None);
+                tokio::select! {
+                    biased;
+                    () = control.cancellation_token.cancelled() => {
+                        return events.fail(control.cancelled_error(run_id, None, 0));
+                    }
+                    deadline = wait_for_deadline(run_deadline) => {
+                        return events.fail(control.deadline_error(run_id, None, 0, deadline));
+                    }
+                    result = &mut checkpoint_future => result,
+                }
+            };
+            let saved = match save_result {
+                Ok(saved) => saved,
+                Err(error) => return events.fail(error),
+            };
+            events.emit(|| GraphEvent::CheckpointSaved {
+                run_id,
+                checkpoint_id: saved.id,
+                thread_id: saved.thread_id,
+                superstep: 0,
+                step: 0,
+                completed: true,
+            });
         }
 
         while !frontier.is_empty() {
@@ -485,19 +519,10 @@ where
                     tokio::select! {
                         biased;
                         () = control.cancellation_token.cancelled() => {
-                            return events.fail(control.cancelled_error(
-                                run_id,
-                                Some(first_node),
-                                first_step,
-                            ));
+                            return events.fail(control.cancelled_error(run_id, None, steps));
                         }
                         deadline = wait_for_deadline(run_deadline) => {
-                            return events.fail(control.deadline_error(
-                                run_id,
-                                Some(first_node),
-                                first_step,
-                                deadline,
-                            ));
+                            return events.fail(control.deadline_error(run_id, None, steps, deadline));
                         }
                         result = &mut checkpoint_future => result,
                     }
@@ -514,6 +539,9 @@ where
                     step: steps,
                     completed,
                 });
+                if let Some(error) = control.check(run_id, None, steps, control.deadline(None)) {
+                    return events.fail(error);
+                }
             }
             if is_parallel {
                 events.emit(|| GraphEvent::SuperstepCompleted { run_id, superstep });
@@ -619,6 +647,7 @@ where
     S: CheckpointState,
 {
     config: CheckpointConfig<S::Snapshot>,
+    expected_parent: Option<CheckpointId>,
 }
 
 impl<S> EnabledCheckpoint<S>
@@ -626,7 +655,11 @@ where
     S: CheckpointState,
 {
     fn new(config: CheckpointConfig<S::Snapshot>) -> Self {
-        Self { config }
+        let expected_parent = config.expected_parent();
+        Self {
+            config,
+            expected_parent,
+        }
     }
 }
 
@@ -661,8 +694,12 @@ where
                     source,
                 })?;
         let request = CheckpointRequest::new(
-            thread_id.clone(),
-            run_id,
+            CheckpointLineage::new(
+                CheckpointId::next(),
+                self.expected_parent,
+                thread_id.clone(),
+                run_id,
+            ),
             superstep,
             step,
             snapshot,
@@ -674,13 +711,27 @@ where
             .checkpointer()
             .save(request)
             .await
-            .map_err(|source| GraphRunError::CheckpointSaveFailed {
-                run_id,
-                thread_id: thread_id.clone(),
-                superstep,
-                step,
-                source,
+            .map_err(|source| match source {
+                CheckpointWriteError::Conflict {
+                    expected_parent,
+                    actual_parent,
+                } => GraphRunError::CheckpointConflict {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    superstep,
+                    step,
+                    expected_parent,
+                    actual_parent,
+                },
+                CheckpointWriteError::Failed(source) => GraphRunError::CheckpointSaveFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    superstep,
+                    step,
+                    source,
+                },
             })?;
+        self.expected_parent = Some(checkpoint.id());
         Ok(SavedCheckpoint {
             id: checkpoint.id(),
             thread_id,
@@ -976,6 +1027,20 @@ impl From<&GraphRunError> for RunFailure {
                 thread_id: thread_id.clone(),
                 superstep: *superstep,
                 step: *step,
+            },
+            GraphRunError::CheckpointConflict {
+                thread_id,
+                superstep,
+                step,
+                expected_parent,
+                actual_parent,
+                ..
+            } => Self::CheckpointConflict {
+                thread_id: thread_id.clone(),
+                superstep: *superstep,
+                step: *step,
+                expected_parent: *expected_parent,
+                actual_parent: *actual_parent,
             },
             GraphRunError::CheckpointSaveFailed {
                 thread_id,
