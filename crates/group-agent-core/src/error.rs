@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{CheckpointId, GraphVersion, InterruptId, NodeId, NodePath, RunId, ThreadId};
+use crate::{
+    CheckpointEncodingError, CheckpointId, GraphVersion, InterruptId, NodeId, NodePath, RunId,
+    ThreadId,
+};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -198,6 +201,26 @@ pub enum CheckpointIncompatibility {
     /// The restored frontier names an unknown executable node.
     #[error("checkpoint frontier contains unknown node `{node_id}`")]
     UnknownFrontierNode { node_id: NodePath },
+    /// The persisted frontier contains the same executable node more than once.
+    #[error("checkpoint frontier contains duplicate node `{node_id}`")]
+    DuplicateFrontierNode { node_id: NodePath },
+    /// Persisted frontier nodes are not ordered by compiled internal index.
+    #[error(
+        "checkpoint frontier is not in canonical compiled order near `{previous}` then `{current}`"
+    )]
+    NonCanonicalFrontierOrder {
+        previous: NodePath,
+        current: NodePath,
+    },
+    /// One persisted frontier spans more than one graph namespace.
+    #[error(
+        "checkpoint frontier mixes graph namespaces `{expected}` and `{actual}` at node `{node_id}`"
+    )]
+    MixedFrontierNamespace {
+        expected: crate::GraphPath,
+        actual: crate::GraphPath,
+        node_id: NodePath,
+    },
     /// `START` cannot appear in a checkpoint frontier.
     #[error("checkpoint frontier contains START")]
     StartInFrontier,
@@ -321,6 +344,19 @@ pub enum GraphRunError {
         checkpoint_id: CheckpointId,
         superstep: usize,
         step: usize,
+    },
+    /// Encoding typed checkpoint data failed before storage.
+    #[error(
+        "checkpoint encoding for thread `{thread_id}` in run `{run_id}` failed after super-step \
+         {superstep} at step {step}: {source}"
+    )]
+    CheckpointEncodeFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        #[source]
+        source: CheckpointEncodingError,
     },
     /// Saving a checkpoint failed.
     #[error(

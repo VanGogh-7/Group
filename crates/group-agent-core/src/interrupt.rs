@@ -1,41 +1,10 @@
 use std::any::{Any, type_name};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use crate::{CheckpointId, GraphEvent, GraphState, NodeId, NodePath, RunId, ThreadId};
-
-static NEXT_INTERRUPT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Identifies one node suspension request.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct InterruptId(u64);
-
-impl InterruptId {
-    /// Creates an identifier for custom checkpoint tooling.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the numeric identifier.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    fn next() -> Self {
-        Self(NEXT_INTERRUPT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-impl fmt::Display for InterruptId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+use crate::{CheckpointId, GraphEvent, GraphState, InterruptId, NodeId, NodePath, RunId, ThreadId};
 
 #[derive(Clone)]
 struct TypedValue {
@@ -59,10 +28,6 @@ impl TypedValue {
         T: Send + Sync + 'static,
     {
         self.value.downcast_ref()
-    }
-
-    fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.value, &other.value)
     }
 }
 
@@ -102,10 +67,6 @@ impl InterruptPayload {
     #[must_use]
     pub const fn type_name(&self) -> &'static str {
         self.0.type_name
-    }
-
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
     }
 }
 
@@ -237,6 +198,18 @@ pub struct CheckpointInterrupt {
 }
 
 impl CheckpointInterrupt {
+    pub(crate) fn from_parts(
+        id: InterruptId,
+        node_path: NodePath,
+        payload: InterruptPayload,
+    ) -> Self {
+        Self {
+            id,
+            node_path,
+            payload,
+        }
+    }
+
     /// Returns the interrupt identifier.
     #[must_use]
     pub const fn id(&self) -> InterruptId {
@@ -259,12 +232,6 @@ impl CheckpointInterrupt {
     #[must_use]
     pub const fn payload(&self) -> &InterruptPayload {
         &self.payload
-    }
-
-    pub(crate) fn matches(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.node_path == other.node_path
-            && self.payload.ptr_eq(&other.payload)
     }
 }
 

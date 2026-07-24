@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    Checkpoint, CheckpointConfig, CheckpointPolicy, CheckpointRequest, CheckpointState,
-    CheckpointWriteError, Checkpointer, CheckpointerError, CompiledGraph, END, EventConfig,
-    GraphBuildError, GraphCompileError, GraphEvent, GraphPath, GraphRunError, GraphState,
-    InMemoryCheckpointer, InterruptibleNode, Node, NodeContext, NodeError, NodeId, NodeOutcome,
-    NodePath, NodeUpdate, ResumeConfig, ResumeValueError, RunConfig, RunControl, START,
+    Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy,
+    CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError,
+    CodecDescriptor, CompiledGraph, END, EncodedValue, EventConfig, GraphBuildError,
+    GraphCompileError, GraphEvent, GraphPath, GraphRunError, GraphState, InMemoryCheckpointer,
+    InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError, NodeId, NodeOutcome,
+    NodePath, NodeUpdate, ResumeConfig, ResumeValueError, RunConfig, RunControl, RunFailure, START,
     SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::sync::{Barrier, Notify};
@@ -27,6 +28,79 @@ struct SharedSnapshot {
     value: i32,
     observed: Arc<Mutex<Vec<(NodePath, i32)>>>,
     resume_leaked: bool,
+}
+
+struct SharedCodec;
+
+impl CheckpointCodec<SharedSnapshot> for SharedCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new(
+            "group.tests.subgraph.snapshot",
+            1,
+            "group.tests.subgraph.raw-v1",
+        )
+    }
+
+    fn encode_snapshot(&self, snapshot: &SharedSnapshot) -> Result<Vec<u8>, CheckpointCodecError> {
+        let mut bytes = snapshot.value.to_le_bytes().to_vec();
+        bytes.push(u8::from(snapshot.resume_leaked));
+        Ok(bytes)
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<SharedSnapshot, CheckpointCodecError> {
+        let (resume_leaked, value_bytes) = bytes
+            .split_last()
+            .ok_or_else(|| CheckpointCodecError::message("empty SharedSnapshot"))?;
+        let value = value_bytes
+            .try_into()
+            .map(i32::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid SharedSnapshot value"))?;
+        Ok(SharedSnapshot {
+            value,
+            observed: Arc::new(Mutex::new(Vec::new())),
+            resume_leaked: *resume_leaked != 0,
+        })
+    }
+
+    fn encode_interrupt(
+        &self,
+        payload: &InterruptPayload,
+    ) -> Result<EncodedValue, CheckpointCodecError> {
+        let message = payload
+            .downcast_ref::<&'static str>()
+            .ok_or_else(|| CheckpointCodecError::unsupported_interrupt(payload))?;
+        Ok(EncodedValue::new(
+            CodecDescriptor::new(
+                "group.tests.subgraph.static-str",
+                1,
+                "group.tests.subgraph.raw-v1",
+            ),
+            message.as_bytes(),
+        ))
+    }
+
+    fn decode_interrupt(
+        &self,
+        value: &EncodedValue,
+    ) -> Result<InterruptPayload, CheckpointCodecError> {
+        if value.descriptor()
+            != &CodecDescriptor::new(
+                "group.tests.subgraph.static-str",
+                1,
+                "group.tests.subgraph.raw-v1",
+            )
+            || value.bytes() != b"approval required"
+        {
+            return Err(CheckpointCodecError::message(
+                "unsupported subgraph interrupt payload",
+            ));
+        }
+        Ok(InterruptPayload::new("approval required"))
+    }
+}
+
+fn new_store() -> Arc<InMemoryCheckpointer<SharedSnapshot>> {
+    Arc::new(InMemoryCheckpointer::new(SharedCodec))
 }
 
 #[derive(Debug)]
@@ -400,7 +474,7 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
         .add_subgraph("research", child.compile().expect("child should compile"))
         .expect("child should mount");
     parent.add_edge(START, "research").add_edge("research", END);
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let outcome = parent
         .compile()
         .expect("parent should compile")
@@ -439,7 +513,7 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
 #[tokio::test]
 async fn checkpoint_frontier_and_resume_reenter_the_child_namespace() {
     let graph = parent_with_linear_child();
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let error = graph
         .invoke_with_checkpoint(
             state(),
@@ -535,7 +609,7 @@ async fn child_interrupt_uses_full_path_and_typed_value_only_for_reexecution() {
         .add_edge("review", "parent_after")
         .add_edge("parent_after", END);
     let graph = parent.compile().expect("interrupt parent should compile");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
 
     let outcome = graph
         .invoke_with_checkpoint(
@@ -771,14 +845,21 @@ async fn child_inherits_cancellation() {
 async fn child_node_timeout_is_classified_independently() {
     let started = Arc::new(Notify::new());
     let graph = Arc::new(pending_child_graph(Arc::clone(&started)));
+    let captured = Arc::new(Mutex::new(Vec::new()));
     let timed_out = {
         let graph = Arc::clone(&graph);
+        let captured = Arc::clone(&captured);
         tokio::spawn(async move {
             graph
                 .invoke_with_control(
                     state(),
                     RunConfig::default(),
-                    EventConfig::default(),
+                    EventConfig::default().with_sink(Arc::new(move |event: &GraphEvent| {
+                        captured
+                            .lock()
+                            .expect("event lock should not be poisoned")
+                            .push(event.clone());
+                    })),
                     RunControl::new().with_node_timeout(Duration::from_secs(2)),
                 )
                 .await
@@ -800,20 +881,41 @@ async fn child_node_timeout_is_classified_independently() {
         } if node_id == NodePath::new(&GraphPath::new(["child"]), "wait")
             && timeout == Duration::from_secs(2)
     ));
+    assert!(matches!(
+        captured
+            .lock()
+            .expect("event lock should not be poisoned")
+            .last(),
+        Some(GraphEvent::RunFailed {
+            failure: RunFailure::NodeTimedOut {
+                node_id,
+                step: 1,
+                ..
+            },
+            ..
+        }) if node_id == &NodePath::new(&GraphPath::new(["child"]), "wait")
+    ));
 }
 
 #[tokio::test(start_paused = true)]
 async fn child_run_timeout_is_classified_independently() {
     let started = Arc::new(Notify::new());
     let graph = Arc::new(pending_child_graph(Arc::clone(&started)));
+    let captured = Arc::new(Mutex::new(Vec::new()));
     let timed_out = {
         let graph = Arc::clone(&graph);
+        let captured = Arc::clone(&captured);
         tokio::spawn(async move {
             graph
                 .invoke_with_control(
                     state(),
                     RunConfig::default(),
-                    EventConfig::default(),
+                    EventConfig::default().with_sink(Arc::new(move |event: &GraphEvent| {
+                        captured
+                            .lock()
+                            .expect("event lock should not be poisoned")
+                            .push(event.clone());
+                    })),
                     RunControl::new().with_run_timeout(Duration::from_secs(2)),
                 )
                 .await
@@ -834,6 +936,20 @@ async fn child_run_timeout_is_classified_independently() {
             ..
         } if node_id == NodePath::new(&GraphPath::new(["child"]), "wait")
             && timeout == Duration::from_secs(2)
+    ));
+    assert!(matches!(
+        captured
+            .lock()
+            .expect("event lock should not be poisoned")
+            .last(),
+        Some(GraphEvent::RunFailed {
+            failure: RunFailure::RunTimedOut {
+                node_id: Some(node_id),
+                step: 1,
+                ..
+            },
+            ..
+        }) if node_id == &NodePath::new(&GraphPath::new(["child"]), "wait")
     ));
 }
 
@@ -863,7 +979,7 @@ async fn concurrent_resume_inside_a_subgraph_conflicts_without_a_fork() {
         .add_edge("prepare", "child")
         .add_edge("child", END);
     let graph = Arc::new(parent.compile().expect("parent should compile"));
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     graph
         .invoke_with_checkpoint(
             state(),
@@ -1228,6 +1344,51 @@ fn small_end_frontier_table_always_returns_a_compile_result() {
         mixed.compile(),
         Err(GraphCompileError::SubgraphInParallelFrontier { .. })
     ));
+}
+
+#[test]
+fn subgraph_frontier_validation_uses_fan_out_declaration_order() {
+    for _ in 0..16 {
+        let mut graph = StateGraph::new();
+        for node_id in [
+            "fork",
+            "left_source",
+            "right_source",
+            "left_ordinary",
+            "right_ordinary",
+        ] {
+            graph
+                .add_node(node_id, Add(0))
+                .expect("node should register");
+        }
+        graph
+            .add_subgraph("left_child", linear_child())
+            .expect("left child should mount");
+        graph
+            .add_subgraph("right_child", linear_child())
+            .expect("right child should mount");
+        graph.add_edge(START, "fork");
+        graph
+            .add_fan_out("fork", ["left_source", "right_source"])
+            .expect("root fan-out should register");
+        graph
+            .add_fan_out("right_source", ["right_ordinary", "right_child"])
+            .expect("first invalid fan-out should register");
+        graph
+            .add_fan_out("left_source", ["left_ordinary", "left_child"])
+            .expect("second invalid fan-out should register");
+        graph
+            .add_edge("left_ordinary", END)
+            .add_edge("right_ordinary", END)
+            .add_edge("left_child", END)
+            .add_edge("right_child", END);
+
+        assert!(matches!(
+            graph.compile(),
+            Err(GraphCompileError::SubgraphInParallelFrontier { node_id })
+                if node_id == NodeId::from("right_child")
+        ));
+    }
 }
 
 #[test]

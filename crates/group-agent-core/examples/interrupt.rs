@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, END, EventConfig,
-    ExecutionOutcome, GraphState, InMemoryCheckpointer, InterruptibleNode, NodeContext, NodeError,
-    NodeOutcome, ResumeConfig, RunConfig, RunControl, SnapshotError, StateError, StateGraph,
+    CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy, CheckpointState,
+    Checkpointer, CodecDescriptor, END, EncodedValue, EventConfig, ExecutionOutcome, GraphState,
+    InMemoryCheckpointer, InterruptPayload, InterruptibleNode, NodeContext, NodeError, NodeOutcome,
+    ResumeConfig, RunConfig, RunControl, SnapshotError, StateError, StateGraph,
 };
 
 #[derive(Debug)]
@@ -47,6 +48,74 @@ struct ApprovalPrompt {
     summary: &'static str,
 }
 
+struct ApprovalCodec;
+
+impl CheckpointCodec<ApprovalSnapshot> for ApprovalCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new(
+            "group.example.approval.snapshot",
+            1,
+            "group.example.approval.raw-v1",
+        )
+    }
+
+    fn encode_snapshot(
+        &self,
+        snapshot: &ApprovalSnapshot,
+    ) -> Result<Vec<u8>, CheckpointCodecError> {
+        Ok(snapshot
+            .approved_by
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec())
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<ApprovalSnapshot, CheckpointCodecError> {
+        let value = std::str::from_utf8(bytes)
+            .map_err(|source| CheckpointCodecError::with_source("invalid approver", source))?;
+        Ok(ApprovalSnapshot {
+            approved_by: (!value.is_empty()).then(|| value.to_owned()),
+        })
+    }
+
+    fn encode_interrupt(
+        &self,
+        payload: &InterruptPayload,
+    ) -> Result<EncodedValue, CheckpointCodecError> {
+        let prompt = payload
+            .downcast_ref::<ApprovalPrompt>()
+            .ok_or_else(|| CheckpointCodecError::unsupported_interrupt(payload))?;
+        Ok(EncodedValue::new(
+            CodecDescriptor::new(
+                "group.example.approval.prompt",
+                1,
+                "group.example.approval.raw-v1",
+            ),
+            prompt.summary.as_bytes(),
+        ))
+    }
+
+    fn decode_interrupt(
+        &self,
+        value: &EncodedValue,
+    ) -> Result<InterruptPayload, CheckpointCodecError> {
+        if value.descriptor()
+            != &CodecDescriptor::new(
+                "group.example.approval.prompt",
+                1,
+                "group.example.approval.raw-v1",
+            )
+            || value.bytes() != b"Approve publishing the draft?"
+        {
+            return Err(CheckpointCodecError::message("unsupported approval prompt"));
+        }
+        Ok(InterruptPayload::new(ApprovalPrompt {
+            summary: "Approve publishing the draft?",
+        }))
+    }
+}
+
 struct RequireApproval;
 
 #[async_trait]
@@ -78,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_edge("approval", END);
     let graph = graph.compile()?;
 
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = Arc::new(InMemoryCheckpointer::new(ApprovalCodec));
     let outcome = graph
         .invoke_with_checkpoint(
             ApprovalState { approved_by: None },

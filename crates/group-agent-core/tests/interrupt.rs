@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
-    CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError, END, EventConfig,
-    EventRetention, EventSink, ExecutionOutcome, GraphEvent, GraphRunError, GraphState,
-    InMemoryCheckpointer, InterruptibleNode, Node, NodeContext, NodeError, NodeOutcome, NodeUpdate,
+    Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointId,
+    CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer,
+    CheckpointerError, CodecDescriptor, END, EncodedValue, EventConfig, EventRetention, EventSink,
+    ExecutionOutcome, GraphEvent, GraphRunError, GraphState, InMemoryCheckpointer,
+    InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError, NodeOutcome, NodeUpdate,
     ResumeConfig, RunConfig, RunControl, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::sync::{Barrier, Notify};
@@ -86,6 +87,99 @@ fn state() -> TestState {
 #[derive(Debug, Eq, PartialEq)]
 struct ApprovalPrompt {
     message: &'static str,
+}
+
+struct TestCodec;
+
+impl CheckpointCodec<TestSnapshot> for TestCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new(
+            "group.tests.interrupt.snapshot",
+            1,
+            "group.tests.interrupt.raw-v1",
+        )
+    }
+
+    fn encode_snapshot(&self, snapshot: &TestSnapshot) -> Result<Vec<u8>, CheckpointCodecError> {
+        let mut bytes = snapshot.value.to_le_bytes().to_vec();
+        bytes.push(u8::from(snapshot.resume_leaked));
+        Ok(bytes)
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<TestSnapshot, CheckpointCodecError> {
+        let (resume_leaked, value_bytes) = bytes
+            .split_last()
+            .ok_or_else(|| CheckpointCodecError::message("empty TestSnapshot"))?;
+        let value = value_bytes
+            .try_into()
+            .map(i32::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid TestSnapshot value"))?;
+        Ok(TestSnapshot {
+            value,
+            resume_leaked: *resume_leaked != 0,
+            apply_calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn encode_interrupt(
+        &self,
+        payload: &InterruptPayload,
+    ) -> Result<EncodedValue, CheckpointCodecError> {
+        if let Some(prompt) = payload.downcast_ref::<ApprovalPrompt>() {
+            return Ok(EncodedValue::new(
+                CodecDescriptor::new(
+                    "group.tests.interrupt.approval",
+                    1,
+                    "group.tests.interrupt.raw-v1",
+                ),
+                prompt.message.as_bytes(),
+            ));
+        }
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            return Ok(EncodedValue::new(
+                CodecDescriptor::new(
+                    "group.tests.interrupt.static-str",
+                    1,
+                    "group.tests.interrupt.raw-v1",
+                ),
+                message.as_bytes(),
+            ));
+        }
+        Err(CheckpointCodecError::unsupported_interrupt(payload))
+    }
+
+    fn decode_interrupt(
+        &self,
+        value: &EncodedValue,
+    ) -> Result<InterruptPayload, CheckpointCodecError> {
+        let message = std::str::from_utf8(value.bytes())
+            .map_err(|source| CheckpointCodecError::with_source("invalid UTF-8 payload", source))?;
+        match value.descriptor().schema() {
+            "group.tests.interrupt.approval" if message == "approve" => {
+                Ok(InterruptPayload::new(ApprovalPrompt { message: "approve" }))
+            }
+            "group.tests.interrupt.static-str" => {
+                let message = match message {
+                    "again" => "again",
+                    "race" => "race",
+                    "parallel" => "parallel",
+                    other => {
+                        return Err(CheckpointCodecError::message(format!(
+                            "unknown static payload `{other}`"
+                        )));
+                    }
+                };
+                Ok(InterruptPayload::new(message))
+            }
+            schema => Err(CheckpointCodecError::message(format!(
+                "unsupported interrupt schema `{schema}`"
+            ))),
+        }
+    }
+}
+
+fn new_store() -> Arc<InMemoryCheckpointer<TestSnapshot>> {
+    Arc::new(InMemoryCheckpointer::new(TestCodec))
 }
 
 struct ApprovalNode;
@@ -173,7 +267,7 @@ async fn interrupt_once(
 #[tokio::test]
 async fn interrupt_preserves_state_saves_current_frontier_and_emits_success_outcome() {
     let graph = approval_graph();
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let report = interrupt_once(&graph, "interrupt", &store, RunConfig::default()).await;
 
     assert_eq!(report.state().value, 0);
@@ -246,7 +340,7 @@ async fn interrupt_preserves_state_saves_current_frontier_and_emits_success_outc
 #[tokio::test]
 async fn resume_value_reexecutes_interrupted_node_then_is_cleared() {
     let graph = approval_graph();
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let interrupted = interrupt_once(&graph, "resume-value", &store, RunConfig::new(1)).await;
     assert_eq!(interrupted.steps(), 0);
 
@@ -289,7 +383,7 @@ async fn resume_value_reexecutes_interrupted_node_then_is_cleared() {
 #[tokio::test]
 async fn missing_and_unexpected_resume_values_are_rejected() {
     let graph = approval_graph();
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let interrupted = interrupt_once(&graph, "resume-errors", &store, RunConfig::default()).await;
 
     let missing = graph
@@ -377,7 +471,7 @@ where
 #[tokio::test]
 async fn repeated_interrupts_create_new_ids_and_continuous_lineage() {
     let graph = repeated_interrupt_graph(AlwaysInterrupt);
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let first = interrupt_once_for_graph(&graph, "repeat", &store).await;
     let second = graph
         .resume(
@@ -450,7 +544,7 @@ async fn concurrent_interrupt_resume_conflicts_without_forming_a_fork() {
     let graph = Arc::new(repeated_interrupt_graph(BarrierInterrupt {
         resumed: Arc::clone(&resumed),
     }));
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let base = interrupt_once_for_graph(&graph, "race", &store).await;
     let base_id = base.checkpoint_id();
 
@@ -530,7 +624,7 @@ struct BlockingSaveCheckpointer {
 impl BlockingSaveCheckpointer {
     fn new() -> Self {
         Self {
-            inner: InMemoryCheckpointer::new(),
+            inner: InMemoryCheckpointer::new(TestCodec),
             save_started: Notify::new(),
             release_save: Notify::new(),
         }
@@ -901,7 +995,7 @@ async fn interrupt_does_not_consume_the_resume_calls_additional_step_budget() {
         .add_edge(group_agent_core::START, "approval")
         .add_edge("approval", END);
     let graph = graph.compile().expect("graph should compile");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let interrupted = graph
         .invoke_with_checkpoint(
             state(),

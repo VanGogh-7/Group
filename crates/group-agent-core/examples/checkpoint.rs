@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, END, EventConfig,
-    GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError, RunConfig, RunControl, START,
-    SnapshotError, StateError, StateGraph, ThreadId,
+    CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy, CheckpointState,
+    Checkpointer, CodecDescriptor, END, EventConfig, GraphState, InMemoryCheckpointer, Node,
+    NodeContext, NodeError, RunConfig, RunControl, START, SnapshotError, StateError, StateGraph,
+    ThreadId,
 };
 
 #[derive(Debug, Default)]
@@ -15,6 +16,26 @@ struct CounterState {
 #[derive(Debug)]
 struct CounterSnapshot {
     value: usize,
+}
+
+struct CounterCodec;
+
+impl CheckpointCodec<CounterSnapshot> for CounterCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new("group.example.counter", 1, "group.example.le-u64-v1")
+    }
+
+    fn encode_snapshot(&self, snapshot: &CounterSnapshot) -> Result<Vec<u8>, CheckpointCodecError> {
+        Ok(snapshot.value.to_le_bytes().to_vec())
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<CounterSnapshot, CheckpointCodecError> {
+        let value = bytes
+            .try_into()
+            .map(usize::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid counter snapshot"))?;
+        Ok(CounterSnapshot { value })
+    }
 }
 
 struct Increment;
@@ -61,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_edge("second", END);
     let compiled = graph.compile()?;
 
-    let checkpointer = Arc::new(InMemoryCheckpointer::<CounterSnapshot>::new());
+    let checkpointer = Arc::new(InMemoryCheckpointer::new(CounterCodec));
     let checkpoint_config = CheckpointConfig::new(
         "example-thread",
         Arc::clone(&checkpointer) as Arc<dyn Checkpointer<CounterSnapshot>>,

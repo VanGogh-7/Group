@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    Checkpoint, CheckpointConfig, CheckpointPolicy, CheckpointRequest, CheckpointState,
-    CheckpointWriteError, Checkpointer, CheckpointerError, CompiledGraph, END, EventConfig,
-    EventRetention, EventSink, GraphEvent, GraphRunError, GraphState, InMemoryCheckpointer, Node,
-    NodeContext, NodeError, NodeId, NodeUpdate, RunConfig, RunControl, RunFailure, START,
-    SnapshotError, StateError, StateGraph, ThreadId,
+    Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy,
+    CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError,
+    CodecDescriptor, CompiledGraph, END, EventConfig, EventRetention, EventSink, GraphEvent,
+    GraphRunError, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError, NodeId,
+    NodeUpdate, RunConfig, RunControl, RunFailure, START, SnapshotError, StateError, StateGraph,
+    ThreadId,
 };
 use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,34 @@ struct TestState {
 #[derive(Debug, Eq, PartialEq)]
 struct TestSnapshot {
     value: usize,
+}
+
+struct TestCodec;
+
+impl CheckpointCodec<TestSnapshot> for TestCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new(
+            "group.tests.checkpointing",
+            1,
+            "group.tests.checkpointing.le-usize-v1",
+        )
+    }
+
+    fn encode_snapshot(&self, snapshot: &TestSnapshot) -> Result<Vec<u8>, CheckpointCodecError> {
+        Ok(snapshot.value.to_le_bytes().to_vec())
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<TestSnapshot, CheckpointCodecError> {
+        let value = bytes
+            .try_into()
+            .map(usize::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid TestSnapshot bytes"))?;
+        Ok(TestSnapshot { value })
+    }
+}
+
+fn new_store() -> Arc<InMemoryCheckpointer<TestSnapshot>> {
+    Arc::new(InMemoryCheckpointer::new(TestCodec))
 }
 
 #[derive(Clone, Copy)]
@@ -181,7 +210,7 @@ async fn invoke_checkpointed(
 
 #[tokio::test]
 async fn every_successful_superstep_saves_with_parent_frontier_and_completed_metadata() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let report = invoke_checkpointed(
         &linear_graph(),
         state(),
@@ -247,7 +276,7 @@ async fn every_successful_superstep_saves_with_parent_frontier_and_completed_met
 
 #[tokio::test]
 async fn final_only_policy_saves_one_completed_checkpoint() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     invoke_checkpointed(
         &linear_graph(),
         state(),
@@ -273,7 +302,7 @@ async fn zero_node_graph_saves_one_completed_checkpoint_for_both_policies() {
         ("zero-every", CheckpointPolicy::EverySuperstep),
         ("zero-final", CheckpointPolicy::FinalOnly),
     ] {
-        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let checkpointer = new_store();
         let report = invoke_checkpointed(
             &zero_node_graph(),
             state(),
@@ -320,7 +349,7 @@ async fn zero_node_graph_saves_one_completed_checkpoint_for_both_policies() {
 
 #[tokio::test]
 async fn successive_runs_on_one_thread_extend_one_parent_chain() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let graph = linear_graph();
     let first = invoke_checkpointed(
         &graph,
@@ -357,7 +386,7 @@ async fn successive_runs_on_one_thread_extend_one_parent_chain() {
 
 #[tokio::test]
 async fn explicit_no_parent_does_not_attach_a_new_run_to_existing_latest() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let graph = zero_node_graph();
     invoke_checkpointed(
         &graph,
@@ -403,7 +432,7 @@ async fn explicit_no_parent_does_not_attach_a_new_run_to_existing_latest() {
 
 #[tokio::test]
 async fn thread_histories_are_isolated_including_concurrent_runs() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let graph = linear_graph();
     let (first, second) = tokio::join!(
         invoke_checkpointed(
@@ -453,7 +482,7 @@ async fn thread_histories_are_isolated_including_concurrent_runs() {
 
 #[tokio::test]
 async fn failed_parallel_superstep_and_batch_merge_create_no_new_checkpoint() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let graph = parallel_graph();
 
     let mut node_failure = state();
@@ -555,7 +584,7 @@ impl Checkpointer<TestSnapshot> for OrderedConflictCheckpointer {
 
 #[tokio::test]
 async fn concurrent_runs_on_one_thread_conflict_without_crossing_parent_chains() {
-    let inner = Arc::new(InMemoryCheckpointer::new());
+    let inner = new_store();
     let checkpointer = Arc::new(OrderedConflictCheckpointer {
         inner: Arc::clone(&inner),
         arrived: Barrier::new(2),
@@ -929,7 +958,7 @@ async fn zero_node_snapshot_and_save_failures_have_terminal_events_without_compl
     let snapshot_sink = Arc::new(RecordingSink::default());
     let mut snapshot_state = state();
     snapshot_state.snapshot_fail_at = Some(0);
-    let snapshot_store = Arc::new(InMemoryCheckpointer::new());
+    let snapshot_store = new_store();
     let snapshot_error = graph
         .invoke_with_checkpoint(
             snapshot_state,
@@ -1024,7 +1053,7 @@ async fn zero_node_snapshot_and_save_failures_have_terminal_events_without_compl
 #[tokio::test]
 async fn zero_node_cancel_and_timeout_fail_before_snapshot_and_completion() {
     let graph = zero_node_graph();
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let cancelled_sink = Arc::new(RecordingSink::default());
     let token = CancellationToken::new();
     token.cancel();
@@ -1386,7 +1415,7 @@ async fn run_timeout_wins_when_save_result_has_the_same_deadline() {
 
 #[tokio::test]
 async fn snapshot_failure_preserves_prior_checkpoint_and_source_context() {
-    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let checkpointer = new_store();
     let sink = Arc::new(RecordingSink::default());
     let mut initial_state = state();
     initial_state.snapshot_fail_at = Some(3);

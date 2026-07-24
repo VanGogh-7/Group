@@ -5,11 +5,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use group_agent_core::{
-    Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
-    CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError, CompiledGraph, END,
-    EventConfig, EventRetention, GraphState, InMemoryCheckpointer, InterruptibleNode, Node,
-    NodeContext, NodeError, NodeId, NodeOutcome, NodeUpdate, ResumeConfig, RunConfig, RunControl,
-    START, SnapshotError, StateError, StateGraph, ThreadId,
+    Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointId,
+    CheckpointPolicy, CheckpointRecord, CheckpointRecordParts, CheckpointRequest, CheckpointState,
+    CheckpointStore, CheckpointWriteError, Checkpointer, CheckpointerError, CodecDescriptor,
+    CompiledGraph, END, EncodedValue, EventConfig, EventRetention, GraphState, GraphVersion,
+    InMemoryCheckpointStore, InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node,
+    NodeContext, NodeError, NodeId, NodeOutcome, NodePath, NodeUpdate, RecordCheckpointer,
+    ResumeConfig, RunConfig, RunControl, RunId, START, SnapshotError, StateError, StateGraph,
+    ThreadId,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +47,50 @@ impl CheckpointState for BenchState {
 
     fn restore(snapshot: &Self::Snapshot) -> Result<Self, SnapshotError> {
         Ok(Self { steps: *snapshot })
+    }
+}
+
+struct BenchCodec;
+
+impl CheckpointCodec<usize> for BenchCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new("group.bench.usize", 1, "group.bench.raw-v1")
+    }
+
+    fn encode_snapshot(&self, snapshot: &usize) -> Result<Vec<u8>, CheckpointCodecError> {
+        Ok(snapshot.to_le_bytes().to_vec())
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<usize, CheckpointCodecError> {
+        bytes
+            .try_into()
+            .map(usize::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid benchmark snapshot"))
+    }
+
+    fn encode_interrupt(
+        &self,
+        payload: &InterruptPayload,
+    ) -> Result<EncodedValue, CheckpointCodecError> {
+        payload
+            .downcast_ref::<()>()
+            .ok_or_else(|| CheckpointCodecError::unsupported_interrupt(payload))?;
+        Ok(EncodedValue::new(
+            CodecDescriptor::new("group.bench.unit", 1, "group.bench.raw-v1"),
+            Vec::<u8>::new(),
+        ))
+    }
+
+    fn decode_interrupt(
+        &self,
+        value: &EncodedValue,
+    ) -> Result<InterruptPayload, CheckpointCodecError> {
+        if value.descriptor() != &CodecDescriptor::new("group.bench.unit", 1, "group.bench.raw-v1")
+            || !value.bytes().is_empty()
+        {
+            return Err(CheckpointCodecError::message("invalid benchmark interrupt"));
+        }
+        Ok(InterruptPayload::new(()))
     }
 }
 
@@ -284,7 +331,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
     let uncancelled_token = CancellationToken::new();
-    let middle_store = Arc::new(InMemoryCheckpointer::new());
+    let middle_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
     runtime
         .block_on(fixed_2.invoke_with_checkpoint(
             BenchState::default(),
@@ -302,11 +349,40 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .block_on(middle_store.latest(&ThreadId::from("resume-middle-benchmark")))
         .expect("middle checkpoint query should succeed")
         .expect("middle checkpoint should exist");
+    let middle_record = runtime
+        .block_on(
+            middle_store
+                .record_store()
+                .latest(&ThreadId::from("resume-middle-benchmark")),
+        )
+        .expect("middle record query should succeed")
+        .expect("middle record should exist");
     let middle_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
         checkpoint: middle_checkpoint,
     });
 
-    let completed_store = Arc::new(InMemoryCheckpointer::new());
+    let record_checkpoint_id = CheckpointId::new();
+    let record_run_id = RunId::new();
+    let record_sample = CheckpointRecord::try_from_parts(CheckpointRecordParts {
+        format_version: group_agent_core::CheckpointFormatVersion::CURRENT,
+        checkpoint_id: record_checkpoint_id,
+        thread_id: ThreadId::from("record-benchmark"),
+        run_id: record_run_id,
+        parent_id: None,
+        graph_version: Some(GraphVersion::from("benchmark-v1")),
+        superstep: 1,
+        step: 1,
+        snapshot: EncodedValue::new(
+            BenchCodec.snapshot_descriptor(),
+            1_usize.to_le_bytes().to_vec(),
+        ),
+        next_frontier: vec![NodePath::from("node_1")],
+        completed: false,
+        interrupt: None,
+    })
+    .expect("benchmark record should be valid");
+
+    let completed_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
     runtime
         .block_on(fixed_2.invoke_with_checkpoint(
             BenchState::default(),
@@ -327,7 +403,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let completed_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
         checkpoint: completed_checkpoint,
     });
-    let interrupted_store = Arc::new(InMemoryCheckpointer::new());
+    let interrupted_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
     runtime
         .block_on(interrupt_graph.invoke_with_checkpoint(
             BenchState::default(),
@@ -349,7 +425,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         checkpoint: interrupted_checkpoint,
     });
 
-    let subgraph_middle_store = Arc::new(InMemoryCheckpointer::new());
+    let subgraph_middle_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
     runtime
         .block_on(subgraph_resume_graph.invoke_with_checkpoint(
             BenchState::default(),
@@ -371,7 +447,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         checkpoint: subgraph_middle_checkpoint,
     });
 
-    let subgraph_interrupted_store = Arc::new(InMemoryCheckpointer::new());
+    let subgraph_interrupted_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
     runtime
         .block_on(subgraph_interrupt_graph.invoke_with_checkpoint(
             BenchState::default(),
@@ -396,6 +472,72 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         Arc::new(ResumeBenchCheckpointer {
             checkpoint: subgraph_interrupted_checkpoint,
         });
+
+    criterion.bench_function("uuid_v4_id_generation", |bencher| {
+        bencher.iter(|| black_box(RunId::new()));
+    });
+
+    criterion.bench_function("checkpoint_record_encode", |bencher| {
+        bencher.iter(|| {
+            let bytes = BenchCodec
+                .encode_snapshot(black_box(&1_usize))
+                .expect("benchmark snapshot should encode");
+            black_box(
+                CheckpointRecord::try_from_parts(CheckpointRecordParts {
+                    format_version: group_agent_core::CheckpointFormatVersion::CURRENT,
+                    checkpoint_id: record_checkpoint_id,
+                    thread_id: ThreadId::from("record-benchmark"),
+                    run_id: record_run_id,
+                    parent_id: None,
+                    graph_version: Some(GraphVersion::from("benchmark-v1")),
+                    superstep: 1,
+                    step: 1,
+                    snapshot: EncodedValue::new(BenchCodec.snapshot_descriptor(), bytes),
+                    next_frontier: vec![NodePath::from("node_1")],
+                    completed: false,
+                    interrupt: None,
+                })
+                .expect("benchmark record should be valid"),
+            );
+        });
+    });
+
+    criterion.bench_function("checkpoint_record_decode", |bencher| {
+        bencher.iter(|| {
+            black_box(
+                Checkpoint::<usize>::from_record(black_box(&record_sample), &BenchCodec)
+                    .expect("benchmark record should decode"),
+            );
+        });
+    });
+
+    criterion.bench_function(
+        "record_reconstruction_resume_one_node_and_final_save",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    let store = Arc::new(
+                        InMemoryCheckpointStore::try_from_records([middle_record.as_ref().clone()])
+                            .expect("persisted setup record should import"),
+                    );
+                    let adapter: Arc<dyn Checkpointer<usize>> = Arc::new(RecordCheckpointer::new(
+                        store as Arc<dyn CheckpointStore>,
+                        Arc::new(BenchCodec),
+                    ));
+                    ResumeConfig::new("resume-middle-benchmark", adapter)
+                        .with_run_config(RunConfig::new(1))
+                },
+                |config| async {
+                    let outcome = fixed_2
+                        .resume(config)
+                        .await
+                        .expect("record resume benchmark should succeed");
+                    black_box(outcome.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
 
     criterion.bench_function("compile_fixed_linear_100_nodes", |bencher| {
         bencher.iter(|| {
@@ -552,7 +694,8 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     criterion.bench_function("interrupt_save_single_node", |bencher| {
         bencher.to_async(&runtime).iter_batched(
             || {
-                let store: Arc<dyn Checkpointer<usize>> = Arc::new(InMemoryCheckpointer::new());
+                let store: Arc<dyn Checkpointer<usize>> =
+                    Arc::new(InMemoryCheckpointer::new(BenchCodec));
                 (
                     BenchState::default(),
                     CheckpointConfig::new(
@@ -608,7 +751,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
             bencher.to_async(&runtime).iter_batched(
                 || {
                     let checkpointer: Arc<dyn Checkpointer<usize>> =
-                        Arc::new(InMemoryCheckpointer::new());
+                        Arc::new(InMemoryCheckpointer::new(BenchCodec));
                     (
                         BenchState::default(),
                         RunConfig::default(),
@@ -655,17 +798,21 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     });
 
     criterion.bench_function("invoke_no_retention_no_sink_10_nodes", |bencher| {
-        bencher.to_async(&runtime).iter(|| async {
-            let report = fixed_10
-                .invoke_with_events(
-                    BenchState::default(),
-                    RunConfig::default(),
-                    EventConfig::new(EventRetention::None),
-                )
-                .await
-                .expect("benchmark invocation should succeed");
-            black_box(report.steps());
-        });
+        bencher.to_async(&runtime).iter_batched(
+            BenchState::default,
+            |initial_state| async {
+                let report = fixed_10
+                    .invoke_with_events(
+                        initial_state,
+                        RunConfig::default(),
+                        EventConfig::new(EventRetention::None),
+                    )
+                    .await
+                    .expect("benchmark invocation should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     criterion.bench_function("invoke_node_timeout_immediate_10_nodes", |bencher| {

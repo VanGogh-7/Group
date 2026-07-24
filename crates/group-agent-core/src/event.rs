@@ -1,33 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{CheckpointId, CheckpointIncompatibility, GraphPath, InterruptId, NodePath, ThreadId};
-
-static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
-
-/// A lightweight identifier that distinguishes graph invocations.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RunId(u64);
-
-impl RunId {
-    pub(crate) fn next() -> Self {
-        Self(NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Returns the numeric run identifier.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for RunId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+use crate::{
+    CheckpointId, CheckpointIncompatibility, GraphPath, InterruptId, NodePath, RunId, ThreadId,
+};
 
 /// Controls whether emitted events are retained in a successful run report.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -171,6 +148,12 @@ pub enum RunFailure {
     CheckpointIdConflict {
         thread_id: ThreadId,
         checkpoint_id: CheckpointId,
+        superstep: usize,
+        step: usize,
+    },
+    /// Encoding typed checkpoint data failed before storage.
+    CheckpointEncodeFailed {
+        thread_id: ThreadId,
         superstep: usize,
         step: usize,
     },

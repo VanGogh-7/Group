@@ -618,7 +618,7 @@ where
             Ok(())
         };
 
-        for fan_out in edges.fan_out_by_source.values() {
+        for fan_out in &self.fan_out_edges {
             enqueue_frontier(fan_out.targets.clone(), &mut queued, &mut work)?;
         }
 

@@ -7,8 +7,8 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 9 adds shared-state subgraphs and structured execution namespaces while
-preserving typed suspension and latest-only checkpoint lineage:
+Stage 10.1 corrects the durable checkpoint contract while preserving Stage 9
+shared-state subgraphs, typed suspension, and latest-only lineage:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
@@ -35,7 +35,8 @@ The current core includes:
 - concurrent node futures without per-node task spawning;
 - explicit, deterministic parallel state-update merging;
 - opt-in snapshots and asynchronous replaceable checkpoint storage;
-- process-local, thread-safe `InMemoryCheckpointer`;
+- storage-neutral `CheckpointRecord` values and explicit Snapshot/payload codecs;
+- record-backed, thread-safe `InMemoryCheckpointer`;
 - latest and ordered history queries with CAS-protected checkpoint lineage;
 - restoration of state, frontier, cumulative step, and super-step position;
 - explicit graph-version compatibility and latest-only resume checks;
@@ -215,7 +216,8 @@ use group_agent_core::{
     CheckpointConfig, CheckpointPolicy, Checkpointer, InMemoryCheckpointer,
 };
 
-let store = Arc::new(InMemoryCheckpointer::<AgentSnapshot>::new());
+// AgentCheckpointCodec implements CheckpointCodec<AgentSnapshot>.
+let store = Arc::new(InMemoryCheckpointer::new(AgentCheckpointCodec));
 let config = CheckpointConfig::new(
     "conversation-42",
     Arc::clone(&store) as Arc<dyn Checkpointer<AgentSnapshot>>,
@@ -232,6 +234,48 @@ let report = compiled
     )
     .await?;
 ```
+
+### Durable record and codec boundary
+
+`CheckpointRecord` is the storage-neutral persistence model. It contains a
+separate `CheckpointFormatVersion`, checkpoint/thread/run/parent identifiers,
+optional `GraphVersion`, fixed-width `u64` cumulative step and super-step,
+structured
+`NodePath` frontier, completion/interrupt metadata, encoded Snapshot bytes, and
+optional encoded interrupt payload bytes. `CheckpointRecordParts` and
+`CheckpointRecord::try_from_parts` let an external backend reconstruct and
+validate records without private Runtime constructors.
+
+`CheckpointCodec<T>` supplies a stable Snapshot `CodecDescriptor`
+(`payload schema + schema version + codec/encoding identity`), byte
+encode/decode methods, and optional durable interrupt payload methods. Thus
+JSON, bincode, and other encodings cannot collide merely because they reuse a
+schema name and version. Descriptor mismatch is rejected before decoding.
+`EncodedValue` equality includes the complete descriptor and bytes.
+
+The codec must emit deterministic, canonical bytes for the same logical value;
+otherwise stable-content idempotency cannot be guaranteed. It does not require
+`GraphState`, Snapshot, or payload types to implement Serde or Clone. Codec
+calls are synchronous and always occur outside store locks. Format, descriptor,
+counter-conversion, and decode failures are structured and retain complete
+codec source chains.
+
+Typed Runtime counters remain `usize`. Record reconstruction converts both
+`u64` counters with `usize::try_from` and returns a structured incompatibility
+when the current target cannot represent a value; it never silently truncates.
+
+`CheckpointStore` is the asynchronous record port for third-party durable
+backends. `RecordCheckpointer<T>` combines a store and codec into the typed
+Runtime `Checkpointer<T>` boundary. `InMemoryCheckpointStore` implements the
+same record CAS/idempotency contract; `InMemoryCheckpointer<T>` is its
+convenient typed adapter. The in-memory store remains process-local, but its
+records can be exported and reconstructed by a fresh store/adapter instance.
+
+`CheckpointId`, `InterruptId`, and `RunId` are UUID v4-backed values. They
+support display, parsing, hashing, and stable 16-byte reconstruction and do not
+depend on process-local counters. `CheckpointFormatVersion` is independent of
+`GraphVersion`: the former versions the record layout, while the latter
+versions the complete graph and state semantics.
 
 Graphs intended for checkpoint resume must have an explicit compatibility
 version before compilation:
@@ -277,10 +321,10 @@ returns a checkpoint owned by another thread. History is ordered oldest to
 newest.
 
 A checkpoint parent represents the state lineage on which execution was based,
-not the previous insertion by wall-clock order. Each write carries both a
+not the previous insertion by wall-clock order. Each record carries both a
 Runtime-assigned `CheckpointId` idempotency key and an `expected_parent`.
-`InMemoryCheckpointer` compares the thread's latest checkpoint with that
-expected parent and inserts atomically under one short lock. A mismatch returns
+`CheckpointStore::save` compares the thread's latest record with that expected
+parent and inserts atomically. A mismatch returns
 `GraphRunError::CheckpointConflict`; it never silently joins unrelated runs.
 Consequently, concurrent runs using the same `ThreadId` and base normally race:
 the first accepted write advances the lineage and the other conflicts.
@@ -292,15 +336,17 @@ The exact save boundary is:
 1. every node in the frontier succeeds;
 2. `apply` or `apply_batch` commits successfully;
 3. all successor routing succeeds and the next frontier is stable;
-4. the user snapshot is created outside storage locks;
-5. the checkpointer saves it before Runtime enters the next super-step.
+4. the user snapshot is created and encoded outside storage locks;
+5. the checkpointer atomically stores the record before Runtime enters the next
+   super-step.
 
 A failing node, batch merge, state apply, or router does not create a checkpoint
-for that super-step. Snapshot, conflict, and storage failures return structured
-`GraphRunError::SnapshotFailed`, `CheckpointConflict`, or
-`CheckpointSaveFailed`, emit one final `RunFailed`, and stop execution. State
-already committed at the boundary and external node side effects are not rolled
-back.
+for that super-step. Snapshot, encoding, conflict, and storage failures return
+structured `GraphRunError::SnapshotFailed`, `CheckpointEncodeFailed`,
+`CheckpointConflict`, or `CheckpointSaveFailed`, emit one final `RunFailed`,
+and stop execution. State already committed at the boundary and external node
+side effects are not rolled back. Record reconstruction failures remain
+structured sources of `CheckpointLoadFailed`.
 
 Run cancellation and run timeout remain active while the asynchronous save
 future is pending. Cancellation has priority over run timeout, and both have
@@ -309,19 +355,22 @@ boundary context (`node_id = None`, with the cumulative completed step count),
 emit exactly one `RunFailed`, and emit neither `CheckpointSaved` nor
 `RunCompleted`. Dropping a save future cannot prove that a backend produced no
 side effect: storage may have committed before its future returned. Custom
-checkpointers must therefore treat `CheckpointRequest::checkpoint_id()` as an
-idempotency key. An exact replay with the same metadata and snapshot `Arc`
-returns the original result even if latest has advanced. Reusing the same ID
-with different lineage, graph version, boundary, frontier, completion, or
-snapshot metadata returns `CheckpointWriteError::IdempotencyConflict`.
-`InMemoryCheckpointer` implements this contract.
+stores must therefore treat `CheckpointRecord::id()` as an idempotency key.
+An exact replay with identical stable record content returns the original
+record even if latest has advanced; Snapshot or payload `Arc` identity is
+irrelevant. Reusing the same ID with different bytes, lineage, format/schema
+version, graph version, frontier, completion, or interrupt metadata returns
+`CheckpointWriteError::IdempotencyConflict`. Idempotency lookup precedes parent
+CAS, and both checks plus insertion are atomic. `InMemoryCheckpointStore`
+implements this contract.
 
-Snapshot creation is synchronous and cannot be preempted. It occurs before
-entering storage and never under the in-memory store lock. A legal
+Snapshot creation and codec work are synchronous and cannot be preempted. They
+occur before entering storage and never under the in-memory store lock. A legal
 `START -> END` graph saves exactly one completed checkpoint under either
 policy, with `superstep = 0`, `step = 0`, an empty frontier, and the configured
 expected parent. Its successful terminal order is `CheckpointSaved` followed
-by `RunCompleted`. The in-memory implementation provides no database durability.
+by `RunCompleted`. The in-memory implementation provides no database
+durability.
 See [`examples/checkpoint.rs`](crates/group-agent-core/examples/checkpoint.rs).
 
 ## Resume from checkpoint
@@ -354,7 +403,10 @@ completed/frontier consistency, and every saved frontier `NodePath`, resolving
 it to compiled internal indices in O(F). `START`, explicit
 `END`, unknown or invalid namespaced nodes, unversioned data, and version
 mismatches produce
-`CheckpointIncompatible`.
+`CheckpointIncompatible`. The frontier must also contain no duplicate path, be
+ordered by compiled internal index, and remain within one `GraphPath`
+namespace. These checks traverse only the actual frontier, do not scan the
+compiled graph, and occur before `CheckpointState::restore`.
 
 Only after every compatibility check and frontier resolution succeeds does the
 Runtime call `CheckpointState::restore` outside the storage lock. The resolved
@@ -469,8 +521,11 @@ should normally occur only after the node validates its Resume value.
 
 Interrupts are supported only from singleton frontiers. An interrupt observed
 in a parallel frontier drops remaining futures, commits none of that
-super-step's updates, and returns `UnsupportedParallelInterrupt`. Payloads are
-process-local and have no persistent serialization format. See
+super-step's updates, and returns `UnsupportedParallelInterrupt`. Payloads
+created by `InterruptRequest` are typed and process-local until the configured
+`CheckpointCodec` provides a durable encoding. A record-backed write with an
+unsupported payload fails explicitly with `CheckpointEncodeFailed`; it never
+silently drops the payload. See
 [`examples/interrupt.rs`](crates/group-agent-core/examples/interrupt.rs).
 
 ## Event observation
@@ -578,6 +633,25 @@ Compatibility accessors named `node_id()` remain available on
 `NodeContext`, `NodeUpdate`, and checkpoint interrupt metadata; use their
 `node_path()` accessors when the complete namespace is required. Display output
 is diagnostic only and must not be parsed for Runtime navigation.
+
+### Durable checkpoint API migration in Stage 10.1
+
+- `InMemoryCheckpointer::new` now requires a `CheckpointCodec<Snapshot>`.
+- Durable backends implement the non-generic `CheckpointStore` record port and
+  use `RecordCheckpointer<T>` for Runtime integration.
+- `CheckpointRecord`, `CheckpointRecordParts`, `EncodedValue`, and
+  `Checkpoint::from_record` are the public persistence/reconstruction boundary.
+- `CodecDescriptor::new` now requires independent schema, schema-version, and
+  encoding identities; use `schema_version()` instead of the old `version()`
+  accessor. `EncodedValue` and record idempotency compare all three.
+- Durable Record step and super-step fields are now `u64`; typed
+  `Checkpoint<T>` and Runtime counters remain `usize` with checked
+  reconstruction.
+- `CheckpointId`, `InterruptId`, and `RunId` changed from numeric process-local
+  counters to UUID-backed values. Use `Display`/`FromStr`, `from_bytes`, or
+  `from_uuid`; numeric `get()` construction/access no longer applies.
+- `CheckpointWriteError` can now report `Encoding`, and Runtime exposes
+  `CheckpointEncodeFailed` plus the corresponding `RunFailure`.
 
 ## Execution control
 
@@ -713,10 +787,10 @@ public trait future. A normal `async-trait` node therefore keeps its one
 required boxed trait future instead of passing through a second boxed adapter
 future.
 
-Checkpointing adds no storage call, snapshot creation, or lock acquisition to a
-normal invocation. Enabled runs construct only next-frontier metadata and never
-scan the complete graph. Snapshot cost is defined entirely by the user's
-`CheckpointState` implementation.
+Checkpointing adds no storage call, snapshot creation, codec work, or lock
+acquisition to a normal invocation. Enabled runs construct only next-frontier
+metadata and never scan the complete graph. Snapshot and codec cost are defined
+entirely by user implementations.
 
 Criterion benchmarks provide regression baselines only; no comparative
 performance claim is made.
@@ -737,7 +811,9 @@ no-op resume baselines. Stage 8 adds singleton interrupt-save and
 interrupt-resume-plus-final-save baselines. Stage 9 adds the normal-node
 single-box path, a ten-node shared-state child, two-level nesting, child
 checkpoint/resume, and child interrupt/resume. These are regression baselines
-without performance thresholds or cross-framework claims.
+without performance thresholds or cross-framework claims. Stage 10.1 adds UUID
+v4 generation, controlled default/retention/checkpoint invocation cases, Record
+encode/decode, and fresh-adapter record reconstruction plus Resume.
 
 ## Workspace
 
@@ -763,11 +839,15 @@ without performance thresholds or cross-framework claims.
         │   └── subgraph.rs
         ├── src
         │   ├── checkpoint.rs
+        │   ├── checkpoint_codec.rs
+        │   ├── checkpoint_record.rs
+        │   ├── checkpoint_store.rs
         │   ├── context.rs
         │   ├── edge.rs
         │   ├── error.rs
         │   ├── event.rs
         │   ├── graph.rs
+        │   ├── id.rs
         │   ├── lib.rs
         │   ├── node.rs
         │   ├── path.rs
@@ -777,6 +857,7 @@ without performance thresholds or cross-framework claims.
             ├── compile_validation.rs
             ├── checkpointing.rs
             ├── conditional_routing.rs
+            ├── durable_checkpoint.rs
             ├── execution_control.rs
             ├── interrupt.rs
             ├── linear_execution.rs
@@ -805,17 +886,17 @@ cargo bench --workspace --no-run
 
 This stage does not support parent/child State mapping, parent-frontier parallel
 subgraphs, parallel interrupts, Replay, Fork, Time Travel, SQLite, PostgreSQL,
-SQLx, snapshot or payload serialization, conditional or dynamic fan-out,
-built-in Tokio channels or streams, standalone reducer registration, LLM or
-tool APIs, MCP, RAG, token streaming, Tower middleware, Axum, HTTP services,
-distributed workers, macro DSLs, or visualization. The event sink and
-Checkpointer are adapter boundaries for later integrations; those excluded
-capabilities are not implemented here.
+SQLx, built-in Serde codecs or database durability, conditional or dynamic
+fan-out, built-in Tokio channels or streams, standalone reducer registration,
+LLM or tool APIs, MCP, RAG, token streaming, Tower middleware, Axum, HTTP
+services, distributed workers, macro DSLs, or visualization. The event sink and
+`CheckpointStore` are adapter boundaries for later integrations; those
+excluded capabilities are not implemented here.
 
 ## Architecture review cadence
 
 After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before continuing feature stages. Corrective
 stages such as Stage 5.1 do not count toward this ten-stage cadence.
-After Stage 9 Review passes, Stage 10 is the next full-repository architecture
-review.
+Stage 9.1 Review has passed. Stage 10.1 supplies the durable-checkpoint contract
+correction required by the Stage 10 architecture review.

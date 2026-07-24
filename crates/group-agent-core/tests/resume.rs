@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use group_agent_core::{
-    Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointPolicy,
-    CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError,
-    CompiledGraph, END, EventConfig, EventRetention, EventSink, GraphEvent, GraphRunError,
-    GraphState, GraphVersion, InMemoryCheckpointer, Node, NodeContext, NodeError, NodeId,
-    ResumeConfig, RunConfig, RunControl, RunFailure, START, SnapshotError, StateError, StateGraph,
-    ThreadId,
+    Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointId,
+    CheckpointIncompatibility, CheckpointPolicy, CheckpointRequest, CheckpointState,
+    CheckpointWriteError, Checkpointer, CheckpointerError, CodecDescriptor, CompiledGraph, END,
+    EventConfig, EventRetention, EventSink, GraphEvent, GraphRunError, GraphState, GraphVersion,
+    InMemoryCheckpointer, Node, NodeContext, NodeError, NodeId, ResumeConfig, RunConfig,
+    RunControl, RunFailure, START, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,39 @@ struct ResumeSnapshot {
     value: usize,
     fail_restore: bool,
     restore_calls: Arc<AtomicUsize>,
+}
+
+struct ResumeCodec;
+
+impl CheckpointCodec<ResumeSnapshot> for ResumeCodec {
+    fn snapshot_descriptor(&self) -> CodecDescriptor {
+        CodecDescriptor::new("group.tests.resume", 1, "group.tests.resume.le-usize-v1")
+    }
+
+    fn encode_snapshot(&self, snapshot: &ResumeSnapshot) -> Result<Vec<u8>, CheckpointCodecError> {
+        let mut bytes = snapshot.value.to_le_bytes().to_vec();
+        bytes.push(u8::from(snapshot.fail_restore));
+        Ok(bytes)
+    }
+
+    fn decode_snapshot(&self, bytes: &[u8]) -> Result<ResumeSnapshot, CheckpointCodecError> {
+        let (fail_restore, value_bytes) = bytes
+            .split_last()
+            .ok_or_else(|| CheckpointCodecError::message("empty ResumeSnapshot"))?;
+        let value = value_bytes
+            .try_into()
+            .map(usize::from_le_bytes)
+            .map_err(|_| CheckpointCodecError::message("invalid ResumeSnapshot value"))?;
+        Ok(ResumeSnapshot {
+            value,
+            fail_restore: *fail_restore != 0,
+            restore_calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+fn new_store() -> Arc<InMemoryCheckpointer<ResumeSnapshot>> {
+    Arc::new(InMemoryCheckpointer::new(ResumeCodec))
 }
 
 impl GraphState for ResumeState {
@@ -243,7 +276,7 @@ impl EventSink for RecordingSink {
 #[tokio::test]
 async fn resume_from_middle_matches_uninterrupted_result_and_continues_lineage() {
     let graph = linear_graph("linear-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let middle = create_middle_checkpoint(&graph, "resume-middle", &store, false).await;
     assert_eq!(
         middle.graph_version(),
@@ -315,7 +348,7 @@ async fn resume_from_middle_matches_uninterrupted_result_and_continues_lineage()
 #[tokio::test]
 async fn resume_max_steps_is_an_additional_budget() {
     let graph = linear_graph("budget-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     create_middle_checkpoint(&graph, "resume-budget", &store, false).await;
 
     let error = graph
@@ -348,7 +381,7 @@ async fn resume_max_steps_is_an_additional_budget() {
 #[tokio::test]
 async fn completed_checkpoint_resume_is_a_no_op_without_duplicate_save() {
     let graph = linear_graph("completed-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     graph
         .invoke_with_checkpoint(
             ResumeState::default(),
@@ -408,7 +441,7 @@ async fn completed_checkpoint_resume_is_a_no_op_without_duplicate_save() {
 #[tokio::test]
 async fn explicit_non_latest_checkpoint_is_rejected_without_forking() {
     let graph = linear_graph("conflict-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     graph
         .invoke_with_checkpoint(
             ResumeState::default(),
@@ -463,7 +496,7 @@ async fn latest_advancing_after_validation_causes_first_resume_save_to_conflict(
         Arc::clone(&started),
         Arc::clone(&release),
     ));
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let base = create_middle_checkpoint(&graph, "cas-race", &store, false).await;
     let node_started = started.notified();
 
@@ -534,7 +567,7 @@ async fn latest_advancing_after_validation_causes_first_resume_save_to_conflict(
 #[tokio::test]
 async fn graph_version_mismatch_and_unknown_frontier_are_incompatible() {
     let v1 = linear_graph("version-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let (checkpoint, version_restore_calls) =
         create_middle_checkpoint_with_counter(&v1, "version", &store, false).await;
     let v2 = linear_graph("version-v2");
@@ -563,7 +596,7 @@ async fn graph_version_mismatch_and_unknown_frontier_are_incompatible() {
     assert_eq!(version_restore_calls.load(Ordering::SeqCst), 0);
 
     let source = two_node_graph("frontier-v1", "obsolete");
-    let frontier_store = Arc::new(InMemoryCheckpointer::new());
+    let frontier_store = new_store();
     let (_, frontier_restore_calls) =
         create_middle_checkpoint_with_counter(&source, "unknown-frontier", &frontier_store, true)
             .await;
@@ -588,7 +621,7 @@ async fn graph_version_mismatch_and_unknown_frontier_are_incompatible() {
 #[tokio::test]
 async fn unversioned_checkpoint_is_incompatible_with_resume() {
     let graph = unversioned_linear_graph();
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let (_, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "unversioned", &store, false).await;
     let error = graph
@@ -639,7 +672,7 @@ impl std::error::Error for RestoreLayerError {
 #[tokio::test]
 async fn restore_failure_preserves_source_chain_emits_once_and_graph_is_reusable() {
     let graph = linear_graph("restore-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let (_, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "restore-failure", &store, true).await;
     let sink = Arc::new(RecordingSink::default());
@@ -729,7 +762,7 @@ async fn restore_failure_preserves_source_chain_emits_once_and_graph_is_reusable
 #[tokio::test]
 async fn missing_checkpoint_and_pre_cancelled_resume_fail_after_run_started() {
     let graph = linear_graph("missing-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     let missing = graph
         .resume(ResumeConfig::new(
             "missing",
@@ -826,7 +859,7 @@ impl Checkpointer<ResumeSnapshot> for BlockingLatestCheckpointer {
 #[tokio::test(start_paused = true)]
 async fn run_timeout_remains_active_while_loading_resume_checkpoint() {
     let graph = Arc::new(linear_graph("timeout-v1"));
-    let inner = Arc::new(InMemoryCheckpointer::new());
+    let inner = new_store();
     create_middle_checkpoint(&graph, "load-timeout", &inner, false).await;
     let checkpointer = Arc::new(BlockingLatestCheckpointer {
         inner,
@@ -869,7 +902,7 @@ async fn run_timeout_remains_active_while_loading_resume_checkpoint() {
 #[tokio::test]
 async fn cancellation_during_checkpoint_load_is_observed_before_restore() {
     let graph = Arc::new(linear_graph("load-cancel-v1"));
-    let inner = Arc::new(InMemoryCheckpointer::new());
+    let inner = new_store();
     let (_, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "load-cancel", &inner, false).await;
     let checkpointer = Arc::new(BlockingLatestCheckpointer {
@@ -1027,7 +1060,7 @@ impl EventSink for CancelOnResumeSink {
 #[tokio::test]
 async fn completed_resume_control_failures_have_stable_event_order() {
     let graph = linear_graph("completed-control-v1");
-    let store = Arc::new(InMemoryCheckpointer::new());
+    let store = new_store();
     graph
         .invoke_with_checkpoint(
             ResumeState::default(),

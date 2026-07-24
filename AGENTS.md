@@ -214,6 +214,19 @@ The current core supports immutable compiled state graphs with:
   checkpointer method, or acquire a checkpoint lock.
 - `CheckpointState` defines a separate `Snapshot`, snapshot creation, and future
   restoration boundary without changing `GraphState`.
+- `CheckpointRecord` is the storage-neutral durable domain model.
+  `CheckpointFormatVersion` versions that layout independently of
+  `GraphVersion`.
+- `CheckpointCodec<T>` owns Snapshot and durable interrupt payload byte
+  conversion. Every `CodecDescriptor` separately identifies payload schema,
+  schema version, and codec/encoding. Codec work is synchronous and must run
+  outside store locks; it must not impose Serde or Clone on State.
+- `CheckpointStore` exchanges only records. `RecordCheckpointer<T>` adapts it
+  to the typed Runtime port. Third-party persistence implementations must not
+  depend on private Runtime constructors.
+- `CheckpointId`, `InterruptId`, and `RunId` use UUID v4 rather than
+  process-local counters and support display, parsing, hashing, and stable-byte
+  reconstruction.
 - Snapshot values are retained through `Arc`; latest/history queries must not
   deep-copy them.
 - Save only after all frontier nodes, state commit, and successor routing
@@ -225,6 +238,9 @@ The current core supports immutable compiled state graphs with:
 - Checkpoints retain checkpoint/thread/run identifiers, parent, super-step,
   cumulative step count, complete `NodePath` next frontier, Snapshot, and
   completed state.
+- Durable `CheckpointRecord` step and super-step fields are fixed-width `u64`.
+  Typed Runtime counters remain `usize`; reconstruction uses checked conversion
+  and rejects out-of-range records without truncation.
 - Parent means the state lineage used by execution, not storage insertion
   order. A new-state configuration explicitly expects no parent; a run based on
   a checkpoint must supply that checkpoint as `expected_parent`.
@@ -232,27 +248,34 @@ The current core supports immutable compiled state graphs with:
   expected parent. Checkpointers atomically compare thread latest with
   `expected_parent` before insertion. A mismatch is `CheckpointConflict`, so
   concurrent runs on one `ThreadId` do not silently cross-link parent chains.
-- `CheckpointRequest` carries a Runtime-assigned `CheckpointId` operation key.
-  Exact same-ID request replay, including the same Snapshot `Arc`, must return
-  the original result even after latest advances. Same ID with different
-  metadata must return `IdempotencyConflict`.
-- Snapshot logic is synchronous and cannot be preempted. It runs before
-  entering storage and never while an in-memory store lock is held.
+- A record carries a Runtime-assigned `CheckpointId` operation key. Same-ID,
+  same-content replay must return the original record even after latest
+  advances, regardless of Snapshot/payload `Arc` identity. Same ID with
+  different bytes, lineage, format/schema/encoding descriptor, graph version,
+  frontier, or interrupt metadata must return `IdempotencyConflict`. Codecs
+  must produce deterministic canonical bytes for equivalent logical values.
+- Idempotency lookup precedes expected-parent CAS. Idempotency, CAS, and
+  insertion must be atomic so concurrent writers cannot form an implicit Fork.
+- Snapshot and Codec logic are synchronous and cannot be preempted. They run
+  before entering storage and never while a store lock is held.
 - Cancellation and run timeout remain active while save is pending, with
   cancellation before run timeout before save result. Save-boundary control
   failures use no node identifier and the cumulative completed step count.
-- Snapshot, conflict, save, cancellation, or timeout failure emits one
-  `RunFailed`, no `CheckpointSaved` for an unconfirmed save, and no
+- Snapshot, encoding, conflict, save, cancellation, or timeout failure emits
+  one `RunFailed`, no `CheckpointSaved` for an unconfirmed save, and no
   `RunCompleted`. Runtime does not claim to roll back committed state, storage
   effects, or external node side effects.
-- `latest`, `get`, and `history` return shared checkpoint `Arc` values. `get`
-  is scoped by both ThreadId and CheckpointId.
+- Record queries and typed `latest`, `get`, and `history` adapters return shared
+  `Arc` values. `get` is scoped by both ThreadId and CheckpointId.
 - An interrupted checkpoint is neither completed nor a successful super-step
   commit. It retains an InterruptId, complete node path, shared typed payload,
   unchanged state snapshot, committed step/super-step counters, and a singleton
   frontier containing the interrupted node.
 - Interrupt checkpoints are mandatory regardless of `CheckpointPolicy`. A
   node interrupt without checkpointing is `InterruptRequiresCheckpoint`.
+- A typed interrupt payload is process-local unless the configured codec can
+  encode it. Record-backed storage must fail explicitly for an unsupported
+  local-only payload and must never discard it.
 
 ## Resume boundaries
 
@@ -262,9 +285,11 @@ The current core supports immutable compiled state graphs with:
   still be latest; otherwise return `ResumeConflict`. Fork is not implicit.
 - Validate ThreadId, latest-only status, explicit graph version,
   completion/frontier consistency, interrupt metadata, and each frontier
-  `NodePath` before calling `CheckpointState::restore`. START, explicit END,
-  unknown or illegal namespaced nodes, unversioned graphs/checkpoints, and
-  version mismatch are `CheckpointIncompatible`.
+  `NodePath` before calling `CheckpointState::restore`. A resumable frontier
+  must contain resolved executable paths exactly once, in compiled-index order,
+  and in one `GraphPath` namespace. START, explicit END, unknown paths,
+  duplicate nodes, non-canonical order, mixed namespaces, unversioned
+  graphs/checkpoints, and version mismatch are `CheckpointIncompatible`.
 - Graph version must change when topology, State/Snapshot schema, reducer, or
   router semantics become incompatible with existing checkpoints.
 - Resolve only the actual saved frontier through the compiled NodePath index
@@ -293,8 +318,9 @@ The current core supports immutable compiled state graphs with:
 - Cancellation and run timeout start at resume entry and remain active during
   checkpoint loading and subsequent execution. Resume failure saves no new
   checkpoint.
-- There is no replay, fork, time travel, parallel interrupt, database
-  persistence, or payload/snapshot serialization.
+- There is no replay, fork, time travel, parallel interrupt, or database
+  persistence. Encoding is user-defined through codecs; no built-in Serde
+  format is imposed.
 
 ## Suspension boundaries
 
@@ -320,8 +346,8 @@ The current core supports immutable compiled state graphs with:
   external effects performed before suspension. Pre-interrupt work must be
   idempotent, and irreversible effects should be deferred until after the node
   has validated its Resume value.
-- Interrupt payloads and Resume values are process-local typed values in this
-  stage; no durable serialization format is provided.
+- Resume values remain process-local. Interrupt payloads become durable only
+  when the configured codec explicitly supports their type/schema.
 
 ## Performance principles
 
@@ -350,8 +376,9 @@ The current core supports immutable compiled state graphs with:
   acquisition. Enabled frontier metadata must inspect only produced successors.
 - Ordinary update nodes allocate no interrupt payload and enter no snapshot
   path unless checkpointing is explicitly enabled.
-- `InMemoryCheckpointer` may lock only briefly while saving or cloning query
-  results; never execute user Snapshot code while holding its mutex.
+- `InMemoryCheckpointStore` may lock only briefly while atomically applying
+  idempotency/CAS/insertion or cloning record handles. Never execute Snapshot
+  or Codec code while holding its mutex.
 - Performance conclusions require repeatable benchmarks. Do not make comparative
   performance claims from architecture alone.
 
@@ -359,8 +386,9 @@ The current core supports immutable compiled state graphs with:
 
 Do not add parent/child State mapping, parent-frontier parallel subgraphs,
 replay, fork, time travel, parallel interrupts, SQLite, PostgreSQL, SQLx,
-forced Serde bounds, conditional or dynamic fan-out, built-in Tokio channels or
-streams, LLM providers, tool calling, MCP, RAG, token streaming, standalone
+forced Serde bounds or built-in Serde codecs, conditional or dynamic fan-out,
+built-in Tokio channels or streams, LLM providers, tool calling, MCP, RAG,
+token streaming, standalone
 reducer registration, Tower middleware, Axum, distributed workers, macro DSLs,
 or a visual interface unless a later stage explicitly authorizes them. Do not
 create placeholder crates for future capabilities.
@@ -428,5 +456,5 @@ examples, supported features, and exclusions match the implementation.
 After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before starting the next feature stage.
 Corrective stages such as Stage 5.1 do not count toward this cadence.
-After Stage 9 Review passes, Stage 10 must be that full-repository architecture
-review.
+Stage 9.1 Review has passed. Stage 10.1 is the durable-checkpoint contract
+correction identified by the Stage 10 architecture review.

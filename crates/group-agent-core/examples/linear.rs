@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["increment_a", "increment_b"]
+        ["/increment_a", "/increment_b"]
     );
 
     println!("final count: {}", report.final_state().count);

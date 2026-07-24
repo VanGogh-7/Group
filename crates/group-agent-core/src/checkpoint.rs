@@ -1,17 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    CheckpointInterrupt, CheckpointerError, EventConfig, GraphState, NodePath, ResumeValue,
+    CheckpointCodec, CheckpointEncodingError, CheckpointFormatVersion, CheckpointId,
+    CheckpointInterrupt, CheckpointReconstructionError, CheckpointRecord,
+    CheckpointRecordInterrupt, CheckpointRecordParts, CheckpointStore, CheckpointerError,
+    EncodedValue, EventConfig, GraphState, InMemoryCheckpointStore, NodePath, ResumeValue,
     RunConfig, RunControl, RunId, SnapshotError,
 };
-
-static NEXT_CHECKPOINT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Identifies a durable logical execution thread across one or more runs.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -52,34 +52,6 @@ impl AsRef<str> for ThreadId {
 impl fmt::Display for ThreadId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
-    }
-}
-
-/// Identifies one checkpoint within a checkpointer.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CheckpointId(u64);
-
-impl CheckpointId {
-    /// Creates an identifier for custom checkpointer implementations.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the numeric identifier.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    pub(crate) fn next() -> Self {
-        Self(NEXT_CHECKPOINT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-impl fmt::Display for CheckpointId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
     }
 }
 
@@ -173,6 +145,88 @@ impl<T> Checkpoint<T>
 where
     T: Send + Sync + 'static,
 {
+    /// Reconstructs a typed checkpoint from a validated storage record.
+    ///
+    /// Codec work runs synchronously in the caller and must be performed
+    /// outside storage locks.
+    pub fn from_record(
+        record: &CheckpointRecord,
+        codec: &dyn CheckpointCodec<T>,
+    ) -> Result<Self, CheckpointReconstructionError> {
+        if record.format_version() != CheckpointFormatVersion::CURRENT {
+            return Err(CheckpointReconstructionError::FormatVersion {
+                actual: record.format_version(),
+                supported: CheckpointFormatVersion::CURRENT,
+            });
+        }
+        let expected = codec.snapshot_descriptor();
+        let actual = record.snapshot().descriptor();
+        if actual.encoding() != expected.encoding() {
+            return Err(CheckpointReconstructionError::SnapshotEncoding {
+                expected: Arc::from(expected.encoding()),
+                actual: Arc::from(actual.encoding()),
+            });
+        }
+        if actual.schema() != expected.schema()
+            || actual.schema_version() != expected.schema_version()
+        {
+            return Err(CheckpointReconstructionError::SnapshotSchema {
+                expected,
+                actual: actual.clone(),
+            });
+        }
+        let snapshot = codec
+            .decode_snapshot(record.snapshot().bytes())
+            .map(Arc::new)
+            .map_err(|source| CheckpointReconstructionError::Snapshot { source })?;
+        let interrupt = record
+            .interrupt()
+            .map(|interrupt| {
+                if interrupt.payload().descriptor().encoding() != expected.encoding() {
+                    return Err(CheckpointReconstructionError::InterruptEncoding {
+                        expected: Arc::from(expected.encoding()),
+                        actual: Arc::from(interrupt.payload().descriptor().encoding()),
+                    });
+                }
+                codec
+                    .decode_interrupt(interrupt.payload())
+                    .map(|payload| {
+                        CheckpointInterrupt::from_parts(
+                            interrupt.id(),
+                            interrupt.node_path().clone(),
+                            payload,
+                        )
+                    })
+                    .map_err(|source| CheckpointReconstructionError::Interrupt { source })
+            })
+            .transpose()?;
+        let superstep = usize::try_from(record.superstep()).map_err(|_| {
+            CheckpointReconstructionError::CounterOutOfRange {
+                field: "superstep",
+                value: record.superstep(),
+            }
+        })?;
+        let step = usize::try_from(record.step()).map_err(|_| {
+            CheckpointReconstructionError::CounterOutOfRange {
+                field: "step",
+                value: record.step(),
+            }
+        })?;
+        Ok(Self {
+            id: record.id(),
+            thread_id: record.thread_id().clone(),
+            run_id: record.run_id(),
+            parent_id: record.parent_id(),
+            graph_version: record.graph_version().cloned(),
+            superstep,
+            step,
+            snapshot,
+            next_frontier: record.next_frontier().to_vec(),
+            completed: record.completed(),
+            interrupt,
+        })
+    }
+
     /// Returns this checkpoint's identifier.
     #[must_use]
     pub const fn id(&self) -> CheckpointId {
@@ -399,6 +453,79 @@ where
         self.interrupt.as_ref()
     }
 
+    /// Encodes this typed request as one storage-neutral record.
+    pub fn to_record(
+        &self,
+        codec: &dyn CheckpointCodec<T>,
+    ) -> Result<CheckpointRecord, CheckpointEncodingError> {
+        let snapshot_descriptor = codec.snapshot_descriptor();
+        let snapshot = codec
+            .encode_snapshot(&self.snapshot)
+            .map(|bytes| EncodedValue::new(snapshot_descriptor.clone(), bytes))
+            .map_err(|source| CheckpointEncodingError::Snapshot { source })?;
+        let interrupt = self
+            .interrupt
+            .as_ref()
+            .map(|interrupt| {
+                codec
+                    .encode_interrupt(interrupt.payload())
+                    .and_then(|payload| {
+                        if payload.descriptor().encoding() == snapshot_descriptor.encoding() {
+                            Ok(payload)
+                        } else {
+                            Err(crate::CheckpointCodecError::message(format!(
+                                "interrupt encoding `{}` does not match codec encoding `{}`",
+                                payload.descriptor().encoding(),
+                                snapshot_descriptor.encoding()
+                            )))
+                        }
+                    })
+                    .map(|payload| {
+                        CheckpointRecordInterrupt::new(
+                            interrupt.id(),
+                            interrupt.node_path().clone(),
+                            payload,
+                        )
+                    })
+                    .map_err(|source| CheckpointEncodingError::Interrupt { source })
+            })
+            .transpose()?;
+        let superstep =
+            u64::try_from(self.superstep).map_err(|source| CheckpointEncodingError::Snapshot {
+                source: crate::CheckpointCodecError::with_source(
+                    "checkpoint superstep exceeds durable u64 range",
+                    source,
+                ),
+            })?;
+        let step =
+            u64::try_from(self.step).map_err(|source| CheckpointEncodingError::Snapshot {
+                source: crate::CheckpointCodecError::with_source(
+                    "checkpoint step exceeds durable u64 range",
+                    source,
+                ),
+            })?;
+        CheckpointRecord::try_from_parts(CheckpointRecordParts {
+            format_version: CheckpointFormatVersion::CURRENT,
+            checkpoint_id: self.checkpoint_id,
+            thread_id: self.thread_id.clone(),
+            run_id: self.run_id,
+            parent_id: self.expected_parent,
+            graph_version: self.graph_version.clone(),
+            superstep,
+            step,
+            snapshot,
+            next_frontier: self.next_frontier.clone(),
+            completed: self.completed,
+            interrupt,
+        })
+        .map_err(|source| CheckpointEncodingError::Snapshot {
+            source: crate::CheckpointCodecError::with_source(
+                "runtime produced invalid checkpoint record metadata",
+                source,
+            ),
+        })
+    }
+
     /// Finalizes this request after the store has accepted its CAS condition.
     #[must_use]
     pub fn into_checkpoint(self) -> Checkpoint<T> {
@@ -434,6 +561,9 @@ pub enum CheckpointWriteError {
     /// An idempotency key was reused for different request metadata.
     #[error("checkpoint idempotency key `{checkpoint_id}` was reused with different metadata")]
     IdempotencyConflict { checkpoint_id: CheckpointId },
+    /// Typed checkpoint data could not be encoded for storage.
+    #[error(transparent)]
+    Encoding(#[from] CheckpointEncodingError),
     /// The storage implementation failed.
     #[error(transparent)]
     Failed(#[from] CheckpointerError),
@@ -448,10 +578,11 @@ where
     /// Saves one prepared checkpoint and returns the stored immutable value.
     ///
     /// Implementations must treat `checkpoint_id` as an idempotency key. An
-    /// exact replay, including the same snapshot `Arc`, should return the
-    /// original result even after the thread latest has advanced. Reusing the
-    /// identifier with different lineage, boundary, frontier, completion,
-    /// version, interrupt, or snapshot metadata must return
+    /// exact replay with the same stable encoded Record content should return
+    /// the original result even after the thread latest has advanced. Snapshot
+    /// and payload `Arc` identity is irrelevant. Reusing the identifier with
+    /// different lineage, boundary, frontier, completion, version, interrupt,
+    /// descriptor, or encoded bytes must return
     /// [`CheckpointWriteError::IdempotencyConflict`].
     async fn save(
         &self,
@@ -724,47 +855,206 @@ where
     }
 }
 
-/// Thread-safe, process-local checkpoint storage.
+/// Adapts a storage-neutral record store to the typed Runtime checkpointer port.
 ///
-/// The store holds snapshots behind `Arc` and takes its mutex only while
-/// assigning metadata or cloning stored `Arc` handles.
+/// Encoding and decoding happen before or after store calls and never while the
+/// store's lock is held. Decoded checkpoints are cached by ID so repeated
+/// latest/get/history calls share their Snapshot `Arc`.
+type DecodedCheckpoints<T> = HashMap<CheckpointId, (CheckpointRecord, Arc<Checkpoint<T>>)>;
+
+pub struct RecordCheckpointer<T>
+where
+    T: Send + Sync + 'static,
+{
+    store: Arc<dyn CheckpointStore>,
+    codec: Arc<dyn CheckpointCodec<T>>,
+    decoded: Mutex<DecodedCheckpoints<T>>,
+}
+
+impl<T> RecordCheckpointer<T>
+where
+    T: Send + Sync + 'static,
+{
+    /// Creates a typed adapter over a public record store and codec.
+    #[must_use]
+    pub fn new(store: Arc<dyn CheckpointStore>, codec: Arc<dyn CheckpointCodec<T>>) -> Self {
+        Self {
+            store,
+            codec,
+            decoded: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the underlying storage-neutral port.
+    #[must_use]
+    pub const fn store(&self) -> &Arc<dyn CheckpointStore> {
+        &self.store
+    }
+
+    fn cached(
+        &self,
+        record: &CheckpointRecord,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        let cache = self
+            .decoded
+            .lock()
+            .map_err(|_| CheckpointerError::message("decoded checkpoint cache was poisoned"))?;
+        match cache.get(&record.id()) {
+            Some((cached_record, checkpoint)) if cached_record == record => {
+                Ok(Some(Arc::clone(checkpoint)))
+            }
+            Some(_) => Err(CheckpointerError::message(format!(
+                "checkpoint store returned conflicting content for id `{}`",
+                record.id()
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    fn cache(
+        &self,
+        record: CheckpointRecord,
+        checkpoint: Arc<Checkpoint<T>>,
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointerError> {
+        let mut cache = self
+            .decoded
+            .lock()
+            .map_err(|_| CheckpointerError::message("decoded checkpoint cache was poisoned"))?;
+        match cache.entry(checkpoint.id()) {
+            Entry::Vacant(entry) => {
+                entry.insert((record, Arc::clone(&checkpoint)));
+                Ok(checkpoint)
+            }
+            Entry::Occupied(entry) if entry.get().0 == record => Ok(Arc::clone(&entry.get().1)),
+            Entry::Occupied(entry) => Err(CheckpointerError::message(format!(
+                "checkpoint store returned conflicting content for id `{}`",
+                entry.key()
+            ))),
+        }
+    }
+
+    fn decode(&self, record: &CheckpointRecord) -> Result<Arc<Checkpoint<T>>, CheckpointerError> {
+        if let Some(checkpoint) = self.cached(record)? {
+            return Ok(checkpoint);
+        }
+        let checkpoint =
+            Checkpoint::from_record(record, self.codec.as_ref()).map_err(|source| {
+                CheckpointerError::with_source(
+                    format!("checkpoint `{}` reconstruction failed", record.id()),
+                    source,
+                )
+            })?;
+        self.cache(record.clone(), Arc::new(checkpoint))
+    }
+}
+
+impl<T> fmt::Debug for RecordCheckpointer<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordCheckpointer")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<T> Checkpointer<T> for RecordCheckpointer<T>
+where
+    T: Send + Sync + 'static,
+{
+    async fn save(
+        &self,
+        request: CheckpointRequest<T>,
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
+        let record = request.to_record(self.codec.as_ref())?;
+        let stored = self.store.save(record.clone()).await?;
+        if stored.as_ref() != &record {
+            return Err(CheckpointWriteError::Failed(CheckpointerError::message(
+                "checkpoint store returned content different from the submitted record",
+            )));
+        }
+        if let Some(checkpoint) = self.cached(&record).map_err(CheckpointWriteError::Failed)? {
+            return Ok(checkpoint);
+        }
+        self.cache(record, Arc::new(request.into_checkpoint()))
+            .map_err(CheckpointWriteError::Failed)
+    }
+
+    async fn latest(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.store
+            .latest(thread_id)
+            .await?
+            .map(|record| self.decode(&record))
+            .transpose()
+    }
+
+    async fn get(
+        &self,
+        thread_id: &ThreadId,
+        checkpoint_id: CheckpointId,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.store
+            .get(thread_id, checkpoint_id)
+            .await?
+            .map(|record| self.decode(&record))
+            .transpose()
+    }
+
+    async fn history(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.store
+            .history(thread_id)
+            .await?
+            .iter()
+            .map(|record| self.decode(record))
+            .collect()
+    }
+}
+
+/// Typed in-memory checkpointer backed by storage-neutral records.
 pub struct InMemoryCheckpointer<T>
 where
     T: Send + Sync + 'static,
 {
-    state: Mutex<InMemoryState<T>>,
-}
-
-struct InMemoryState<T>
-where
-    T: Send + Sync + 'static,
-{
-    histories: HashMap<ThreadId, Vec<Arc<Checkpoint<T>>>>,
-    by_id: HashMap<CheckpointId, Arc<Checkpoint<T>>>,
+    records: Arc<InMemoryCheckpointStore>,
+    adapter: RecordCheckpointer<T>,
 }
 
 impl<T> InMemoryCheckpointer<T>
 where
     T: Send + Sync + 'static,
 {
-    /// Creates an empty in-memory checkpointer.
+    /// Creates an empty record store using the supplied Snapshot/payload codec.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new<C>(codec: C) -> Self
+    where
+        C: CheckpointCodec<T> + 'static,
+    {
+        Self::with_codec(Arc::new(codec))
+    }
+
+    /// Creates an empty record store using a shared codec.
+    #[must_use]
+    pub fn with_codec(codec: Arc<dyn CheckpointCodec<T>>) -> Self {
+        let records = Arc::new(InMemoryCheckpointStore::new());
+        let store = Arc::clone(&records) as Arc<dyn CheckpointStore>;
         Self {
-            state: Mutex::new(InMemoryState {
-                histories: HashMap::new(),
-                by_id: HashMap::new(),
-            }),
+            records,
+            adapter: RecordCheckpointer::new(store, codec),
         }
     }
-}
 
-impl<T> Default for InMemoryCheckpointer<T>
-where
-    T: Send + Sync + 'static,
-{
-    fn default() -> Self {
-        Self::new()
+    /// Returns the underlying storage-neutral in-memory store.
+    #[must_use]
+    pub const fn record_store(&self) -> &Arc<InMemoryCheckpointStore> {
+        &self.records
     }
 }
 
@@ -788,56 +1078,14 @@ where
         &self,
         request: CheckpointRequest<T>,
     ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-
-        if let Some(checkpoint) = state.by_id.get(&request.checkpoint_id()) {
-            if checkpoint_matches_request(checkpoint, &request) {
-                return Ok(Arc::clone(checkpoint));
-            }
-            return Err(CheckpointWriteError::IdempotencyConflict {
-                checkpoint_id: request.checkpoint_id(),
-            });
-        }
-
-        let actual_parent = state
-            .histories
-            .get(request.thread_id())
-            .and_then(|history| history.last())
-            .map(|checkpoint| checkpoint.id());
-        if actual_parent != request.expected_parent() {
-            return Err(CheckpointWriteError::Conflict {
-                expected_parent: request.expected_parent(),
-                actual_parent,
-            });
-        }
-
-        let thread_id = request.thread_id().clone();
-        let checkpoint = Arc::new(request.into_checkpoint());
-        state
-            .histories
-            .entry(thread_id)
-            .or_default()
-            .push(Arc::clone(&checkpoint));
-        state.by_id.insert(checkpoint.id(), Arc::clone(&checkpoint));
-        Ok(checkpoint)
+        self.adapter.save(request).await
     }
 
     async fn latest(
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        Ok(state
-            .histories
-            .get(thread_id)
-            .and_then(|history| history.last())
-            .cloned())
+        self.adapter.latest(thread_id).await
     }
 
     async fn get(
@@ -845,53 +1093,42 @@ where
         thread_id: &ThreadId,
         checkpoint_id: CheckpointId,
     ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        Ok(state
-            .by_id
-            .get(&checkpoint_id)
-            .filter(|checkpoint| checkpoint.thread_id() == thread_id)
-            .cloned())
+        self.adapter.get(thread_id, checkpoint_id).await
     }
 
     async fn history(
         &self,
         thread_id: &ThreadId,
     ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CheckpointerError::message("in-memory checkpoint lock was poisoned"))?;
-        Ok(state.histories.get(thread_id).cloned().unwrap_or_default())
+        self.adapter.history(thread_id).await
     }
-}
-
-fn checkpoint_matches_request<T>(checkpoint: &Checkpoint<T>, request: &CheckpointRequest<T>) -> bool
-where
-    T: Send + Sync + 'static,
-{
-    checkpoint.id == request.checkpoint_id
-        && checkpoint.parent_id == request.expected_parent
-        && checkpoint.graph_version == request.graph_version
-        && checkpoint.thread_id == request.thread_id
-        && checkpoint.run_id == request.run_id
-        && checkpoint.superstep == request.superstep
-        && checkpoint.step == request.step
-        && checkpoint.next_frontier == request.next_frontier
-        && checkpoint.completed == request.completed
-        && match (&checkpoint.interrupt, &request.interrupt) {
-            (Some(checkpoint), Some(request)) => checkpoint.matches(request),
-            (None, None) => true,
-            _ => false,
-        }
-        && Arc::ptr_eq(&checkpoint.snapshot, &request.snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UsizeCodec;
+
+    impl CheckpointCodec<usize> for UsizeCodec {
+        fn snapshot_descriptor(&self) -> crate::CodecDescriptor {
+            crate::CodecDescriptor::new("group.test.usize", 1, "group.test.le-usize-v1")
+        }
+
+        fn encode_snapshot(
+            &self,
+            snapshot: &usize,
+        ) -> Result<Vec<u8>, crate::CheckpointCodecError> {
+            Ok(snapshot.to_le_bytes().to_vec())
+        }
+
+        fn decode_snapshot(&self, bytes: &[u8]) -> Result<usize, crate::CheckpointCodecError> {
+            let bytes: [u8; size_of::<usize>()] = bytes
+                .try_into()
+                .map_err(|_| crate::CheckpointCodecError::message("invalid usize bytes"))?;
+            Ok(usize::from_le_bytes(bytes))
+        }
+    }
 
     fn request(
         checkpoint_id: CheckpointId,
@@ -921,9 +1158,30 @@ mod tests {
         )
     }
 
+    fn record(checkpoint_id: CheckpointId, step: u64, value: usize) -> CheckpointRecord {
+        CheckpointRecord::try_from_parts(CheckpointRecordParts {
+            format_version: CheckpointFormatVersion::CURRENT,
+            checkpoint_id,
+            thread_id: ThreadId::from("cache-thread"),
+            run_id: RunId::next(),
+            parent_id: None,
+            graph_version: Some(GraphVersion::from("test-v1")),
+            superstep: step,
+            step,
+            snapshot: EncodedValue::new(
+                crate::CodecDescriptor::new("group.test.usize", 1, "group.test.le-usize-v1"),
+                value.to_le_bytes().to_vec(),
+            ),
+            next_frontier: vec![NodePath::from("next")],
+            completed: false,
+            interrupt: None,
+        })
+        .expect("test record should be valid")
+    }
+
     #[tokio::test]
     async fn identical_checkpoint_request_replay_returns_original_arc() {
-        let store = InMemoryCheckpointer::new();
+        let store = InMemoryCheckpointer::new(UsizeCodec);
         let run_id = RunId::next();
         let snapshot = Arc::new(1);
         let checkpoint_id = CheckpointId::next();
@@ -938,7 +1196,7 @@ mod tests {
             .await
             .expect("initial save should succeed");
         let replay = store
-            .save(request(checkpoint_id, None, run_id, 1, snapshot))
+            .save(request(checkpoint_id, None, run_id, 1, Arc::new(1)))
             .await
             .expect("identical replay should succeed");
         assert!(Arc::ptr_eq(&first, &replay));
@@ -969,7 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_still_returns_original_after_latest_advances() {
-        let store = InMemoryCheckpointer::new();
+        let store = InMemoryCheckpointer::new(UsizeCodec);
         let run_id = RunId::next();
         let first_snapshot = Arc::new(1);
         let first_id = CheckpointId::next();
@@ -1006,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_checkpoint_id_with_different_metadata_is_rejected() {
-        let store = InMemoryCheckpointer::new();
+        let store = InMemoryCheckpointer::new(UsizeCodec);
         let run_id = RunId::next();
         let snapshot = Arc::new(1);
         let checkpoint_id = CheckpointId::next();
@@ -1030,5 +1288,31 @@ mod tests {
                 checkpoint_id: actual
             } if actual == checkpoint_id
         ));
+    }
+
+    #[test]
+    fn occupied_cache_rejects_same_id_with_different_record_content() {
+        let checkpoint_id = CheckpointId::next();
+        let first_record = record(checkpoint_id, 1, 1);
+        let second_record = record(checkpoint_id, 2, 2);
+        let adapter = RecordCheckpointer::new(
+            Arc::new(InMemoryCheckpointStore::new()),
+            Arc::new(UsizeCodec),
+        );
+        let first =
+            Checkpoint::from_record(&first_record, &UsizeCodec).expect("record should decode");
+        adapter
+            .cache(first_record, Arc::new(first))
+            .expect("vacant cache entry should insert");
+        let second =
+            Checkpoint::from_record(&second_record, &UsizeCodec).expect("record should decode");
+        let error = adapter
+            .cache(second_record, Arc::new(second))
+            .expect_err("occupied cache must compare complete record content");
+        assert!(
+            error
+                .to_string()
+                .contains("returned conflicting content for id")
+        );
     }
 }

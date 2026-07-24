@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::{Future, pending};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1035,12 +1036,6 @@ where
         });
         if let Some(first) = frontier.first() {
             let graph_path = &self.node_at(*first).graph_path;
-            debug_assert!(
-                frontier
-                    .iter()
-                    .all(|index| self.node_at(*index).graph_path == *graph_path),
-                "one resumable frontier cannot span graph namespaces"
-            );
             for graph_path in graph_path.prefixes() {
                 events.emit(|| GraphEvent::SubgraphStarted { run_id, graph_path });
             }
@@ -1122,7 +1117,7 @@ where
                 });
             }
         }
-        checkpoint
+        let frontier = checkpoint
             .next_frontier()
             .iter()
             .map(|node_path| {
@@ -1138,7 +1133,41 @@ where
                     }
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut seen = HashSet::with_capacity(frontier.len());
+        for index in frontier.iter().copied() {
+            if !seen.insert(index) {
+                return Err(CheckpointIncompatibility::DuplicateFrontierNode {
+                    node_id: self.node_at(index).path.clone(),
+                });
+            }
+        }
+
+        if let Some(first) = frontier.first().copied() {
+            let expected = &self.node_at(first).graph_path;
+            for index in frontier.iter().copied().skip(1) {
+                let node = self.node_at(index);
+                if node.graph_path != *expected {
+                    return Err(CheckpointIncompatibility::MixedFrontierNamespace {
+                        expected: expected.clone(),
+                        actual: node.graph_path.clone(),
+                        node_id: node.path.clone(),
+                    });
+                }
+            }
+        }
+
+        for pair in frontier.windows(2) {
+            if pair[0].index() > pair[1].index() {
+                return Err(CheckpointIncompatibility::NonCanonicalFrontierOrder {
+                    previous: self.node_at(pair[0]).path.clone(),
+                    current: self.node_at(pair[1]).path.clone(),
+                });
+            }
+        }
+
+        Ok(frontier)
     }
 }
 
@@ -1327,6 +1356,13 @@ where
                         step,
                     }
                 }
+                CheckpointWriteError::Encoding(source) => GraphRunError::CheckpointEncodeFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    superstep,
+                    step,
+                    source,
+                },
             })?;
         self.expected_parent = Some(checkpoint.id());
         Ok(SavedCheckpoint {
@@ -1686,6 +1722,16 @@ impl From<&GraphRunError> for RunFailure {
                 superstep: *superstep,
                 step: *step,
             },
+            GraphRunError::CheckpointEncodeFailed {
+                thread_id,
+                superstep,
+                step,
+                ..
+            } => Self::CheckpointEncodeFailed {
+                thread_id: thread_id.clone(),
+                superstep: *superstep,
+                step: *step,
+            },
             GraphRunError::CheckpointSaveFailed {
                 thread_id,
                 superstep,
@@ -1928,6 +1974,48 @@ mod resume_validation_tests {
         parent.compile().expect("parent should compile")
     }
 
+    fn parallel_validation_graph() -> CompiledGraph<ValidationState> {
+        let mut graph = StateGraph::new();
+        graph.set_version("validation-v1");
+        graph
+            .add_node("fork", NoopNode)
+            .expect("fork should register");
+        graph
+            .add_node("left", NoopNode)
+            .expect("left should register");
+        graph
+            .add_node("right", NoopNode)
+            .expect("right should register");
+        graph
+            .add_edge(START, "fork")
+            .add_fan_out("fork", ["left", "right"])
+            .expect("fan-out should register");
+        graph.add_edge("left", END).add_edge("right", END);
+        graph.compile().expect("parallel graph should compile")
+    }
+
+    fn mixed_namespace_validation_graph() -> CompiledGraph<ValidationState> {
+        let mut child = StateGraph::new();
+        child
+            .add_node("inside", NoopNode)
+            .expect("child node should register");
+        child.add_edge(START, "inside").add_edge("inside", END);
+
+        let mut parent = StateGraph::new();
+        parent.set_version("validation-v1");
+        parent
+            .add_node("outside", NoopNode)
+            .expect("parent node should register");
+        parent
+            .add_subgraph("child", child.compile().expect("child should compile"))
+            .expect("child should mount");
+        parent
+            .add_edge(START, "outside")
+            .add_edge("outside", "child")
+            .add_edge("child", END);
+        parent.compile().expect("mixed graph should compile")
+    }
+
     fn forged_checkpoint(
         frontier: Vec<NodePath>,
         completed: bool,
@@ -2025,6 +2113,51 @@ mod resume_validation_tests {
             Vec::new(),
             false,
             CheckpointIncompatibility::IncompleteWithoutFrontier,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_frontier_is_rejected_before_restore() {
+        let duplicate = NodePath::from("left");
+        assert_incompatible_before_restore_with(
+            parallel_validation_graph(),
+            vec![duplicate.clone(), duplicate.clone()],
+            false,
+            CheckpointIncompatibility::DuplicateFrontierNode { node_id: duplicate },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn out_of_order_frontier_is_rejected_before_restore() {
+        let left = NodePath::from("left");
+        let right = NodePath::from("right");
+        assert_incompatible_before_restore_with(
+            parallel_validation_graph(),
+            vec![right.clone(), left.clone()],
+            false,
+            CheckpointIncompatibility::NonCanonicalFrontierOrder {
+                previous: right,
+                current: left,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mixed_namespace_frontier_is_rejected_before_restore() {
+        let outside = NodePath::from("outside");
+        let inside = NodePath::new(&GraphPath::new(["child"]), "inside");
+        assert_incompatible_before_restore_with(
+            mixed_namespace_validation_graph(),
+            vec![outside, inside.clone()],
+            false,
+            CheckpointIncompatibility::MixedFrontierNamespace {
+                expected: GraphPath::root(),
+                actual: GraphPath::new(["child"]),
+                node_id: inside,
+            },
         )
         .await;
     }
