@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{CheckpointId, NodeId, RunId, ThreadId};
+use crate::{CheckpointId, GraphVersion, NodeId, RunId, ThreadId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -167,6 +167,42 @@ define_source_error!(
     "An error returned by a checkpoint storage implementation."
 );
 
+/// Why a checkpoint cannot be resumed by a compiled graph.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum CheckpointIncompatibility {
+    /// The checkpoint was created by an unversioned graph.
+    #[error("checkpoint has no graph version")]
+    UnversionedCheckpoint,
+    /// The target compiled graph has no explicit version.
+    #[error("compiled graph has no graph version")]
+    UnversionedGraph,
+    /// The explicit graph versions differ.
+    #[error("checkpoint graph version `{checkpoint}` does not match compiled graph `{compiled}`")]
+    GraphVersionMismatch {
+        checkpoint: GraphVersion,
+        compiled: GraphVersion,
+    },
+    /// A custom store returned a checkpoint from another thread.
+    #[error("checkpoint belongs to thread `{actual_thread}`")]
+    ThreadMismatch { actual_thread: ThreadId },
+    /// The restored frontier names an unknown executable node.
+    #[error("checkpoint frontier contains unknown node `{node_id}`")]
+    UnknownFrontierNode { node_id: NodeId },
+    /// `START` cannot appear in a checkpoint frontier.
+    #[error("checkpoint frontier contains START")]
+    StartInFrontier,
+    /// `END` is represented by an empty frontier and cannot appear explicitly.
+    #[error("checkpoint frontier contains END")]
+    EndInFrontier,
+    /// A completed checkpoint retained executable frontier nodes.
+    #[error("completed checkpoint has a non-empty frontier")]
+    CompletedWithFrontier,
+    /// An incomplete checkpoint has no node from which to continue.
+    #[error("incomplete checkpoint has an empty frontier")]
+    IncompleteWithoutFrontier,
+}
+
 /// An error raised during graph execution.
 #[derive(Debug, Error)]
 pub enum GraphRunError {
@@ -253,6 +289,18 @@ pub enum GraphRunError {
         expected_parent: Option<CheckpointId>,
         actual_parent: Option<CheckpointId>,
     },
+    /// A checkpoint idempotency key was reused for different metadata.
+    #[error(
+        "checkpoint idempotency key `{checkpoint_id}` for thread `{thread_id}` in run `{run_id}` \
+         conflicts with an existing request"
+    )]
+    CheckpointIdConflict {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        superstep: usize,
+        step: usize,
+    },
     /// Saving a checkpoint failed.
     #[error(
         "checkpoint save for thread `{thread_id}` in run `{run_id}` failed after super-step \
@@ -265,6 +313,57 @@ pub enum GraphRunError {
         step: usize,
         #[source]
         source: CheckpointerError,
+    },
+    /// Loading checkpoint storage failed.
+    #[error("checkpoint load for thread `{thread_id}` in run `{run_id}` failed: {source}")]
+    CheckpointLoadFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+        #[source]
+        source: CheckpointerError,
+    },
+    /// No checkpoint matched the requested resume target.
+    #[error("checkpoint {checkpoint_id:?} was not found for thread `{thread_id}`")]
+    CheckpointNotFound {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+    },
+    /// The selected checkpoint is not the thread's latest checkpoint.
+    #[error(
+        "checkpoint `{checkpoint_id}` is not latest for thread `{thread_id}`; latest is \
+         {latest_checkpoint_id:?}"
+    )]
+    ResumeConflict {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        latest_checkpoint_id: Option<CheckpointId>,
+        step: usize,
+    },
+    /// The selected checkpoint is incompatible with the compiled graph.
+    #[error("checkpoint `{checkpoint_id}` for thread `{thread_id}` is incompatible: {reason}")]
+    CheckpointIncompatible {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        step: usize,
+        reason: CheckpointIncompatibility,
+    },
+    /// Restoring state from a checkpoint snapshot failed.
+    #[error(
+        "restore from checkpoint `{checkpoint_id}` for thread `{thread_id}` failed at step \
+         {step}: {source}"
+    )]
+    RestoreFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        superstep: usize,
+        step: usize,
+        #[source]
+        source: SnapshotError,
     },
     /// A conditional router failed.
     #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]

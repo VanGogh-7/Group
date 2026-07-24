@@ -20,6 +20,8 @@ The current core supports immutable compiled state graphs with:
 - asynchronous replaceable checkpointers and an in-memory implementation;
 - checkpoint latest/history queries and CAS-protected state lineage by logical
   thread;
+- latest-only resume from specified or latest versioned checkpoints;
+- restoration of state, frontier, cumulative steps, and super-step position;
 - synchronous conditional edges with declared target whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
@@ -61,6 +63,8 @@ The current core supports immutable compiled state graphs with:
   work once.
 - `CompiledGraph` is immutable and reusable. It stores pre-resolved internal
   indices and must not expose `petgraph` or other internal cursor types.
+- Graphs intended for resume use an explicit `GraphVersion`. Checkpoints from
+  unversioned graphs are saveable but cannot be resumed.
 - Runtime invocation owns its input state, events, visited nodes, and step count.
   It also owns the active frontier and per-super-step update collection.
   Separate invocations must remain isolated, including concurrent invocations.
@@ -180,8 +184,9 @@ The current core supports immutable compiled state graphs with:
   `expected_parent` before insertion. A mismatch is `CheckpointConflict`, so
   concurrent runs on one `ThreadId` do not silently cross-link parent chains.
 - `CheckpointRequest` carries a Runtime-assigned `CheckpointId` operation key.
-  Checkpointers should save idempotently because a dropped save future may have
-  committed an external side effect before returning.
+  Exact same-ID request replay, including the same Snapshot `Arc`, must return
+  the original result even after latest advances. Same ID with different
+  metadata must return `IdempotencyConflict`.
 - Snapshot logic is synchronous and cannot be preempted. It runs before
   entering storage and never while an in-memory store lock is held.
 - Cancellation and run timeout remain active while save is pending, with
@@ -191,9 +196,43 @@ The current core supports immutable compiled state graphs with:
   `RunFailed`, no `CheckpointSaved` for an unconfirmed save, and no
   `RunCompleted`. Runtime does not claim to roll back committed state, storage
   effects, or external node side effects.
-- Stage 6 provides no resume, replay, fork, time travel, database persistence,
-  or serialization. Future resume work must validate graph version and topology
-  compatibility in addition to stored frontier metadata.
+- `latest`, `get`, and `history` return shared checkpoint `Arc` values. `get`
+  is scoped by both ThreadId and CheckpointId.
+
+## Resume boundaries
+
+- `ResumeConfig` centralizes checkpoint selection, checkpoint policy,
+  additional step budget, events, and execution controls.
+- Resume loads a specified checkpoint or latest. A specified checkpoint must
+  still be latest; otherwise return `ResumeConflict`. Fork is not implicit.
+- Validate ThreadId, latest-only status, explicit graph version,
+  completion/frontier consistency, and each frontier NodeId before calling
+  `CheckpointState::restore`. START, explicit END, unknown nodes, unversioned
+  graphs/checkpoints, and version mismatch are `CheckpointIncompatible`.
+- Graph version must change when topology, State/Snapshot schema, reducer, or
+  router semantics become incompatible with existing checkpoints.
+- Resolve only the actual saved frontier through the compiled NodeId index
+  before restore, then reuse those internal indices for execution. Never scan
+  all graph nodes or resolve the frontier twice during resume.
+- After all compatibility checks and frontier resolution succeed, call
+  `CheckpointState::restore` synchronously outside every storage lock. Restore
+  is not preemptible; observe cancellation and run timeout again after it
+  returns.
+- Resume assigns a new RunId and emits `RunStarted`, then `RunResumed`, then
+  continued execution events. Preparation failure emits one `RunFailed` and no
+  `RunResumed`.
+- Restore cumulative step and super-step counters. `RunConfig::max_steps` is
+  the additional node budget for this resume call, while emitted positions
+  remain cumulative.
+- The restored checkpoint is the expected parent of the next save. Later saves
+  continue from each prior successful save.
+- Resuming a completed checkpoint restores State, executes no node, saves no
+  duplicate checkpoint, and emits `RunStarted -> RunResumed -> RunCompleted`.
+- Cancellation and run timeout start at resume entry and remain active during
+  checkpoint loading and subsequent execution. Resume failure saves no new
+  checkpoint.
+- Stage 7 provides no replay, fork, time travel, human interrupt, database
+  persistence, or serialization.
 
 ## Performance principles
 
@@ -222,8 +261,8 @@ The current core supports immutable compiled state graphs with:
 
 ## Out of scope
 
-Do not add resume, replay, fork, time travel, human interrupts, SQLite,
-PostgreSQL, SQLx, forced Serde bounds, conditional or dynamic fan-out, built-in
+Do not add replay, fork, time travel, human interrupts, SQLite, PostgreSQL,
+SQLx, forced Serde bounds, conditional or dynamic fan-out, built-in
 Tokio channels or streams, LLM providers, tool calling, MCP, RAG, token
 streaming, standalone reducer registration, subgraphs, Tower middleware, Axum,
 distributed workers, macro DSLs, or a visual interface unless a later stage
@@ -254,6 +293,7 @@ cargo run -p group-agent-core --example linear
 cargo run -p group-agent-core --example conditional
 cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
+cargo run -p group-agent-core --example resume
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```

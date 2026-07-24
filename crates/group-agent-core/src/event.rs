@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{CheckpointId, NodeId, ThreadId};
+use crate::{CheckpointId, CheckpointIncompatibility, NodeId, ThreadId};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -164,9 +164,47 @@ pub enum RunFailure {
         expected_parent: Option<CheckpointId>,
         actual_parent: Option<CheckpointId>,
     },
+    /// A checkpoint idempotency key conflicts with stored metadata.
+    CheckpointIdConflict {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        superstep: usize,
+        step: usize,
+    },
     /// Saving a checkpoint failed.
     CheckpointSaveFailed {
         thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+    },
+    /// Loading checkpoint storage failed.
+    CheckpointLoadFailed {
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+    },
+    /// No checkpoint matched the resume target.
+    CheckpointNotFound {
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+    },
+    /// The selected checkpoint was not latest.
+    ResumeConflict {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        latest_checkpoint_id: Option<CheckpointId>,
+        step: usize,
+    },
+    /// The checkpoint cannot be used by this compiled graph.
+    CheckpointIncompatible {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        step: usize,
+        reason: CheckpointIncompatibility,
+    },
+    /// State restoration from a checkpoint failed.
+    RestoreFailed {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
         superstep: usize,
         step: usize,
     },
@@ -188,6 +226,14 @@ pub enum RunFailure {
 pub enum GraphEvent {
     /// A graph invocation began.
     RunStarted { run_id: RunId, max_steps: usize },
+    /// A run restored state and execution position from a checkpoint.
+    RunResumed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        step: usize,
+        superstep: usize,
+    },
     /// A super-step began with a stable active frontier.
     SuperstepStarted {
         run_id: RunId,
@@ -242,6 +288,7 @@ impl GraphEvent {
     pub const fn run_id(&self) -> RunId {
         match self {
             Self::RunStarted { run_id, .. }
+            | Self::RunResumed { run_id, .. }
             | Self::SuperstepStarted { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeCompleted { run_id, .. }

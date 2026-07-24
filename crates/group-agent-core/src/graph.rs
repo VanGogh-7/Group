@@ -6,7 +6,9 @@ use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::Dfs;
 
 use crate::edge::{ConditionalEdge, FanOutEdge, FixedEdge, Router};
-use crate::{GraphBuildError, GraphCompileError, GraphState, Node, NodeId, RouteError};
+use crate::{
+    GraphBuildError, GraphCompileError, GraphState, GraphVersion, Node, NodeId, RouteError,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum TopologyEdge {
@@ -38,6 +40,7 @@ where
     fixed_edges: Vec<FixedEdge>,
     fan_out_edges: Vec<FanOutEdge>,
     conditional_edges: Vec<ConditionalEdge<S>>,
+    version: Option<GraphVersion>,
 }
 
 impl<S> StateGraph<S>
@@ -52,7 +55,21 @@ where
             fixed_edges: Vec::new(),
             fan_out_edges: Vec::new(),
             conditional_edges: Vec::new(),
+            version: None,
         }
+    }
+
+    /// Assigns an explicit compatibility version to this graph.
+    pub fn set_version(&mut self, version: impl Into<GraphVersion>) -> &mut Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Assigns an explicit compatibility version and returns this builder.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<GraphVersion>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// Registers a normal graph node.
@@ -263,8 +280,10 @@ where
         Ok(CompiledGraph {
             _topology: topology,
             nodes: compiled_nodes,
+            node_indices: indices,
             entry_index,
             end_index,
+            version: self.version.clone(),
         })
     }
 
@@ -498,8 +517,10 @@ where
 {
     _topology: StableDiGraph<NodeId, TopologyEdge>,
     pub(crate) nodes: Vec<Option<CompiledNode<S>>>,
+    pub(crate) node_indices: IndexMap<NodeId, NodeIndex>,
     pub(crate) entry_index: NodeIndex,
     pub(crate) end_index: NodeIndex,
+    pub(crate) version: Option<GraphVersion>,
 }
 
 impl<S> CompiledGraph<S>
@@ -510,5 +531,11 @@ where
         self.nodes[index.index()]
             .as_ref()
             .expect("compiled executable index contains a node")
+    }
+
+    /// Returns the explicit compatibility version, if one was assigned.
+    #[must_use]
+    pub const fn version(&self) -> Option<&GraphVersion> {
+        self.version.as_ref()
     }
 }

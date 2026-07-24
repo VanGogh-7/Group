@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use group_agent_core::{
     CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, END, EventConfig,
-    GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError, RunConfig, RunControl, START,
-    SnapshotError, StateError, StateGraph, ThreadId,
+    GraphRunError, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError, ResumeConfig,
+    RunConfig, RunControl, START, SnapshotError, StateError, StateGraph,
 };
 
 #[derive(Debug, Default)]
@@ -16,8 +16,6 @@ struct CounterState {
 struct CounterSnapshot {
     value: usize,
 }
-
-struct Increment;
 
 impl GraphState for CounterState {
     type Update = usize;
@@ -42,6 +40,8 @@ impl CheckpointState for CounterState {
     }
 }
 
+struct Increment;
+
 #[async_trait]
 impl Node<CounterState> for Increment {
     async fn run(&self, _state: &CounterState, _context: &NodeContext) -> Result<usize, NodeError> {
@@ -62,33 +62,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compiled = graph.compile()?;
 
     let checkpointer = Arc::new(InMemoryCheckpointer::<CounterSnapshot>::new());
-    let checkpoint_config = CheckpointConfig::new(
-        "example-thread",
-        Arc::clone(&checkpointer) as Arc<dyn Checkpointer<CounterSnapshot>>,
-        CheckpointPolicy::EverySuperstep,
-    );
-    let report = compiled
+    let interrupted = compiled
         .invoke_with_checkpoint(
             CounterState::default(),
-            RunConfig::default(),
+            RunConfig::new(1),
             EventConfig::default(),
             RunControl::default(),
-            checkpoint_config,
+            CheckpointConfig::new(
+                "resume-example",
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<CounterSnapshot>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await;
+    assert!(matches!(
+        interrupted,
+        Err(GraphRunError::MaxStepsExceeded { step: 2, .. })
+    ));
+
+    let report = compiled
+        .resume(
+            ResumeConfig::new(
+                "resume-example",
+                checkpointer as Arc<dyn Checkpointer<CounterSnapshot>>,
+            )
+            .with_run_config(RunConfig::new(1)),
         )
         .await?;
 
-    let history = checkpointer
-        .history(&ThreadId::from("example-thread"))
-        .await?;
     assert_eq!(report.final_state().value, 2);
-    assert_eq!(history.len(), 2);
-    assert_eq!(history[0].snapshot().value, 1);
-    assert_eq!(history[1].snapshot().value, 2);
-    assert!(history[1].completed());
-    assert_eq!(history[1].parent_id(), Some(history[0].id()));
-
-    println!("final value: {}", report.final_state().value);
-    println!("checkpoint count: {}", history.len());
-    println!("latest checkpoint: {}", history[1].id());
+    assert_eq!(report.steps(), 2);
+    println!("resumed final value: {}", report.final_state().value);
+    println!("cumulative steps: {}", report.steps());
     Ok(())
 }

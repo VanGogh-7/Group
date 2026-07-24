@@ -17,13 +17,14 @@ mod state;
 
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
-    CheckpointState, CheckpointWriteError, Checkpointer, InMemoryCheckpointer, ThreadId,
+    CheckpointState, CheckpointWriteError, Checkpointer, GraphVersion, InMemoryCheckpointer,
+    ResumeConfig, ResumeTarget, ThreadId,
 };
 pub use context::{NodeContext, RunConfig, RunControl};
 pub use edge::{END, NodeId, START};
 pub use error::{
-    CheckpointerError, GraphBuildError, GraphCompileError, GraphRunError, NodeError, RouteError,
-    SnapshotError, StateError,
+    CheckpointIncompatibility, CheckpointerError, GraphBuildError, GraphCompileError,
+    GraphRunError, NodeError, RouteError, SnapshotError, StateError,
 };
 pub use event::{EventConfig, EventRetention, EventSink, GraphEvent, RunFailure, RunId};
 pub use graph::{CompiledGraph, StateGraph};

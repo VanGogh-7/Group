@@ -5,14 +5,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use group_agent_core::{
-    CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, CompiledGraph, END,
+    Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
+    CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError, CompiledGraph, END,
     EventConfig, EventRetention, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError,
-    NodeId, NodeUpdate, RunConfig, RunControl, START, SnapshotError, StateError, StateGraph,
+    NodeId, NodeUpdate, ResumeConfig, RunConfig, RunControl, START, SnapshotError, StateError,
+    StateGraph, ThreadId,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct BenchState {
     steps: usize,
 }
@@ -72,8 +74,52 @@ impl Node<BenchState> for DelayedNode {
     }
 }
 
+struct ResumeBenchCheckpointer {
+    checkpoint: Arc<Checkpoint<usize>>,
+}
+
+#[async_trait]
+impl Checkpointer<usize> for ResumeBenchCheckpointer {
+    async fn save(
+        &self,
+        request: CheckpointRequest<usize>,
+    ) -> Result<Arc<Checkpoint<usize>>, CheckpointWriteError> {
+        Ok(Arc::new(request.into_checkpoint()))
+    }
+
+    async fn latest(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok((self.checkpoint.thread_id() == thread_id).then(|| Arc::clone(&self.checkpoint)))
+    }
+
+    async fn get(
+        &self,
+        thread_id: &ThreadId,
+        checkpoint_id: CheckpointId,
+    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(
+            (self.checkpoint.thread_id() == thread_id && self.checkpoint.id() == checkpoint_id)
+                .then(|| Arc::clone(&self.checkpoint)),
+        )
+    }
+
+    async fn history(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(if self.checkpoint.thread_id() == thread_id {
+            vec![Arc::clone(&self.checkpoint)]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
 fn fixed_graph_builder(node_count: usize) -> StateGraph<BenchState> {
     let mut graph = StateGraph::new();
+    graph.set_version("benchmark-v1");
     let node_ids = (0..node_count)
         .map(|index| NodeId::from(format!("node_{index}")))
         .collect::<Vec<_>>();
@@ -152,6 +198,7 @@ fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchStat
 fn runtime_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("Tokio benchmark runtime should start");
     let fixed_10 = fixed_graph(10);
+    let fixed_2 = fixed_graph(2);
     let fixed_32 = fixed_graph(32);
     let fixed_100 = fixed_graph(100);
     let parallel_2 = parallel_graph(2, false);
@@ -162,6 +209,49 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
     let uncancelled_token = CancellationToken::new();
+    let middle_store = Arc::new(InMemoryCheckpointer::new());
+    runtime
+        .block_on(fixed_2.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "resume-middle-benchmark",
+                Arc::clone(&middle_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect_err("one-step setup should stop at the second node");
+    let middle_checkpoint = runtime
+        .block_on(middle_store.latest(&ThreadId::from("resume-middle-benchmark")))
+        .expect("middle checkpoint query should succeed")
+        .expect("middle checkpoint should exist");
+    let middle_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
+        checkpoint: middle_checkpoint,
+    });
+
+    let completed_store = Arc::new(InMemoryCheckpointer::new());
+    runtime
+        .block_on(fixed_2.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "resume-completed-benchmark",
+                Arc::clone(&completed_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect("completed setup should succeed");
+    let completed_checkpoint = runtime
+        .block_on(completed_store.latest(&ThreadId::from("resume-completed-benchmark")))
+        .expect("completed checkpoint query should succeed")
+        .expect("completed checkpoint should exist");
+    let completed_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
+        checkpoint: completed_checkpoint,
+    });
 
     criterion.bench_function("compile_fixed_linear_100_nodes", |bencher| {
         bencher.iter(|| {
@@ -199,6 +289,45 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
             );
         },
     );
+
+    criterion.bench_function(
+        "resume_load_restore_one_immediate_node_and_final_save",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    ResumeConfig::new("resume-middle-benchmark", Arc::clone(&middle_resume_store))
+                        .with_run_config(RunConfig::new(1))
+                },
+                |config| async {
+                    let report = fixed_2
+                        .resume(config)
+                        .await
+                        .expect("middle resume benchmark should succeed");
+                    black_box(report.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+
+    criterion.bench_function("resume_completed_checkpoint_noop", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ResumeConfig::new(
+                    "resume-completed-benchmark",
+                    Arc::clone(&completed_resume_store),
+                )
+            },
+            |config| async {
+                let report = fixed_2
+                    .resume(config)
+                    .await
+                    .expect("completed resume benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
 
     criterion.bench_function(
         "invoke_checkpoint_enabled_every_superstep_10_nodes",

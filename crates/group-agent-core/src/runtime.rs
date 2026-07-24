@@ -1,9 +1,10 @@
-use std::future::pending;
+use std::future::{Future, pending};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use petgraph::stable_graph::NodeIndex;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -11,10 +12,10 @@ use tracing::debug;
 use crate::checkpoint::CheckpointLineage;
 use crate::graph::{CompiledNode, CompiledTransition};
 use crate::{
-    CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest, CheckpointState,
-    CheckpointWriteError, CompiledGraph, EventConfig, EventRetention, GraphEvent, GraphRunError,
-    GraphState, NodeContext, NodeId, NodeUpdate, RunConfig, RunControl, RunFailure, RunId,
-    ThreadId,
+    Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointPolicy,
+    CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph, EventConfig,
+    EventRetention, GraphEvent, GraphRunError, GraphState, NodeContext, NodeId, NodeUpdate,
+    ResumeConfig, ResumeTarget, RunConfig, RunControl, RunFailure, RunId, ThreadId,
 };
 
 /// The outcome of a successful graph invocation.
@@ -52,7 +53,7 @@ where
         self.final_state
     }
 
-    /// Returns the number of nodes executed.
+    /// Returns the cumulative number of nodes executed in this lineage.
     #[must_use]
     pub const fn steps(&self) -> usize {
         self.steps
@@ -69,6 +70,20 @@ where
     pub fn events(&self) -> &[GraphEvent] {
         &self.events
     }
+}
+
+struct Execution<'a, S>
+where
+    S: GraphState,
+{
+    run_id: RunId,
+    state: S,
+    steps: usize,
+    visited_nodes: Vec<NodeId>,
+    events: EventEmitter<'a>,
+    frontier: Vec<NodeIndex>,
+    superstep: usize,
+    save_empty_checkpoint: bool,
 }
 
 impl<S> CompiledGraph<S>
@@ -126,7 +141,7 @@ where
         config: RunConfig,
         event_config: EventConfig,
         control: RunControl,
-        mut checkpoints: C,
+        checkpoints: C,
     ) -> Result<RunReport<S>, GraphRunError>
     where
         C: RuntimeCheckpoint<S>,
@@ -134,21 +149,16 @@ where
         let invocation_started = Instant::now();
         let run_id = RunId::next();
         let control = ActiveControl::new(control, invocation_started);
-        let mut state = initial_state;
-        let mut steps = 0;
-        let mut visited_nodes = Vec::new();
         let mut events = EventEmitter::new(run_id, &event_config);
         events.emit(|| GraphEvent::RunStarted {
             run_id,
             max_steps: config.max_steps,
         });
-        let mut frontier = if self.entry_index == self.end_index {
+        let frontier = if self.entry_index == self.end_index {
             Vec::new()
         } else {
             vec![self.entry_index]
         };
-        let mut next_frontier = Vec::new();
-        let mut superstep = 0;
 
         debug!(%run_id, max_steps = config.max_steps, "graph run started");
 
@@ -160,24 +170,55 @@ where
             return events.fail(error);
         }
 
-        if frontier.is_empty() && checkpoints.should_save(true) {
-            let checkpoint_future = checkpoints.save(run_id, 0, 0, &state, Vec::new(), true);
-            let save_result = if control.is_disabled() {
-                checkpoint_future.await
-            } else {
-                tokio::pin!(checkpoint_future);
-                let run_deadline = control.deadline(None);
-                tokio::select! {
-                    biased;
-                    () = control.cancellation_token.cancelled() => {
-                        return events.fail(control.cancelled_error(run_id, None, 0));
-                    }
-                    deadline = wait_for_deadline(run_deadline) => {
-                        return events.fail(control.deadline_error(run_id, None, 0, deadline));
-                    }
-                    result = &mut checkpoint_future => result,
-                }
-            };
+        self.execute_internal(
+            Execution {
+                run_id,
+                state: initial_state,
+                steps: 0,
+                visited_nodes: Vec::new(),
+                events,
+                frontier,
+                superstep: 0,
+                save_empty_checkpoint: true,
+            },
+            config,
+            control,
+            checkpoints,
+        )
+        .await
+    }
+
+    async fn execute_internal<C>(
+        &self,
+        execution: Execution<'_, S>,
+        config: RunConfig,
+        control: ActiveControl,
+        mut checkpoints: C,
+    ) -> Result<RunReport<S>, GraphRunError>
+    where
+        C: RuntimeCheckpoint<S>,
+    {
+        let Execution {
+            run_id,
+            mut state,
+            mut steps,
+            mut visited_nodes,
+            mut events,
+            mut frontier,
+            mut superstep,
+            save_empty_checkpoint,
+        } = execution;
+        let mut next_frontier = Vec::new();
+        let absolute_step_limit = steps.saturating_add(config.max_steps);
+
+        if save_empty_checkpoint && frontier.is_empty() && checkpoints.should_save(true) {
+            let save_result = await_run_boundary(
+                &control,
+                run_id,
+                steps,
+                checkpoints.save(run_id, superstep, steps, &state, Vec::new(), true),
+            )
+            .await;
             let saved = match save_result {
                 Ok(saved) => saved,
                 Err(error) => return events.fail(error),
@@ -186,8 +227,8 @@ where
                 run_id,
                 checkpoint_id: saved.id,
                 thread_id: saved.thread_id,
-                superstep: 0,
-                step: 0,
+                superstep,
+                step: steps,
                 completed: true,
             });
         }
@@ -201,7 +242,7 @@ where
                 return events.fail(error);
             }
 
-            let remaining_steps = config.max_steps.saturating_sub(steps);
+            let remaining_steps = absolute_step_limit.saturating_sub(steps);
             if frontier.len() > remaining_steps {
                 let blocked_offset = remaining_steps;
                 let blocked_node = &self.node_at(frontier[blocked_offset]).id;
@@ -509,24 +550,13 @@ where
                     .iter()
                     .map(|index| self.node_at(*index).id.clone())
                     .collect();
-                let checkpoint_future =
-                    checkpoints.save(run_id, superstep, steps, &state, next_node_ids, completed);
-                let save_result = if control.is_disabled() {
-                    checkpoint_future.await
-                } else {
-                    tokio::pin!(checkpoint_future);
-                    let run_deadline = control.deadline(None);
-                    tokio::select! {
-                        biased;
-                        () = control.cancellation_token.cancelled() => {
-                            return events.fail(control.cancelled_error(run_id, None, steps));
-                        }
-                        deadline = wait_for_deadline(run_deadline) => {
-                            return events.fail(control.deadline_error(run_id, None, steps, deadline));
-                        }
-                        result = &mut checkpoint_future => result,
-                    }
-                };
+                let save_result = await_run_boundary(
+                    &control,
+                    run_id,
+                    steps,
+                    checkpoints.save(run_id, superstep, steps, &state, next_node_ids, completed),
+                )
+                .await;
                 let saved = match save_result {
                     Ok(saved) => saved,
                     Err(error) => return events.fail(error),
@@ -575,6 +605,163 @@ impl<S> CompiledGraph<S>
 where
     S: CheckpointState,
 {
+    /// Restores a checkpoint and continues its latest state lineage.
+    pub async fn resume(
+        &self,
+        resume_config: ResumeConfig<S::Snapshot>,
+    ) -> Result<RunReport<S>, GraphRunError> {
+        let invocation_started = Instant::now();
+        let (
+            thread_id,
+            checkpointer,
+            target,
+            checkpoint_policy,
+            run_config,
+            event_config,
+            run_control,
+        ) = resume_config.into_parts();
+        let run_id = RunId::next();
+        let control = ActiveControl::new(run_control, invocation_started);
+        let mut events = EventEmitter::new(run_id, &event_config);
+        events.emit(|| GraphEvent::RunStarted {
+            run_id,
+            max_steps: run_config.max_steps,
+        });
+        debug!(%run_id, %thread_id, max_steps = run_config.max_steps, "graph resume started");
+
+        if let Some(error) = control.check(run_id, None, 0, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        let requested_id = match target {
+            ResumeTarget::Latest => None,
+            ResumeTarget::Checkpoint(checkpoint_id) => Some(checkpoint_id),
+        };
+        let load = async {
+            let checkpoint = match target {
+                ResumeTarget::Latest => checkpointer.latest(&thread_id).await,
+                ResumeTarget::Checkpoint(checkpoint_id) => {
+                    checkpointer.get(&thread_id, checkpoint_id).await
+                }
+            }
+            .map_err(|source| GraphRunError::CheckpointLoadFailed {
+                run_id,
+                thread_id: thread_id.clone(),
+                checkpoint_id: requested_id,
+                source,
+            })?;
+            checkpoint.ok_or_else(|| GraphRunError::CheckpointNotFound {
+                run_id,
+                thread_id: thread_id.clone(),
+                checkpoint_id: requested_id,
+            })
+        };
+        let checkpoint = match await_run_boundary(&control, run_id, 0, load).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return events.fail(error),
+        };
+        let checkpoint_step = checkpoint.step();
+
+        if checkpoint.thread_id() != &thread_id {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id: checkpoint.id(),
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::ThreadMismatch {
+                    actual_thread: checkpoint.thread_id().clone(),
+                },
+            });
+        }
+
+        if matches!(target, ResumeTarget::Checkpoint(_)) {
+            let latest = async {
+                checkpointer.latest(&thread_id).await.map_err(|source| {
+                    GraphRunError::CheckpointLoadFailed {
+                        run_id,
+                        thread_id: thread_id.clone(),
+                        checkpoint_id: Some(checkpoint.id()),
+                        source,
+                    }
+                })
+            };
+            let latest = match await_run_boundary(&control, run_id, checkpoint_step, latest).await {
+                Ok(latest) => latest,
+                Err(error) => return events.fail(error),
+            };
+            let latest_checkpoint_id = latest.as_ref().map(|checkpoint| checkpoint.id());
+            if latest_checkpoint_id != Some(checkpoint.id()) {
+                return events.fail(GraphRunError::ResumeConflict {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: checkpoint.id(),
+                    latest_checkpoint_id,
+                    step: checkpoint_step,
+                });
+            }
+        }
+
+        let frontier = match self.validate_and_resolve_resume_frontier(&checkpoint) {
+            Ok(frontier) => frontier,
+            Err(reason) => {
+                return events.fail(GraphRunError::CheckpointIncompatible {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: checkpoint.id(),
+                    step: checkpoint_step,
+                    reason,
+                });
+            }
+        };
+
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+        let state = match S::restore(checkpoint.snapshot()) {
+            Ok(state) => state,
+            Err(source) => {
+                return events.fail(GraphRunError::RestoreFailed {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: checkpoint.id(),
+                    superstep: checkpoint.superstep(),
+                    step: checkpoint_step,
+                    source,
+                });
+            }
+        };
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        events.emit(|| GraphEvent::RunResumed {
+            run_id,
+            thread_id: thread_id.clone(),
+            checkpoint_id: checkpoint.id(),
+            step: checkpoint_step,
+            superstep: checkpoint.superstep(),
+        });
+
+        let checkpoint_config = CheckpointConfig::new(thread_id, checkpointer, checkpoint_policy)
+            .with_expected_parent(Some(checkpoint.id()));
+        self.execute_internal(
+            Execution {
+                run_id,
+                state,
+                steps: checkpoint_step,
+                visited_nodes: Vec::new(),
+                events,
+                frontier,
+                superstep: checkpoint.superstep(),
+                save_empty_checkpoint: false,
+            },
+            run_config,
+            control,
+            EnabledCheckpoint::new(checkpoint_config, self.version.clone()),
+        )
+        .await
+    }
+
     /// Invokes the graph with explicit execution and checkpoint configuration.
     pub async fn invoke_with_checkpoint(
         &self,
@@ -589,9 +776,51 @@ where
             config,
             event_config,
             control,
-            EnabledCheckpoint::new(checkpoint_config),
+            EnabledCheckpoint::new(checkpoint_config, self.version.clone()),
         )
         .await
+    }
+
+    fn validate_and_resolve_resume_frontier(
+        &self,
+        checkpoint: &Checkpoint<S::Snapshot>,
+    ) -> Result<Vec<NodeIndex>, CheckpointIncompatibility> {
+        match (checkpoint.graph_version(), self.version()) {
+            (None, _) => return Err(CheckpointIncompatibility::UnversionedCheckpoint),
+            (Some(_), None) => return Err(CheckpointIncompatibility::UnversionedGraph),
+            (Some(checkpoint_version), Some(compiled_version))
+                if checkpoint_version != compiled_version =>
+            {
+                return Err(CheckpointIncompatibility::GraphVersionMismatch {
+                    checkpoint: checkpoint_version.clone(),
+                    compiled: compiled_version.clone(),
+                });
+            }
+            (Some(_), Some(_)) => {}
+        }
+        if checkpoint.completed() && !checkpoint.next_frontier().is_empty() {
+            return Err(CheckpointIncompatibility::CompletedWithFrontier);
+        }
+        if !checkpoint.completed() && checkpoint.next_frontier().is_empty() {
+            return Err(CheckpointIncompatibility::IncompleteWithoutFrontier);
+        }
+        checkpoint
+            .next_frontier()
+            .iter()
+            .map(|node_id| {
+                if node_id.is_start() {
+                    return Err(CheckpointIncompatibility::StartInFrontier);
+                }
+                if node_id.is_end() {
+                    return Err(CheckpointIncompatibility::EndInFrontier);
+                }
+                self.node_indices.get(node_id).copied().ok_or_else(|| {
+                    CheckpointIncompatibility::UnknownFrontierNode {
+                        node_id: node_id.clone(),
+                    }
+                })
+            })
+            .collect()
     }
 }
 
@@ -648,17 +877,22 @@ where
 {
     config: CheckpointConfig<S::Snapshot>,
     expected_parent: Option<CheckpointId>,
+    graph_version: Option<crate::GraphVersion>,
 }
 
 impl<S> EnabledCheckpoint<S>
 where
     S: CheckpointState,
 {
-    fn new(config: CheckpointConfig<S::Snapshot>) -> Self {
+    fn new(
+        config: CheckpointConfig<S::Snapshot>,
+        graph_version: Option<crate::GraphVersion>,
+    ) -> Self {
         let expected_parent = config.expected_parent();
         Self {
             config,
             expected_parent,
+            graph_version,
         }
     }
 }
@@ -697,6 +931,7 @@ where
             CheckpointLineage::new(
                 CheckpointId::next(),
                 self.expected_parent,
+                self.graph_version.clone(),
                 thread_id.clone(),
                 run_id,
             ),
@@ -730,6 +965,15 @@ where
                     step,
                     source,
                 },
+                CheckpointWriteError::IdempotencyConflict { checkpoint_id } => {
+                    GraphRunError::CheckpointIdConflict {
+                        run_id,
+                        thread_id: thread_id.clone(),
+                        checkpoint_id,
+                        superstep,
+                        step,
+                    }
+                }
             })?;
         self.expected_parent = Some(checkpoint.id());
         Ok(SavedCheckpoint {
@@ -968,6 +1212,33 @@ async fn wait_for_deadline(deadline: Option<ActiveDeadline>) -> ActiveDeadline {
     }
 }
 
+async fn await_run_boundary<F, T>(
+    control: &ActiveControl,
+    run_id: RunId,
+    step: usize,
+    future: F,
+) -> Result<T, GraphRunError>
+where
+    F: Future<Output = Result<T, GraphRunError>>,
+{
+    if control.is_disabled() {
+        return future.await;
+    }
+
+    tokio::pin!(future);
+    let run_deadline = control.deadline(None);
+    tokio::select! {
+        biased;
+        () = control.cancellation_token.cancelled() => {
+            Err(control.cancelled_error(run_id, None, step))
+        }
+        deadline = wait_for_deadline(run_deadline) => {
+            Err(control.deadline_error(run_id, None, step, deadline))
+        }
+        result = &mut future => result,
+    }
+}
+
 impl From<&GraphRunError> for RunFailure {
     fn from(error: &GraphRunError) -> Self {
         match error {
@@ -1042,6 +1313,18 @@ impl From<&GraphRunError> for RunFailure {
                 expected_parent: *expected_parent,
                 actual_parent: *actual_parent,
             },
+            GraphRunError::CheckpointIdConflict {
+                thread_id,
+                checkpoint_id,
+                superstep,
+                step,
+                ..
+            } => Self::CheckpointIdConflict {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+                superstep: *superstep,
+                step: *step,
+            },
             GraphRunError::CheckpointSaveFailed {
                 thread_id,
                 superstep,
@@ -1049,6 +1332,58 @@ impl From<&GraphRunError> for RunFailure {
                 ..
             } => Self::CheckpointSaveFailed {
                 thread_id: thread_id.clone(),
+                superstep: *superstep,
+                step: *step,
+            },
+            GraphRunError::CheckpointLoadFailed {
+                thread_id,
+                checkpoint_id,
+                ..
+            } => Self::CheckpointLoadFailed {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+            },
+            GraphRunError::CheckpointNotFound {
+                thread_id,
+                checkpoint_id,
+                ..
+            } => Self::CheckpointNotFound {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+            },
+            GraphRunError::ResumeConflict {
+                thread_id,
+                checkpoint_id,
+                latest_checkpoint_id,
+                step,
+                ..
+            } => Self::ResumeConflict {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+                latest_checkpoint_id: *latest_checkpoint_id,
+                step: *step,
+            },
+            GraphRunError::CheckpointIncompatible {
+                thread_id,
+                checkpoint_id,
+                step,
+                reason,
+                ..
+            } => Self::CheckpointIncompatible {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+                step: *step,
+                reason: reason.clone(),
+            },
+            GraphRunError::RestoreFailed {
+                thread_id,
+                checkpoint_id,
+                superstep,
+                step,
+                ..
+            } => Self::RestoreFailed {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
                 superstep: *superstep,
                 step: *step,
             },
@@ -1066,5 +1401,194 @@ impl From<&GraphRunError> for RunFailure {
                 step: *step,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_validation_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        Checkpointer, CheckpointerError, END, GraphVersion, Node, NodeError, START, SnapshotError,
+        StateError, StateGraph,
+    };
+
+    #[derive(Debug, Default)]
+    struct ValidationState {
+        restore_calls: Arc<AtomicUsize>,
+    }
+
+    struct ValidationSnapshot {
+        restore_calls: Arc<AtomicUsize>,
+        fail_restore: bool,
+    }
+
+    impl GraphState for ValidationState {
+        type Update = ();
+
+        fn apply(&mut self, (): Self::Update) -> Result<(), StateError> {
+            Ok(())
+        }
+    }
+
+    impl CheckpointState for ValidationState {
+        type Snapshot = ValidationSnapshot;
+
+        fn snapshot(&self) -> Result<Self::Snapshot, SnapshotError> {
+            Ok(ValidationSnapshot {
+                restore_calls: Arc::clone(&self.restore_calls),
+                fail_restore: false,
+            })
+        }
+
+        fn restore(snapshot: &Self::Snapshot) -> Result<Self, SnapshotError> {
+            snapshot.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if snapshot.fail_restore {
+                return Err(SnapshotError::message("restore should not run"));
+            }
+            Ok(Self {
+                restore_calls: Arc::clone(&snapshot.restore_calls),
+            })
+        }
+    }
+
+    struct NoopNode;
+
+    #[async_trait]
+    impl Node<ValidationState> for NoopNode {
+        async fn run(
+            &self,
+            _state: &ValidationState,
+            _context: &NodeContext,
+        ) -> Result<(), NodeError> {
+            Ok(())
+        }
+    }
+
+    struct StaticCheckpointer {
+        checkpoint: Arc<Checkpoint<ValidationSnapshot>>,
+    }
+
+    #[async_trait]
+    impl Checkpointer<ValidationSnapshot> for StaticCheckpointer {
+        async fn save(
+            &self,
+            request: CheckpointRequest<ValidationSnapshot>,
+        ) -> Result<Arc<Checkpoint<ValidationSnapshot>>, CheckpointWriteError> {
+            Ok(Arc::new(request.into_checkpoint()))
+        }
+
+        async fn latest(
+            &self,
+            thread_id: &ThreadId,
+        ) -> Result<Option<Arc<Checkpoint<ValidationSnapshot>>>, CheckpointerError> {
+            Ok((self.checkpoint.thread_id() == thread_id).then(|| Arc::clone(&self.checkpoint)))
+        }
+
+        async fn history(
+            &self,
+            thread_id: &ThreadId,
+        ) -> Result<Vec<Arc<Checkpoint<ValidationSnapshot>>>, CheckpointerError> {
+            Ok(if self.checkpoint.thread_id() == thread_id {
+                vec![Arc::clone(&self.checkpoint)]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    fn validation_graph() -> CompiledGraph<ValidationState> {
+        let mut graph = StateGraph::new();
+        graph.set_version("validation-v1");
+        graph
+            .add_node("valid", NoopNode)
+            .expect("node should register");
+        graph.add_edge(START, "valid").add_edge("valid", END);
+        graph.compile().expect("graph should compile")
+    }
+
+    fn forged_checkpoint(
+        frontier: Vec<NodeId>,
+        completed: bool,
+    ) -> (Arc<Checkpoint<ValidationSnapshot>>, Arc<AtomicUsize>) {
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let request = CheckpointRequest::new(
+            CheckpointLineage::new(
+                CheckpointId::next(),
+                None,
+                Some(GraphVersion::from("validation-v1")),
+                ThreadId::from("validation-thread"),
+                RunId::next(),
+            ),
+            1,
+            1,
+            Arc::new(ValidationSnapshot {
+                restore_calls: Arc::clone(&restore_calls),
+                fail_restore: true,
+            }),
+            frontier,
+            completed,
+        );
+        (Arc::new(request.into_checkpoint()), restore_calls)
+    }
+
+    async fn assert_incompatible_before_restore(
+        frontier: Vec<NodeId>,
+        completed: bool,
+        expected: CheckpointIncompatibility,
+    ) {
+        let (checkpoint, restore_calls) = forged_checkpoint(frontier, completed);
+        let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
+            Arc::new(StaticCheckpointer { checkpoint });
+        let error = validation_graph()
+            .resume(ResumeConfig::new("validation-thread", store))
+            .await
+            .expect_err("forged checkpoint should be incompatible");
+        match error {
+            GraphRunError::CheckpointIncompatible { reason, .. } => {
+                assert_eq!(reason, expected);
+            }
+            other => panic!("unexpected resume error: {other}"),
+        }
+        assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn start_frontier_is_rejected_before_restore() {
+        assert_incompatible_before_restore(
+            vec![NodeId::start()],
+            false,
+            CheckpointIncompatibility::StartInFrontier,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn end_frontier_is_rejected_before_restore() {
+        assert_incompatible_before_restore(
+            vec![NodeId::end()],
+            false,
+            CheckpointIncompatibility::EndInFrontier,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_completed_frontier_combinations_are_rejected_before_restore() {
+        assert_incompatible_before_restore(
+            vec![NodeId::from("valid")],
+            true,
+            CheckpointIncompatibility::CompletedWithFrontier,
+        )
+        .await;
+        assert_incompatible_before_restore(
+            Vec::new(),
+            false,
+            CheckpointIncompatibility::IncompleteWithoutFrontier,
+        )
+        .await;
     }
 }

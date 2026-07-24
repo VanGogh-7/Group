@@ -614,25 +614,32 @@ async fn concurrent_runs_on_one_thread_conflict_without_crossing_parent_chains()
             ..
         } if thread_id == &ThreadId::from("shared-thread") && actual == history[0].id()
     ));
-    let events = sink.0.lock().expect("sink lock should not be poisoned");
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, GraphEvent::RunFailed { .. }))
-            .count(),
-        1
-    );
-    assert!(matches!(
-        events.last(),
-        Some(GraphEvent::RunFailed {
-            failure: RunFailure::CheckpointConflict {
-                expected_parent: None,
-                actual_parent: Some(actual),
+    {
+        let events = sink.0.lock().expect("sink lock should not be poisoned");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GraphEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(GraphEvent::RunFailed {
+                failure: RunFailure::CheckpointConflict {
+                    expected_parent: None,
+                    actual_parent: Some(actual),
+                    ..
+                },
                 ..
-            },
-            ..
-        }) if *actual == history[0].id()
-    ));
+            }) if *actual == history[0].id()
+        ));
+    }
+    let report = graph
+        .invoke(state())
+        .await
+        .expect("compiled graph should remain reusable after conflict");
+    assert_eq!(report.steps(), 0);
 }
 
 struct FailingCheckpointer {
@@ -952,21 +959,19 @@ async fn zero_node_snapshot_and_save_failures_have_terminal_events_without_compl
             .lock()
             .expect("sink lock should not be poisoned");
         assert!(matches!(
-            snapshot_events.last(),
-            Some(GraphEvent::RunFailed {
-                failure: RunFailure::SnapshotFailed {
-                    superstep: 0,
-                    step: 0,
+            snapshot_events.as_slice(),
+            [
+                GraphEvent::RunStarted { .. },
+                GraphEvent::RunFailed {
+                    failure: RunFailure::SnapshotFailed {
+                        superstep: 0,
+                        step: 0,
+                        ..
+                    },
                     ..
                 },
-                ..
-            })
+            ]
         ));
-        assert!(
-            !snapshot_events
-                .iter()
-                .any(|event| matches!(event, GraphEvent::RunCompleted { .. }))
-        );
     }
 
     let save_sink = Arc::new(RecordingSink::default());
@@ -1001,22 +1006,19 @@ async fn zero_node_snapshot_and_save_failures_have_terminal_events_without_compl
         .lock()
         .expect("sink lock should not be poisoned");
     assert!(matches!(
-        save_events.last(),
-        Some(GraphEvent::RunFailed {
-            failure: RunFailure::CheckpointSaveFailed {
-                superstep: 0,
-                step: 0,
+        save_events.as_slice(),
+        [
+            GraphEvent::RunStarted { .. },
+            GraphEvent::RunFailed {
+                failure: RunFailure::CheckpointSaveFailed {
+                    superstep: 0,
+                    step: 0,
+                    ..
+                },
                 ..
             },
-            ..
-        })
+        ]
     ));
-    assert!(!save_events.iter().any(|event| {
-        matches!(
-            event,
-            GraphEvent::CheckpointSaved { .. } | GraphEvent::RunCompleted { .. }
-        )
-    }));
 }
 
 #[tokio::test]
@@ -1055,14 +1057,17 @@ async fn zero_node_cancel_and_timeout_fail_before_snapshot_and_completion() {
             .lock()
             .expect("sink lock should not be poisoned");
         assert!(matches!(
-            cancelled_events.last(),
-            Some(GraphEvent::RunFailed {
-                failure: RunFailure::Cancelled {
-                    node_id: None,
-                    step: 0,
+            cancelled_events.as_slice(),
+            [
+                GraphEvent::RunStarted { .. },
+                GraphEvent::RunFailed {
+                    failure: RunFailure::Cancelled {
+                        node_id: None,
+                        step: 0,
+                    },
+                    ..
                 },
-                ..
-            })
+            ]
         ));
     }
 
@@ -1092,21 +1097,19 @@ async fn zero_node_cancel_and_timeout_fail_before_snapshot_and_completion() {
         .lock()
         .expect("sink lock should not be poisoned");
     assert!(matches!(
-        timeout_events.last(),
-        Some(GraphEvent::RunFailed {
-            failure: RunFailure::RunTimedOut {
-                node_id: None,
-                step: 0,
-                timeout: Duration::ZERO,
+        timeout_events.as_slice(),
+        [
+            GraphEvent::RunStarted { .. },
+            GraphEvent::RunFailed {
+                failure: RunFailure::RunTimedOut {
+                    node_id: None,
+                    step: 0,
+                    timeout: Duration::ZERO,
+                },
+                ..
             },
-            ..
-        })
+        ]
     ));
-    assert!(
-        !timeout_events
-            .iter()
-            .any(|event| matches!(event, GraphEvent::RunCompleted { .. }))
-    );
 }
 
 #[tokio::test]
@@ -1289,6 +1292,57 @@ async fn cancellation_wins_when_save_and_cancellation_are_ready_together() {
         .await
         .expect("run task should not panic")
         .expect_err("cancellation should beat a ready save");
+    assert!(matches!(
+        error,
+        GraphRunError::Cancelled {
+            node_id: None,
+            step: 0,
+            ..
+        }
+    ));
+    assert_eq!(checkpointer.dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_wins_when_save_run_timeout_and_cancellation_are_all_ready() {
+    let graph = Arc::new(zero_node_graph());
+    let checkpointer = Arc::new(PendingSaveCheckpointer {
+        started: Notify::new(),
+        release: Notify::new(),
+        dropped: AtomicUsize::new(0),
+    });
+    let started = checkpointer.started.notified();
+    let token = CancellationToken::new();
+    let task = tokio::spawn({
+        let graph = Arc::clone(&graph);
+        let checkpointer = Arc::clone(&checkpointer);
+        let token = token.clone();
+        async move {
+            graph
+                .invoke_with_checkpoint(
+                    state(),
+                    RunConfig::default(),
+                    EventConfig::default(),
+                    RunControl::new()
+                        .with_cancellation_token(token)
+                        .with_run_timeout(Duration::from_secs(5)),
+                    CheckpointConfig::new(
+                        "triple-ready",
+                        checkpointer as Arc<dyn Checkpointer<TestSnapshot>>,
+                        CheckpointPolicy::EverySuperstep,
+                    ),
+                )
+                .await
+        }
+    });
+    started.await;
+    checkpointer.release.notify_waiters();
+    token.cancel();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let error = task
+        .await
+        .expect("run task should not panic")
+        .expect_err("cancellation should have highest priority");
     assert!(matches!(
         error,
         GraphRunError::Cancelled {

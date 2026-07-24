@@ -7,9 +7,8 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 6.1 hardens the opt-in checkpoint foundation with explicit state lineage,
-atomic expected-parent checks, zero-node terminal checkpoints, and execution
-control during asynchronous saves:
+Stage 7 adds latest-only resume from versioned checkpoints while preserving
+explicit checkpoint lineage:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
@@ -36,6 +35,8 @@ The current core includes:
 - opt-in snapshots and asynchronous replaceable checkpoint storage;
 - process-local, thread-safe `InMemoryCheckpointer`;
 - latest and ordered history queries with CAS-protected checkpoint lineage;
+- restoration of state, frontier, cumulative step, and super-step position;
+- explicit graph-version compatibility and latest-only resume checks;
 - explicit loops protected by a per-run `max_steps`;
 - immutable, reusable, concurrently shareable compiled graphs;
 - immediate lifecycle delivery through a thread-safe `EventSink`;
@@ -127,10 +128,9 @@ impl CheckpointState for AgentState {
 }
 ```
 
-`restore` reserves the state boundary required by a later Resume stage. Stage 6
-does not call it and cannot resume, replay, fork, or time-travel. A future
-Resume design must additionally validate graph version and topology
-compatibility; the stored frontier alone is not sufficient.
+`restore` is called synchronously during resume and remains outside storage
+locks. It is not preemptible by cancellation or timeout; control is observed
+again immediately after it returns.
 
 Checkpointing is enabled only through `invoke_with_checkpoint`:
 
@@ -159,6 +159,19 @@ let report = compiled
     .await?;
 ```
 
+Graphs intended for checkpoint resume must have an explicit compatibility
+version before compilation:
+
+```rust
+graph.set_version("agent-graph-v3");
+let compiled = graph.compile()?;
+```
+
+The version is stored in every new checkpoint. Update it whenever graph
+topology, state/Snapshot schema, batch reducer behavior, or router semantics
+change in a way that makes an old frontier or state unsafe to continue.
+Unversioned checkpoints and unversioned compiled graphs cannot resume.
+
 `CheckpointConfig::new` explicitly starts from state with no parent checkpoint.
 When the supplied state is based on an existing checkpoint, identify that
 lineage rather than allowing storage insertion order to choose it:
@@ -179,11 +192,13 @@ let config = CheckpointConfig::new(
 
 `CheckpointPolicy::EverySuperstep` saves after every successful super-step.
 `FinalOnly` creates only the final completed checkpoint. Each immutable
-`Checkpoint` records its `CheckpointId`, `ThreadId`, `RunId`, parent,
-super-step, cumulative step count, shared `Arc<Snapshot>`, stable next frontier,
-and completed flag. `Checkpointer::latest` and `history` return shared
-`Arc<Checkpoint<_>>` values, so queries do not deep-copy snapshots. History is
-ordered oldest to newest.
+`Checkpoint` records its `CheckpointId`, `ThreadId`, `RunId`, parent, graph
+version, super-step, cumulative step count, shared `Arc<Snapshot>`, stable next
+frontier, and completed flag. `Checkpointer::latest`, `get`, and `history`
+return shared `Arc<Checkpoint<_>>` values, so queries do not deep-copy
+snapshots. `get` is scoped by both `ThreadId` and `CheckpointId`; it never
+returns a checkpoint owned by another thread. History is ordered oldest to
+newest.
 
 A checkpoint parent represents the state lineage on which execution was based,
 not the previous insertion by wall-clock order. Each write carries both a
@@ -218,17 +233,72 @@ boundary context (`node_id = None`, with the cumulative completed step count),
 emit exactly one `RunFailed`, and emit neither `CheckpointSaved` nor
 `RunCompleted`. Dropping a save future cannot prove that a backend produced no
 side effect: storage may have committed before its future returned. Custom
-checkpointers should therefore treat `CheckpointRequest::checkpoint_id()` as
-an idempotency key. `InMemoryCheckpointer` deduplicates that key.
+checkpointers must therefore treat `CheckpointRequest::checkpoint_id()` as an
+idempotency key. An exact replay with the same metadata and snapshot `Arc`
+returns the original result even if latest has advanced. Reusing the same ID
+with different lineage, graph version, boundary, frontier, completion, or
+snapshot metadata returns `CheckpointWriteError::IdempotencyConflict`.
+`InMemoryCheckpointer` implements this contract.
 
 Snapshot creation is synchronous and cannot be preempted. It occurs before
 entering storage and never under the in-memory store lock. A legal
 `START -> END` graph saves exactly one completed checkpoint under either
 policy, with `superstep = 0`, `step = 0`, an empty frontier, and the configured
 expected parent. Its successful terminal order is `CheckpointSaved` followed
-by `RunCompleted`. The in-memory implementation provides no database durability
-or serialization. See
-[`examples/checkpoint.rs`](crates/group-agent-core/examples/checkpoint.rs).
+by `RunCompleted`. The in-memory implementation provides no database durability.
+See [`examples/checkpoint.rs`](crates/group-agent-core/examples/checkpoint.rs).
+
+## Resume from checkpoint
+
+`ResumeConfig` keeps checkpoint selection, checkpoint policy, additional step
+budget, events, and execution controls in one configuration:
+
+```rust
+let report = compiled
+    .resume(
+        ResumeConfig::new(
+            "conversation-42",
+            Arc::clone(&store) as Arc<dyn Checkpointer<AgentSnapshot>>,
+        )
+        // Omit this to load latest.
+        .with_checkpoint_id(checkpoint_id)
+        .with_run_config(RunConfig::new(100))
+        .with_checkpoint_policy(CheckpointPolicy::EverySuperstep)
+        .with_event_config(EventConfig::default())
+        .with_control(RunControl::default()),
+    )
+    .await?;
+```
+
+Resume loads a specified checkpoint through `get`, or uses `latest` by
+default. A specified checkpoint must still equal current latest; otherwise
+`ResumeConflict` is returned because Stage 7 does not implement Fork. The
+Runtime validates ThreadId, latest-only status, explicit graph version,
+completed/frontier consistency, and every frontier NodeId, resolving the saved
+frontier to compiled internal indices in O(F). `START`, explicit `END`, unknown
+nodes, unversioned data, and version mismatches produce
+`CheckpointIncompatible`.
+
+Only after every compatibility check and frontier resolution succeeds does the
+Runtime call `CheckpointState::restore` outside the storage lock. The resolved
+indices are reused directly for execution rather than parsed again. Events are
+ordered `RunStarted`, `RunResumed`, then the continued node lifecycle. Restore
+failure instead emits `RunStarted` followed by one `RunFailed`. `RunResumed`
+identifies the thread, checkpoint, cumulative step, and super-step position.
+
+Steps and super-steps continue from the checkpoint. `RunConfig::max_steps`
+means the additional number of nodes allowed by this resume call; error and
+checkpoint positions still use cumulative lineage steps. A resumed save uses
+the restored checkpoint as `expected_parent`, and later saves continue that
+chain. Resuming a completed checkpoint restores state but executes no node and
+does not create another completed checkpoint; its exact success sequence is
+`RunStarted -> RunResumed -> RunCompleted`.
+
+Cancellation and run timeout start at the `resume` call entry and remain active
+while loading storage and executing. Restore itself is synchronous and
+uninterruptible. Any load, compatibility, latest, restore, cancellation, or
+timeout failure saves nothing new and emits exactly one `RunFailed`. See
+[`examples/resume.rs`](crates/group-agent-core/examples/resume.rs).
 
 ## Event observation
 
@@ -289,6 +359,10 @@ save. The event includes checkpoint/thread/run identifiers, boundary position,
 and completed status without including the Snapshot. Snapshot or storage
 failures emit the corresponding typed `RunFailed`; they do not emit
 `CheckpointSaved`.
+
+Resume emits `RunResumed` only after loading, latest/version/frontier
+validation, and successful state restoration. It precedes every continued node
+event.
 
 `RunReport` remains a success-only result. On a node, state-apply, batch-apply,
 router, undeclared-target, step-limit, snapshot, or checkpoint-storage failure,
@@ -446,8 +520,9 @@ frontiers and an 8-branch short-wait frontier. The scheduler baselines are named
 explicitly as a 32-total-node linear chain and a 32-branch/33-total-node
 fan-out, so they are not presented as equivalent topologies. Stage 6 adds
 checkpoint-disabled and in-memory checkpoint-enabled invocation baselines.
-These are regression baselines without performance thresholds or
-cross-framework claims.
+Stage 7 adds load-plus-restore-plus-one-immediate-node and completed-checkpoint
+no-op resume baselines. These are regression baselines without performance
+thresholds or cross-framework claims.
 
 ## Workspace
 
@@ -467,7 +542,8 @@ cross-framework claims.
         │   ├── checkpoint.rs
         │   ├── conditional.rs
         │   ├── linear.rs
-        │   └── parallel.rs
+        │   ├── parallel.rs
+        │   └── resume.rs
         ├── src
         │   ├── checkpoint.rs
         │   ├── context.rs
@@ -487,6 +563,7 @@ cross-framework claims.
             ├── linear_execution.rs
             ├── observability.rs
             ├── parallel_execution.rs
+            ├── resume.rs
             └── review_regressions.rs
 ```
 
@@ -498,13 +575,14 @@ cargo run -p group-agent-core --example linear
 cargo run -p group-agent-core --example conditional
 cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
+cargo run -p group-agent-core --example resume
 cargo bench --workspace --no-run
 ```
 
 ## Current exclusions
 
-This stage does not support Resume, Replay, Fork, Time Travel, human interrupts,
-SQLite, PostgreSQL, SQLx, snapshot serialization, conditional or dynamic
+This stage does not support Replay, Fork, Time Travel, human interrupts, SQLite,
+PostgreSQL, SQLx, snapshot serialization, conditional or dynamic
 fan-out, built-in Tokio channels or streams, standalone reducer registration,
 LLM or tool APIs, MCP, RAG, token streaming, subgraphs, Tower middleware, Axum,
 HTTP services, distributed workers, macro DSLs, or visualization. The event
