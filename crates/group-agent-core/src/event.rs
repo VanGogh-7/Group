@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::NodeId;
+use crate::{CheckpointId, NodeId, ThreadId};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -148,6 +148,20 @@ pub enum RunFailure {
     NodeFailed { node_id: NodeId, step: usize },
     /// Applying a node update failed.
     StateUpdateFailed { node_id: NodeId, step: usize },
+    /// Applying a parallel state-update batch failed.
+    StateBatchUpdateFailed { node_ids: Vec<NodeId>, step: usize },
+    /// Creating a checkpoint snapshot failed.
+    SnapshotFailed {
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+    },
+    /// Saving a checkpoint failed.
+    CheckpointSaveFailed {
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+    },
     /// A conditional router returned an error.
     RouteFailed { node_id: NodeId, step: usize },
     /// A router selected a target outside its declared whitelist.
@@ -166,6 +180,12 @@ pub enum RunFailure {
 pub enum GraphEvent {
     /// A graph invocation began.
     RunStarted { run_id: RunId, max_steps: usize },
+    /// A super-step began with a stable active frontier.
+    SuperstepStarted {
+        run_id: RunId,
+        superstep: usize,
+        node_ids: Vec<NodeId>,
+    },
     /// A node began executing.
     NodeStarted {
         run_id: RunId,
@@ -191,6 +211,17 @@ pub enum GraphEvent {
         target: NodeId,
         step: usize,
     },
+    /// A super-step committed its updates and selected its successors.
+    SuperstepCompleted { run_id: RunId, superstep: usize },
+    /// A checkpoint was saved after a successful super-step.
+    CheckpointSaved {
+        run_id: RunId,
+        checkpoint_id: CheckpointId,
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        completed: bool,
+    },
     /// The invocation reached `END`.
     RunCompleted { run_id: RunId, steps: usize },
     /// The invocation failed and will not produce a run report.
@@ -203,10 +234,13 @@ impl GraphEvent {
     pub const fn run_id(&self) -> RunId {
         match self {
             Self::RunStarted { run_id, .. }
+            | Self::SuperstepStarted { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeCompleted { run_id, .. }
             | Self::StateUpdated { run_id, .. }
             | Self::RouteSelected { run_id, .. }
+            | Self::SuperstepCompleted { run_id, .. }
+            | Self::CheckpointSaved { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. } => *run_id,
         }

@@ -14,6 +14,7 @@ criterion = { version = "0.7.0", default-features = false, features = [
     "async_tokio",
     "cargo_bench_support",
 ] }
+futures-util = "0.3.31"
 indexmap = "2.14.0"
 petgraph = "0.8.3"
 thiserror = "2.0.19"

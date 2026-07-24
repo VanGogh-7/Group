@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{NodeId, RunId};
+use crate::{NodeId, RunId, ThreadId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -25,6 +25,15 @@ pub enum GraphBuildError {
     /// A source attempted to register more than one conditional router.
     #[error("node `{source_node}` already has a conditional router")]
     MultipleConditionalRouters { source_node: NodeId },
+    /// A fan-out edge declared no targets.
+    #[error("fan-out edge from `{source_node}` must declare at least one target")]
+    EmptyFanOutTargets { source_node: NodeId },
+    /// A fan-out edge declared the same target more than once.
+    #[error("fan-out edge from `{source_node}` declares duplicate target `{target}`")]
+    DuplicateFanOutTarget { source_node: NodeId, target: NodeId },
+    /// A source attempted to register more than one fan-out transition.
+    #[error("node `{source_node}` already has a fan-out transition")]
+    MultipleFanOutTransitions { source_node: NodeId },
 }
 
 /// An error found while compiling graph topology.
@@ -43,6 +52,12 @@ pub enum GraphCompileError {
     /// A conditional target does not name a registered node or `END`.
     #[error("conditional edge from `{source_node}` references unknown target `{target}`")]
     UnknownConditionalTarget { source_node: NodeId, target: NodeId },
+    /// A fan-out source is not a registered normal node.
+    #[error("fan-out source `{source_node}` is not a registered node")]
+    UnknownFanOutSource { source_node: NodeId },
+    /// A fan-out target does not name a registered node or `END`.
+    #[error("fan-out from `{source_node}` references unknown target `{target}`")]
+    UnknownFanOutTarget { source_node: NodeId, target: NodeId },
     /// `START` has no outgoing fixed edge.
     #[error("START must have exactly one outgoing fixed edge")]
     MissingStartEdge,
@@ -52,23 +67,29 @@ pub enum GraphCompileError {
     /// `START` attempted to use conditional routing.
     #[error("START cannot have a conditional edge")]
     StartHasConditionalEdge,
+    /// `START` attempted to use fan-out.
+    #[error("START cannot have a fan-out transition")]
+    StartHasFanOut,
     /// `END` has a fixed outgoing edge.
     #[error("END cannot have an outgoing edge to `{to}`")]
     EndHasOutgoing { to: NodeId },
     /// `END` attempted to use conditional routing.
     #[error("END cannot have a conditional edge")]
     EndHasConditionalEdge,
+    /// `END` attempted to use fan-out.
+    #[error("END cannot have a fan-out transition")]
+    EndHasFanOut,
     /// `START` has more than one fixed outgoing edge.
     #[error("START has {count} outgoing fixed edges; exactly one is allowed")]
     MultipleStartEdges { count: usize },
     /// A normal node has more than one fixed successor.
     #[error("node `{node_id}` has {count} outgoing fixed edges; at most one is allowed")]
     MultipleOutgoingEdges { node_id: NodeId, count: usize },
-    /// A node has both fixed and conditional routing.
-    #[error("node `{node_id}` cannot have both fixed and conditional outgoing edges")]
+    /// A node declared more than one transition kind.
+    #[error("node `{node_id}` cannot combine fixed, fan-out, and conditional transitions")]
     MixedOutgoingEdgeKinds { node_id: NodeId },
     /// A reachable normal node has no successor.
-    #[error("node `{node_id}` has no outgoing fixed or conditional edge")]
+    #[error("node `{node_id}` has no outgoing fixed, fan-out, or conditional transition")]
     MissingOutgoingEdge { node_id: NodeId },
     /// A registered node cannot be reached from `START`.
     #[error("node `{node_id}` is unreachable from START")]
@@ -137,6 +158,14 @@ define_source_error!(
     RouteError,
     "An error returned by a synchronous conditional router."
 );
+define_source_error!(
+    SnapshotError,
+    "An error produced while creating or restoring a checkpoint snapshot."
+);
+define_source_error!(
+    CheckpointerError,
+    "An error returned by a checkpoint storage implementation."
+);
 
 /// An error raised during graph execution.
 #[derive(Debug, Error)]
@@ -188,6 +217,40 @@ pub enum GraphRunError {
         step: usize,
         #[source]
         source: StateError,
+    },
+    /// A parallel state-update batch could not be applied.
+    #[error("parallel state-update batch from nodes {node_ids:?} failed at step {step}: {source}")]
+    StateBatchUpdateFailed {
+        node_ids: Vec<NodeId>,
+        step: usize,
+        #[source]
+        source: StateError,
+    },
+    /// Creating a checkpoint snapshot failed.
+    #[error(
+        "snapshot creation for thread `{thread_id}` in run `{run_id}` failed after super-step \
+         {superstep} at step {step}: {source}"
+    )]
+    SnapshotFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        #[source]
+        source: SnapshotError,
+    },
+    /// Saving a checkpoint failed.
+    #[error(
+        "checkpoint save for thread `{thread_id}` in run `{run_id}` failed after super-step \
+         {superstep} at step {step}: {source}"
+    )]
+    CheckpointSaveFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        superstep: usize,
+        step: usize,
+        #[source]
+        source: CheckpointerError,
     },
     /// A conditional router failed.
     #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]

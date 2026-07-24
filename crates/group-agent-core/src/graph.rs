@@ -5,12 +5,13 @@ use indexmap::IndexMap;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::Dfs;
 
-use crate::edge::{ConditionalEdge, FixedEdge, Router};
+use crate::edge::{ConditionalEdge, FanOutEdge, FixedEdge, Router};
 use crate::{GraphBuildError, GraphCompileError, GraphState, Node, NodeId, RouteError};
 
 #[derive(Clone, Copy, Debug)]
 enum TopologyEdge {
     Fixed,
+    FanOut,
     Conditional,
 }
 
@@ -24,6 +25,7 @@ where
     S: GraphState,
 {
     fixed_by_source: HashMap<NodeId, FixedOutgoing>,
+    fan_out_by_source: HashMap<NodeId, &'a FanOutEdge>,
     conditional_by_source: HashMap<NodeId, &'a ConditionalEdge<S>>,
 }
 
@@ -34,6 +36,7 @@ where
 {
     nodes: IndexMap<NodeId, Arc<dyn Node<S>>>,
     fixed_edges: Vec<FixedEdge>,
+    fan_out_edges: Vec<FanOutEdge>,
     conditional_edges: Vec<ConditionalEdge<S>>,
 }
 
@@ -47,6 +50,7 @@ where
         Self {
             nodes: IndexMap::new(),
             fixed_edges: Vec::new(),
+            fan_out_edges: Vec::new(),
             conditional_edges: Vec::new(),
         }
     }
@@ -80,6 +84,47 @@ where
         self.fixed_edges
             .push(FixedEdge::new(from.into(), to.into()));
         self
+    }
+
+    /// Registers one static fan-out transition.
+    ///
+    /// All target nodes become members of the next active frontier and execute
+    /// concurrently against the same immutable state snapshot.
+    pub fn add_fan_out<I, T>(
+        &mut self,
+        source: impl Into<NodeId>,
+        targets: I,
+    ) -> Result<&mut Self, GraphBuildError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<NodeId>,
+    {
+        let source = source.into();
+        if self.fan_out_edges.iter().any(|edge| edge.source == source) {
+            return Err(GraphBuildError::MultipleFanOutTransitions {
+                source_node: source,
+            });
+        }
+
+        let targets: Vec<NodeId> = targets.into_iter().map(Into::into).collect();
+        if targets.is_empty() {
+            return Err(GraphBuildError::EmptyFanOutTargets {
+                source_node: source,
+            });
+        }
+
+        let mut unique_targets = HashSet::new();
+        for target in &targets {
+            if !unique_targets.insert(target.clone()) {
+                return Err(GraphBuildError::DuplicateFanOutTarget {
+                    source_node: source,
+                    target: target.clone(),
+                });
+            }
+        }
+
+        self.fan_out_edges.push(FanOutEdge::new(source, targets));
+        Ok(self)
     }
 
     /// Registers one synchronous conditional router and its target whitelist.
@@ -157,6 +202,11 @@ where
         for edge in &self.fixed_edges {
             topology.add_edge(indices[&edge.from], indices[&edge.to], TopologyEdge::Fixed);
         }
+        for edge in &self.fan_out_edges {
+            for target in &edge.targets {
+                topology.add_edge(indices[&edge.source], indices[target], TopologyEdge::FanOut);
+            }
+        }
         for edge in &self.conditional_edges {
             for target in &edge.allowed_targets {
                 topology.add_edge(
@@ -183,6 +233,10 @@ where
         for (node_id, node) in &self.nodes {
             let transition = if let Some(outgoing) = edges.fixed_by_source.get(node_id) {
                 CompiledTransition::Fixed(indices[&outgoing.successor])
+            } else if let Some(edge) = edges.fan_out_by_source.get(node_id) {
+                CompiledTransition::FanOut(
+                    edge.targets.iter().map(|target| indices[target]).collect(),
+                )
             } else {
                 let edge = edges
                     .conditional_by_source
@@ -279,8 +333,40 @@ where
             conditional_by_source.insert(edge.source.clone(), edge);
         }
 
+        let mut fan_out_by_source = HashMap::with_capacity(self.fan_out_edges.len());
+        for edge in &self.fan_out_edges {
+            if edge.source.is_start() {
+                return Err(GraphCompileError::StartHasFanOut);
+            }
+            if edge.source.is_end() {
+                return Err(GraphCompileError::EndHasFanOut);
+            }
+            if !self.nodes.contains_key(&edge.source) {
+                return Err(GraphCompileError::UnknownFanOutSource {
+                    source_node: edge.source.clone(),
+                });
+            }
+
+            for target in &edge.targets {
+                if target.is_start() {
+                    return Err(GraphCompileError::StartHasIncoming {
+                        from: edge.source.clone(),
+                    });
+                }
+                if !target.is_end() && !self.nodes.contains_key(target) {
+                    return Err(GraphCompileError::UnknownFanOutTarget {
+                        source_node: edge.source.clone(),
+                        target: target.clone(),
+                    });
+                }
+            }
+
+            fan_out_by_source.insert(edge.source.clone(), edge);
+        }
+
         Ok(EdgeAggregation {
             fixed_by_source,
+            fan_out_by_source,
             conditional_by_source,
         })
     }
@@ -313,8 +399,10 @@ where
                 });
             }
 
-            let has_conditional = edges.conditional_by_source.contains_key(node_id);
-            if fixed_count == 1 && has_conditional {
+            let transition_kind_count = usize::from(fixed_count == 1)
+                + usize::from(edges.fan_out_by_source.contains_key(node_id))
+                + usize::from(edges.conditional_by_source.contains_key(node_id));
+            if transition_kind_count > 1 {
                 return Err(GraphCompileError::MixedOutgoingEdgeKinds {
                     node_id: node_id.clone(),
                 });
@@ -361,8 +449,9 @@ where
     ) -> Result<(), GraphCompileError> {
         for node_id in self.nodes.keys() {
             let has_fixed = edges.fixed_by_source.contains_key(node_id);
+            let has_fan_out = edges.fan_out_by_source.contains_key(node_id);
             let has_conditional = edges.conditional_by_source.contains_key(node_id);
-            if !has_fixed && !has_conditional {
+            if !has_fixed && !has_fan_out && !has_conditional {
                 return Err(GraphCompileError::MissingOutgoingEdge {
                     node_id: node_id.clone(),
                 });
@@ -386,6 +475,7 @@ where
     S: GraphState,
 {
     Fixed(NodeIndex),
+    FanOut(Vec<NodeIndex>),
     Conditional {
         router: Router<S>,
         allowed_targets: IndexMap<NodeId, NodeIndex>,

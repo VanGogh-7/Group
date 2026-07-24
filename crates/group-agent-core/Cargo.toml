@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 indexmap.workspace = true
 petgraph.workspace = true
 thiserror.workspace = true

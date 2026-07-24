@@ -1,11 +1,13 @@
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use criterion::{Criterion, criterion_group, criterion_main};
 use group_agent_core::{
-    CompiledGraph, END, EventConfig, EventRetention, GraphState, Node, NodeContext, NodeError,
-    NodeId, RunConfig, RunControl, START, StateError, StateGraph,
+    CheckpointConfig, CheckpointPolicy, CheckpointState, Checkpointer, CompiledGraph, END,
+    EventConfig, EventRetention, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError,
+    NodeId, NodeUpdate, RunConfig, RunControl, START, SnapshotError, StateError, StateGraph,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -24,6 +26,23 @@ impl GraphState for BenchState {
         self.steps += 1;
         Ok(())
     }
+
+    fn apply_batch(&mut self, updates: Vec<NodeUpdate<Self::Update>>) -> Result<(), StateError> {
+        self.steps += updates.len();
+        Ok(())
+    }
+}
+
+impl CheckpointState for BenchState {
+    type Snapshot = usize;
+
+    fn snapshot(&self) -> Result<Self::Snapshot, SnapshotError> {
+        Ok(self.steps)
+    }
+
+    fn restore(snapshot: &Self::Snapshot) -> Result<Self, SnapshotError> {
+        Ok(Self { steps: *snapshot })
+    }
 }
 
 struct ImmediateNode;
@@ -35,6 +54,20 @@ impl Node<BenchState> for ImmediateNode {
         _state: &BenchState,
         _context: &NodeContext,
     ) -> Result<StepUpdate, NodeError> {
+        Ok(StepUpdate)
+    }
+}
+
+struct DelayedNode;
+
+#[async_trait]
+impl Node<BenchState> for DelayedNode {
+    async fn run(
+        &self,
+        _state: &BenchState,
+        _context: &NodeContext,
+    ) -> Result<StepUpdate, NodeError> {
+        tokio::time::sleep(Duration::from_micros(100)).await;
         Ok(StepUpdate)
     }
 }
@@ -89,10 +122,42 @@ fn conditional_loop_graph() -> CompiledGraph<BenchState> {
     graph.compile().expect("benchmark graph should compile")
 }
 
+fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchState> {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node("fork", ImmediateNode)
+        .expect("fork node should register");
+    let branch_ids = (0..branch_count)
+        .map(|index| NodeId::from(format!("branch_{index}")))
+        .collect::<Vec<_>>();
+    for node_id in &branch_ids {
+        if delayed {
+            graph
+                .add_node(node_id.as_str(), DelayedNode)
+                .expect("delayed branch should register");
+        } else {
+            graph
+                .add_node(node_id.as_str(), ImmediateNode)
+                .expect("immediate branch should register");
+        }
+        graph.add_edge(node_id.clone(), END);
+    }
+    graph.add_edge(START, "fork");
+    graph
+        .add_fan_out("fork", branch_ids)
+        .expect("benchmark fan-out should register");
+    graph.compile().expect("parallel graph should compile")
+}
+
 fn runtime_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("Tokio benchmark runtime should start");
     let fixed_10 = fixed_graph(10);
+    let fixed_32 = fixed_graph(32);
     let fixed_100 = fixed_graph(100);
+    let parallel_2 = parallel_graph(2, false);
+    let parallel_8 = parallel_graph(8, false);
+    let parallel_32 = parallel_graph(32, false);
+    let parallel_delayed_8 = parallel_graph(8, true);
     let conditional_1_000 = conditional_loop_graph();
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
@@ -118,15 +183,43 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         });
     });
 
-    criterion.bench_function("invoke_default_no_control_10_nodes", |bencher| {
-        bencher.to_async(&runtime).iter(|| async {
-            let report = fixed_10
-                .invoke(BenchState::default())
-                .await
-                .expect("benchmark invocation should succeed");
-            black_box(report.steps());
-        });
-    });
+    criterion.bench_function(
+        "invoke_default_no_control_checkpoint_disabled_10_nodes",
+        |bencher| {
+            bencher.to_async(&runtime).iter(|| async {
+                let report = fixed_10
+                    .invoke(BenchState::default())
+                    .await
+                    .expect("benchmark invocation should succeed");
+                black_box(report.steps());
+            });
+        },
+    );
+
+    criterion.bench_function(
+        "invoke_checkpoint_enabled_every_superstep_10_nodes",
+        |bencher| {
+            bencher.to_async(&runtime).iter(|| async {
+                let checkpointer: Arc<dyn Checkpointer<usize>> =
+                    Arc::new(InMemoryCheckpointer::new());
+                let report = fixed_10
+                    .invoke_with_checkpoint(
+                        BenchState::default(),
+                        RunConfig::default(),
+                        EventConfig::default(),
+                        RunControl::default(),
+                        CheckpointConfig::new(
+                            "benchmark-thread",
+                            checkpointer,
+                            CheckpointPolicy::EverySuperstep,
+                        ),
+                    )
+                    .await
+                    .expect("checkpoint benchmark invocation should succeed");
+                black_box(report.steps());
+            });
+        },
+    );
 
     criterion.bench_function("invoke_uncancelled_token_10_nodes", |bencher| {
         bencher.to_async(&runtime).iter(|| async {
@@ -178,6 +271,52 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
                 .invoke(BenchState::default())
                 .await
                 .expect("benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    for (name, graph) in [
+        ("parallel_immediate_2_nodes", &parallel_2),
+        ("parallel_immediate_8_nodes", &parallel_8),
+        ("parallel_immediate_32_nodes", &parallel_32),
+    ] {
+        criterion.bench_function(name, |bencher| {
+            bencher.to_async(&runtime).iter(|| async {
+                let report = graph
+                    .invoke(BenchState::default())
+                    .await
+                    .expect("parallel benchmark invocation should succeed");
+                black_box(report.steps());
+            });
+        });
+    }
+
+    criterion.bench_function("parallel_short_wait_8_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = parallel_delayed_8
+                .invoke(BenchState::default())
+                .await
+                .expect("delayed parallel benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("scheduler_linear_chain_32_total_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = fixed_32
+                .invoke(BenchState::default())
+                .await
+                .expect("sequential benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("scheduler_fan_out_32_branches_33_total_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = parallel_32
+                .invoke(BenchState::default())
+                .await
+                .expect("parallel benchmark invocation should succeed");
             black_box(report.steps());
         });
     });

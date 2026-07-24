@@ -12,7 +12,13 @@ implement or claim to implement a mathematical group.
 The current core supports immutable compiled state graphs with:
 
 - asynchronous trait-based nodes;
-- sequential fixed edges;
+- sequential fixed edges and static fan-out transitions;
+- parallel super-steps over one immutable state snapshot;
+- fan-in barriers with deterministic frontier ordering and deduplication;
+- explicit deterministic parallel update merging through `apply_batch`;
+- optional checkpoint snapshots after successful super-step boundaries;
+- asynchronous replaceable checkpointers and an in-memory implementation;
+- checkpoint latest/history queries and parent chains by logical thread;
 - synchronous conditional edges with declared target whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
@@ -30,6 +36,10 @@ The current core supports immutable compiled state graphs with:
 - A `Node` receives only `&S` and `&NodeContext`.
 - A `Node` returns `S::Update`; it never receives shared writable state.
 - Only the Runtime calls `GraphState::apply`.
+- Single-node super-steps call `GraphState::apply`. Multi-node super-steps call
+  `GraphState::apply_batch` with source-tagged updates in stable node order.
+- The default `apply_batch` rejects multiple updates before state mutation.
+  Custom implementations must validate the complete batch before committing.
 - State updates must be applied before successor routing.
 - Routers are synchronous, read-only functions. Async work belongs in a node,
   which writes the routing decision into state through an update.
@@ -37,17 +47,21 @@ The current core supports immutable compiled state graphs with:
   `tokio::spawn`.
 - Cancellation state belongs to `RunControl` and `NodeContext`, never
   `GraphState`.
+- `GraphState` must not gain `Clone` or Serde bounds for checkpointing.
+  Checkpoint-enabled state implements the separate `CheckpointState` capability.
 
 ## Graph responsibilities
 
 - `StateGraph` is the mutable declaration builder. It owns node registrations,
-  fixed-edge declarations, conditional routers, and target whitelists.
+  fixed-edge declarations, static fan-out declarations, conditional routers,
+  and target whitelists.
 - The compiler validates all identifiers, edge-shape constraints, possible
   reachability, and possible END reachability. It performs expensive resolution
   work once.
 - `CompiledGraph` is immutable and reusable. It stores pre-resolved internal
   indices and must not expose `petgraph` or other internal cursor types.
 - Runtime invocation owns its input state, events, visited nodes, and step count.
+  It also owns the active frontier and per-super-step update collection.
   Separate invocations must remain isolated, including concurrent invocations.
 - Every lifecycle event carries a `RunId`. A shared sink must be able to
   distinguish concurrent invocations without receiving state or update values.
@@ -80,9 +94,9 @@ The current core supports immutable compiled state graphs with:
   per-node timeout. Its default has no external token and no timeout.
 - Run timeout starts at invocation entry. Node timeout starts immediately before
   `NodeStarted` delivery.
-- Runtime checks control after `RunStarted`, before each node, while its future
-  is pending, after node completion, and before successor execution or
-  `RunCompleted`.
+- Runtime checks control after `RunStarted`, before each frontier node, while
+  each future is pending, after observed node completion, and before successor
+  execution or `RunCompleted`.
 - Synchronous checks and asynchronous waiting must share one deadline selector:
   choose the earlier absolute run or node deadline, and choose run on equality.
   Classification must remain correct even when both are expired before Runtime
@@ -93,48 +107,110 @@ The current core supports immutable compiled state graphs with:
   `max_steps` at node boundaries.
 - Cancellation and timeout drop the in-flight node future without spawning it.
   Dropping a future does not roll back external side effects.
-- `GraphState::apply`, routers, and sink callbacks are synchronous and cannot be
-  preempted. Runtime observes control after they return.
+- In a parallel super-step, node errors, cancellation, and timeouts drop all
+  remaining futures and discard every uncommitted update from that super-step.
+  The first failure observed by Runtime wins.
+- `GraphState::apply`, `GraphState::apply_batch`, routers, and sink callbacks are
+  synchronous and cannot be preempted. Runtime observes control after they
+  return.
 - Control failures emit exactly one typed `RunFailed`, do not emit
   `RunCompleted`, and return structured `GraphRunError`.
 
-## Conditional edge semantics
+## Transition and super-step semantics
 
 - `START` has exactly one fixed successor and cannot use conditional routing.
 - `END` has no outgoing edge.
-- Each executable node has either one fixed successor or one conditional router,
-  never both.
+- Each executable node has exactly one transition kind: one fixed successor,
+  one static fan-out, or one conditional router.
+- Static fan-out declares a non-empty, duplicate-free target set. Conditional
+  fan-out is not supported.
+- Runtime maintains an active frontier. Every node in one multi-node frontier
+  borrows the same immutable state and is polled concurrently without
+  `tokio::spawn`.
+- Runtime waits for all frontier nodes before applying updates or routing.
+- Successors are sorted and deduplicated by compiled internal index, so fan-in
+  targets execute once and ordering never depends on completion order.
+- An `END` successor ends only its branch. Execution completes when the next
+  frontier is empty.
 - A conditional router declares a non-empty, duplicate-free target whitelist.
 - Every allowed target must resolve during compilation.
 - Runtime calls a conditional router only after the source update is applied.
+- For a parallel frontier, Runtime calls routers after the complete batch is
+  applied, in stable source order.
 - A router result outside the whitelist is a structured run error.
 - Conditional routes may revisit nodes. START and END do not count as steps.
 - `max_steps = N` permits at most N real node executions.
+- Runtime never executes a partial parallel frontier to consume the remaining
+  step budget.
+
+## Parallel event semantics
+
+- Multi-node frontiers emit `SuperstepStarted` and `SuperstepCompleted`;
+  singleton frontiers retain the earlier sequential event sequence.
+- `NodeStarted` is emitted in stable compiled node order.
+- `NodeCompleted` follows observed future-completion order and may vary.
+- `StateUpdated` is emitted only after a successful batch commit and in stable
+  node order.
+- `SuperstepCompleted` is emitted only after batch commit and all routing
+  succeed. When checkpointing requires a save at that boundary, the save must
+  also succeed first.
+
+## Checkpoint boundaries
+
+- Checkpointing is opt-in. Normal invocation must not create a snapshot, enter a
+  checkpointer method, or acquire a checkpoint lock.
+- `CheckpointState` defines a separate `Snapshot`, snapshot creation, and future
+  restoration boundary without changing `GraphState`.
+- Snapshot values are retained through `Arc`; latest/history queries must not
+  deep-copy them.
+- Save only after all frontier nodes, state commit, and successor routing
+  succeed. Save before entering the next frontier.
+- `EverySuperstep` saves once per successful super-step. `FinalOnly` saves only
+  the completed empty-frontier checkpoint.
+- Checkpoints retain checkpoint/thread/run identifiers, parent, super-step,
+  cumulative step count, next frontier, Snapshot, and completed state.
+- Snapshot logic runs before entering storage and never while an in-memory store
+  lock is held.
+- Snapshot or save failure returns structured `GraphRunError`, emits one
+  `RunFailed`, and stops before the next frontier. Runtime does not claim to
+  roll back committed state or external side effects.
+- Stage 6 provides no resume, replay, fork, time travel, database persistence,
+  or serialization.
 
 ## Performance principles
 
-- Aggregate fixed edges, conditional routers, source counts, and successor
-  presence once during compilation and reuse the result across validation and
-  transition compilation. Compilation should remain approximately O(V + E).
+- Aggregate fixed edges, fan-out targets, conditional routers, source counts,
+  and successor presence once during compilation and reuse the result across
+  validation and transition compilation. Compilation should remain
+  approximately O(V + E).
 - Use internal indices on the Runtime hot path.
+- Fixed and fan-out transitions must remain pre-resolved to internal indices.
+- Frontier deduplication must operate on produced successors and must not scan
+  every compiled graph node.
 - Do not clone complete state values per step.
 - Do not use a global Mutex or RwLock for execution.
-- Do not spawn sequential work without a concurrency reason.
+- Do not spawn nodes; use in-task future concurrency for a super-step.
 - One `Arc<dyn Node<S>>` dispatch and the `async-trait` boxed future are accepted
   costs at this stage.
 - When no external token or timeout is configured, node execution should retain
   a direct-await fast path with only small control-state branches.
 - `EventRetention::None` without a sink should avoid constructing events.
+- Disabled checkpointing must avoid snapshot creation, storage calls, and lock
+  acquisition. Enabled frontier metadata must inspect only produced successors.
+- `InMemoryCheckpointer` may lock only briefly while saving or cloning query
+  results; never execute user Snapshot code while holding its mutex.
 - Performance conclusions require repeatable benchmarks. Do not make comparative
   performance claims from architecture alone.
 
 ## Out of scope
 
-Do not add built-in Tokio channels or streams, LLM providers, tool calling, MCP,
-RAG, token streaming, parallel super-steps, reducers, checkpoints, resume,
-human interrupts, subgraphs, Tower middleware, SQLx, Axum, distributed workers,
-macro DSLs, or a visual interface unless a later stage explicitly authorizes
-them. Do not create placeholder crates for future capabilities.
+Do not add resume, replay, fork, time travel, human interrupts, SQLite,
+PostgreSQL, SQLx, forced Serde bounds, conditional or dynamic fan-out, built-in
+Tokio channels or streams, LLM providers, tool calling, MCP, RAG, token
+streaming, standalone reducer registration, subgraphs, Tower middleware, Axum,
+distributed workers, macro DSLs, or a visual interface unless a later stage
+explicitly authorizes them. Do not create placeholder crates for future
+capabilities.
 
 ## Rust and code standards
 
@@ -158,6 +234,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo run -p group-agent-core --example linear
 cargo run -p group-agent-core --example conditional
+cargo run -p group-agent-core --example parallel
+cargo run -p group-agent-core --example checkpoint
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
@@ -190,3 +268,7 @@ features.
 
 After every stage, update both `AGENTS.md` and `README.md` so repository guidance,
 examples, supported features, and exclusions match the implementation.
+
+After Stage 10, 20, 30, and every later multiple of ten, perform a full
+repository architecture review before starting the next feature stage.
+Corrective stages such as Stage 5.1 do not count toward this cadence.

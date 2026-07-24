@@ -202,6 +202,115 @@ fn duplicate_conditional_target_is_rejected() {
 }
 
 #[test]
+fn empty_and_duplicate_fan_out_targets_are_rejected() {
+    let mut graph = graph_with_nodes(&["source", "target"]);
+    assert_eq!(
+        graph
+            .add_fan_out("source", Vec::<NodeId>::new())
+            .err()
+            .expect("empty fan-out should fail"),
+        GraphBuildError::EmptyFanOutTargets {
+            source_node: NodeId::from("source"),
+        }
+    );
+    assert_eq!(
+        graph
+            .add_fan_out("source", ["target", "target"])
+            .err()
+            .expect("duplicate target should fail"),
+        GraphBuildError::DuplicateFanOutTarget {
+            source_node: NodeId::from("source"),
+            target: NodeId::from("target"),
+        }
+    );
+}
+
+#[test]
+fn fan_out_endpoints_and_transition_kind_are_validated() {
+    let mut unknown_source = graph_with_nodes(&["node"]);
+    unknown_source.add_edge(START, "node").add_edge("node", END);
+    unknown_source
+        .add_fan_out("missing", [END])
+        .expect("declaration should be accepted");
+    assert_eq!(
+        unknown_source
+            .compile()
+            .err()
+            .expect("unknown source should fail"),
+        GraphCompileError::UnknownFanOutSource {
+            source_node: NodeId::from("missing"),
+        }
+    );
+
+    let mut unknown_target = graph_with_nodes(&["source"]);
+    unknown_target.add_edge(START, "source");
+    unknown_target
+        .add_fan_out("source", ["missing", END])
+        .expect("declaration should be accepted");
+    assert_eq!(
+        unknown_target
+            .compile()
+            .err()
+            .expect("unknown target should fail"),
+        GraphCompileError::UnknownFanOutTarget {
+            source_node: NodeId::from("source"),
+            target: NodeId::from("missing"),
+        }
+    );
+
+    let mut mixed = graph_with_nodes(&["source", "target"]);
+    mixed
+        .add_edge(START, "source")
+        .add_edge("source", "target")
+        .add_edge("target", END);
+    mixed
+        .add_fan_out("source", ["target"])
+        .expect("fan-out should register");
+    assert_eq!(
+        mixed.compile().err().expect("mixed transition should fail"),
+        GraphCompileError::MixedOutgoingEdgeKinds {
+            node_id: NodeId::from("source"),
+        }
+    );
+}
+
+#[test]
+fn start_end_and_start_target_cannot_participate_in_fan_out() {
+    let mut start = graph_with_nodes(&["node"]);
+    start
+        .add_fan_out(START, ["node"])
+        .expect("declaration should be accepted");
+    assert_eq!(
+        start.compile().err().expect("START fan-out should fail"),
+        GraphCompileError::StartHasFanOut
+    );
+
+    let mut end = graph_with_nodes(&["node"]);
+    end.add_edge(START, "node").add_edge("node", END);
+    end.add_fan_out(END, ["node"])
+        .expect("declaration should be accepted");
+    assert_eq!(
+        end.compile().err().expect("END fan-out should fail"),
+        GraphCompileError::EndHasFanOut
+    );
+
+    let mut incoming_start = graph_with_nodes(&["node"]);
+    incoming_start.add_edge(START, "node");
+    incoming_start
+        .add_fan_out("node", [START, END])
+        .expect("declaration should be accepted");
+    assert_eq!(
+        incoming_start
+            .compile()
+            .err()
+            .expect("START target should fail"),
+        GraphCompileError::StartHasIncoming {
+            from: NodeId::from("node"),
+        }
+    );
+}
+
+#[test]
 fn unknown_conditional_target_is_rejected_at_compile_time() {
     let mut graph = graph_with_nodes(&["router"]);
     graph.add_edge(START, "router");

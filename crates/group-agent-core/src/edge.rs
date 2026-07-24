@@ -90,6 +90,18 @@ impl FixedEdge {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FanOutEdge {
+    pub(crate) source: NodeId,
+    pub(crate) targets: Vec<NodeId>,
+}
+
+impl FanOutEdge {
+    pub(crate) fn new(source: NodeId, targets: Vec<NodeId>) -> Self {
+        Self { source, targets }
+    }
+}
+
 pub(crate) type Router<S> = Arc<dyn Fn(&S) -> Result<NodeId, RouteError> + Send + Sync + 'static>;
 
 pub(crate) struct ConditionalEdge<S>
