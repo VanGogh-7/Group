@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::{GraphState, NodeContext, NodeError, NodeOutcome};
@@ -28,48 +30,22 @@ where
     ) -> Result<NodeOutcome<S::Update>, NodeError>;
 }
 
-#[async_trait]
-pub(crate) trait RuntimeNode<S>: Send + Sync
+pub(crate) enum NodeKind<S>
 where
     S: GraphState,
 {
-    async fn run(
-        &self,
-        state: &S,
-        context: &NodeContext,
-    ) -> Result<NodeOutcome<S::Update>, NodeError>;
+    Normal(Arc<dyn Node<S>>),
+    Interruptible(Arc<dyn InterruptibleNode<S>>),
 }
 
-pub(crate) struct UpdateNode<N>(pub(crate) N);
-
-#[async_trait]
-impl<S, N> RuntimeNode<S> for UpdateNode<N>
+impl<S> Clone for NodeKind<S>
 where
     S: GraphState,
-    N: Node<S>,
 {
-    async fn run(
-        &self,
-        state: &S,
-        context: &NodeContext,
-    ) -> Result<NodeOutcome<S::Update>, NodeError> {
-        self.0.run(state, context).await.map(NodeOutcome::Update)
-    }
-}
-
-pub(crate) struct SuspendingNode<N>(pub(crate) N);
-
-#[async_trait]
-impl<S, N> RuntimeNode<S> for SuspendingNode<N>
-where
-    S: GraphState,
-    N: InterruptibleNode<S>,
-{
-    async fn run(
-        &self,
-        state: &S,
-        context: &NodeContext,
-    ) -> Result<NodeOutcome<S::Update>, NodeError> {
-        self.0.run(state, context).await
+    fn clone(&self) -> Self {
+        match self {
+            Self::Normal(node) => Self::Normal(Arc::clone(node)),
+            Self::Interruptible(node) => Self::Interruptible(Arc::clone(node)),
+        }
     }
 }

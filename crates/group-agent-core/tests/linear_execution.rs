@@ -110,32 +110,32 @@ async fn linear_graph_executes_in_edge_order_and_applies_updates() {
             },
             GraphEvent::NodeStarted {
                 run_id,
-                node_id: NodeId::from("first"),
+                node_id: NodeId::from("first").into(),
                 step: 1,
             },
             GraphEvent::NodeCompleted {
                 run_id,
-                node_id: NodeId::from("first"),
+                node_id: NodeId::from("first").into(),
                 step: 1,
             },
             GraphEvent::StateUpdated {
                 run_id,
-                node_id: NodeId::from("first"),
+                node_id: NodeId::from("first").into(),
                 step: 1,
             },
             GraphEvent::NodeStarted {
                 run_id,
-                node_id: NodeId::from("second"),
+                node_id: NodeId::from("second").into(),
                 step: 2,
             },
             GraphEvent::NodeCompleted {
                 run_id,
-                node_id: NodeId::from("second"),
+                node_id: NodeId::from("second").into(),
                 step: 2,
             },
             GraphEvent::StateUpdated {
                 run_id,
-                node_id: NodeId::from("second"),
+                node_id: NodeId::from("second").into(),
                 step: 2,
             },
             GraphEvent::RunCompleted { run_id, steps: 2 },

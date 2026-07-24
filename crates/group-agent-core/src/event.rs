@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{CheckpointId, CheckpointIncompatibility, InterruptId, NodeId, ThreadId};
+use crate::{CheckpointId, CheckpointIncompatibility, GraphPath, InterruptId, NodePath, ThreadId};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -123,33 +123,36 @@ impl fmt::Debug for EventConfig {
 pub enum RunFailure {
     /// Cancellation was requested for the invocation.
     Cancelled {
-        node_id: Option<NodeId>,
+        node_id: Option<NodePath>,
         step: usize,
     },
     /// The configured run timeout elapsed.
     RunTimedOut {
         timeout: Duration,
-        node_id: Option<NodeId>,
+        node_id: Option<NodePath>,
         step: usize,
     },
     /// The configured timeout for one node elapsed.
     NodeTimedOut {
         timeout: Duration,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// The next node would exceed the configured step limit.
     MaxStepsExceeded {
         max_steps: usize,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node returned an error.
-    NodeFailed { node_id: NodeId, step: usize },
+    NodeFailed { node_id: NodePath, step: usize },
     /// Applying a node update failed.
-    StateUpdateFailed { node_id: NodeId, step: usize },
+    StateUpdateFailed { node_id: NodePath, step: usize },
     /// Applying a parallel state-update batch failed.
-    StateBatchUpdateFailed { node_ids: Vec<NodeId>, step: usize },
+    StateBatchUpdateFailed {
+        node_ids: Vec<NodePath>,
+        step: usize,
+    },
     /// Creating a checkpoint snapshot failed.
     SnapshotFailed {
         thread_id: ThreadId,
@@ -211,13 +214,13 @@ pub enum RunFailure {
     /// A node requested suspension without checkpoint storage.
     InterruptRequiresCheckpoint {
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node requested suspension from a parallel frontier.
     UnsupportedParallelInterrupt {
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// An interrupted checkpoint was resumed without a value.
@@ -225,7 +228,7 @@ pub enum RunFailure {
         thread_id: ThreadId,
         checkpoint_id: CheckpointId,
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A non-interrupted checkpoint received a resume value.
@@ -235,11 +238,11 @@ pub enum RunFailure {
         step: usize,
     },
     /// A conditional router returned an error.
-    RouteFailed { node_id: NodeId, step: usize },
+    RouteFailed { node_id: NodePath, step: usize },
     /// A router selected a target outside its declared whitelist.
     InvalidRouteTarget {
-        node_id: NodeId,
-        target: NodeId,
+        node_id: NodePath,
+        target: NodePath,
         step: usize,
     },
 }
@@ -264,42 +267,52 @@ pub enum GraphEvent {
     SuperstepStarted {
         run_id: RunId,
         superstep: usize,
-        node_ids: Vec<NodeId>,
+        node_ids: Vec<NodePath>,
     },
     /// A node began executing.
     NodeStarted {
         run_id: RunId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node requested suspension without producing an update.
     NodeInterrupted {
         run_id: RunId,
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node returned an update successfully.
     NodeCompleted {
         run_id: RunId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// The runtime applied a node update.
     StateUpdated {
         run_id: RunId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A conditional router selected an allowed target.
     RouteSelected {
         run_id: RunId,
-        source: NodeId,
-        target: NodeId,
+        source: NodePath,
+        target: NodePath,
         step: usize,
     },
     /// A super-step committed its updates and selected its successors.
     SuperstepCompleted { run_id: RunId, superstep: usize },
+    /// Execution entered a mounted child graph.
+    SubgraphStarted {
+        run_id: RunId,
+        graph_path: GraphPath,
+    },
+    /// A mounted child graph reached its local END.
+    SubgraphCompleted {
+        run_id: RunId,
+        graph_path: GraphPath,
+    },
     /// A checkpoint was saved after a successful super-step.
     CheckpointSaved {
         run_id: RunId,
@@ -315,7 +328,7 @@ pub enum GraphEvent {
         interrupt_id: InterruptId,
         checkpoint_id: CheckpointId,
         thread_id: ThreadId,
-        node_id: NodeId,
+        node_id: NodePath,
         superstep: usize,
         step: usize,
     },
@@ -339,6 +352,8 @@ impl GraphEvent {
             | Self::StateUpdated { run_id, .. }
             | Self::RouteSelected { run_id, .. }
             | Self::SuperstepCompleted { run_id, .. }
+            | Self::SubgraphStarted { run_id, .. }
+            | Self::SubgraphCompleted { run_id, .. }
             | Self::CheckpointSaved { run_id, .. }
             | Self::RunInterrupted { run_id, .. }
             | Self::RunCompleted { run_id, .. }

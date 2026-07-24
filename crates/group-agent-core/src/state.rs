@@ -1,4 +1,4 @@
-use crate::{NodeId, StateError};
+use crate::{NodeId, NodePath, StateError};
 
 /// One node's update in a deterministic parallel state-update batch.
 ///
@@ -6,19 +6,25 @@ use crate::{NodeId, StateError};
 /// order in which node futures complete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeUpdate<U> {
-    node_id: NodeId,
+    node_path: NodePath,
     update: U,
 }
 
 impl<U> NodeUpdate<U> {
-    pub(crate) fn new(node_id: NodeId, update: U) -> Self {
-        Self { node_id, update }
+    pub(crate) fn new(node_path: NodePath, update: U) -> Self {
+        Self { node_path, update }
     }
 
     /// Returns the node that produced this update.
     #[must_use]
-    pub const fn node_id(&self) -> &NodeId {
-        &self.node_id
+    pub fn node_id(&self) -> &NodeId {
+        self.node_path.leaf()
+    }
+
+    /// Returns the complete structured source path.
+    #[must_use]
+    pub const fn node_path(&self) -> &NodePath {
+        &self.node_path
     }
 
     /// Returns the update without consuming this batch entry.
@@ -29,8 +35,8 @@ impl<U> NodeUpdate<U> {
 
     /// Consumes the entry and returns its source and update.
     #[must_use]
-    pub fn into_parts(self) -> (NodeId, U) {
-        (self.node_id, self.update)
+    pub fn into_parts(self) -> (NodePath, U) {
+        (self.node_path, self.update)
     }
 }
 

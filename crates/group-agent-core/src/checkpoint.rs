@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    CheckpointInterrupt, CheckpointerError, EventConfig, GraphState, NodeId, ResumeValue,
+    CheckpointInterrupt, CheckpointerError, EventConfig, GraphState, NodePath, ResumeValue,
     RunConfig, RunControl, RunId, SnapshotError,
 };
 
@@ -164,7 +164,7 @@ where
     superstep: usize,
     step: usize,
     snapshot: Arc<T>,
-    next_frontier: Vec<NodeId>,
+    next_frontier: Vec<NodePath>,
     completed: bool,
     interrupt: Option<CheckpointInterrupt>,
 }
@@ -228,7 +228,7 @@ where
 
     /// Returns the stable next frontier.
     #[must_use]
-    pub fn next_frontier(&self) -> &[NodeId] {
+    pub fn next_frontier(&self) -> &[NodePath] {
         &self.next_frontier
     }
 
@@ -271,7 +271,7 @@ where
     superstep: usize,
     step: usize,
     snapshot: Arc<T>,
-    next_frontier: Vec<NodeId>,
+    next_frontier: Vec<NodePath>,
     completed: bool,
     interrupt: Option<CheckpointInterrupt>,
 }
@@ -311,7 +311,7 @@ where
         superstep: usize,
         step: usize,
         snapshot: Arc<T>,
-        next_frontier: Vec<NodeId>,
+        next_frontier: Vec<NodePath>,
         completed: bool,
         interrupt: Option<CheckpointInterrupt>,
     ) -> Self {
@@ -383,7 +383,7 @@ where
 
     /// Returns the stable next frontier.
     #[must_use]
-    pub fn next_frontier(&self) -> &[NodeId] {
+    pub fn next_frontier(&self) -> &[NodePath] {
         &self.next_frontier
     }
 
@@ -914,7 +914,7 @@ mod tests {
             if step == 2 {
                 Vec::new()
             } else {
-                vec![NodeId::from("next")]
+                vec![NodePath::from("next")]
             },
             step == 2,
             None,

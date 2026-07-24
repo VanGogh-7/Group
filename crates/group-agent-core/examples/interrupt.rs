@@ -56,7 +56,10 @@ impl InterruptibleNode<ApprovalState> for RequireApproval {
         _state: &ApprovalState,
         context: &NodeContext,
     ) -> Result<NodeOutcome<String>, NodeError> {
-        if let Some(approved_by) = context.resume_value::<String>() {
+        if context.has_resume_value() {
+            let approved_by = context
+                .require_resume_value::<String>()
+                .map_err(|source| NodeError::with_source("invalid approval value", source))?;
             return Ok(NodeOutcome::update(approved_by.clone()));
         }
         Ok(NodeOutcome::interrupt(ApprovalPrompt {

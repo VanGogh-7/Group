@@ -10,12 +10,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::checkpoint::{CheckpointLineage, ResumeParts};
-use crate::graph::{CompiledNode, CompiledTransition};
+use crate::graph::{CompiledItem, CompiledNode, CompiledTransition};
+use crate::node::NodeKind;
 use crate::{
     Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointInterrupt,
     CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph,
     EventConfig, EventRetention, ExecutionOutcome, GraphEvent, GraphRunError, GraphState,
-    InterruptReport, NodeContext, NodeId, NodeOutcome, NodeUpdate, ResumeConfig, ResumeTarget,
+    InterruptReport, NodeContext, NodeOutcome, NodePath, NodeUpdate, ResumeConfig, ResumeTarget,
     ResumeValue, RunConfig, RunControl, RunFailure, RunId, ThreadId,
 };
 
@@ -28,7 +29,7 @@ where
     run_id: RunId,
     final_state: S,
     steps: usize,
-    visited_nodes: Vec<NodeId>,
+    visited_nodes: Vec<NodePath>,
     events: Vec<GraphEvent>,
 }
 
@@ -62,7 +63,7 @@ where
 
     /// Returns executed node identifiers in execution order.
     #[must_use]
-    pub fn visited_nodes(&self) -> &[NodeId] {
+    pub fn visited_nodes(&self) -> &[NodePath] {
         &self.visited_nodes
     }
 
@@ -80,13 +81,31 @@ where
     run_id: RunId,
     state: S,
     steps: usize,
-    visited_nodes: Vec<NodeId>,
+    visited_nodes: Vec<NodePath>,
     events: EventEmitter<'a>,
     frontier: Vec<NodeIndex>,
     superstep: usize,
     save_empty_checkpoint: bool,
     resume_node: Option<NodeIndex>,
     resume_value: Option<ResumeValue>,
+}
+
+enum SubgraphBoundary {
+    Started(crate::GraphPath),
+    Completed(crate::GraphPath),
+}
+
+impl SubgraphBoundary {
+    fn emit(self, events: &mut EventEmitter<'_>, run_id: RunId) {
+        match self {
+            Self::Started(graph_path) => {
+                events.emit(|| GraphEvent::SubgraphStarted { run_id, graph_path });
+            }
+            Self::Completed(graph_path) => {
+                events.emit(|| GraphEvent::SubgraphCompleted { run_id, graph_path });
+            }
+        }
+    }
 }
 
 impl<S> CompiledGraph<S>
@@ -164,15 +183,19 @@ where
             run_id,
             max_steps: config.max_steps,
         });
-        let frontier = if self.entry_index == self.end_index {
-            Vec::new()
-        } else {
-            vec![self.entry_index]
-        };
+        let mut frontier = self.entry_index.into_iter().collect::<Vec<_>>();
 
         debug!(%run_id, max_steps = config.max_steps, "graph run started");
 
-        let initial_node = frontier.first().map(|index| &self.node_at(*index).id);
+        match self.normalize_frontier(&mut frontier, &initial_state, &mut events, run_id, 0) {
+            Ok(boundaries) => {
+                for boundary in boundaries {
+                    boundary.emit(&mut events, run_id);
+                }
+            }
+            Err(error) => return events.fail(error),
+        }
+        let initial_node = frontier.first().map(|index| &self.node_at(*index).path);
         let initial_step = usize::from(initial_node.is_some());
         if let Some(error) =
             control.check(run_id, initial_node, initial_step, control.deadline(None))
@@ -252,7 +275,7 @@ where
         }
 
         while !frontier.is_empty() {
-            let first_node = &self.node_at(frontier[0]).id;
+            let first_node = &self.node_at(frontier[0]).path;
             let first_step = steps + 1;
             if let Some(error) =
                 control.check(run_id, Some(first_node), first_step, control.deadline(None))
@@ -263,7 +286,7 @@ where
             let remaining_steps = absolute_step_limit.saturating_sub(steps);
             if frontier.len() > remaining_steps {
                 let blocked_offset = remaining_steps;
-                let blocked_node = &self.node_at(frontier[blocked_offset]).id;
+                let blocked_node = &self.node_at(frontier[blocked_offset]).path;
                 return events.fail(GraphRunError::MaxStepsExceeded {
                     max_steps: config.max_steps,
                     node_id: blocked_node.clone(),
@@ -279,7 +302,7 @@ where
                     superstep,
                     node_ids: frontier
                         .iter()
-                        .map(|index| self.node_at(*index).id.clone())
+                        .map(|index| self.node_at(*index).path.clone())
                         .collect(),
                 });
             }
@@ -290,7 +313,7 @@ where
                 let step = first_step;
                 if let Some(error) = control.check(
                     run_id,
-                    Some(&compiled_node.id),
+                    Some(&compiled_node.path),
                     step,
                     control.deadline(None),
                 ) {
@@ -300,7 +323,7 @@ where
                 let node_deadline = control.node_deadline(Instant::now());
                 let context = NodeContext::new(
                     step,
-                    compiled_node.id.clone(),
+                    compiled_node.path.clone(),
                     control.cancellation_token.clone(),
                     control.run_deadline,
                     (resume_node == Some(frontier[0]))
@@ -309,15 +332,15 @@ where
                 );
                 events.emit(|| GraphEvent::NodeStarted {
                     run_id,
-                    node_id: compiled_node.id.clone(),
+                    node_id: compiled_node.path.clone(),
                     step,
                 });
-                visited_nodes.push(compiled_node.id.clone());
-                debug!(node_id = %compiled_node.id, step, superstep, "node started");
+                visited_nodes.push(compiled_node.path.clone());
+                debug!(node_path = %compiled_node.path, step, superstep, "node started");
 
                 if let Some(error) = control.check(
                     run_id,
-                    Some(&compiled_node.id),
+                    Some(&compiled_node.path),
                     step,
                     control.deadline(node_deadline),
                 ) {
@@ -339,17 +362,17 @@ where
                 let update = match outcome {
                     NodeOutcome::Update(update) => update,
                     NodeOutcome::Interrupt(request) => {
-                        let interrupt = request.into_checkpoint(compiled_node.id.clone());
+                        let interrupt = request.into_checkpoint(compiled_node.path.clone());
                         events.emit(|| GraphEvent::NodeInterrupted {
                             run_id,
                             interrupt_id: interrupt.id(),
-                            node_id: compiled_node.id.clone(),
+                            node_id: compiled_node.path.clone(),
                             step,
                         });
                         if !checkpoints.is_enabled() {
                             return events.fail(GraphRunError::InterruptRequiresCheckpoint {
                                 interrupt_id: interrupt.id(),
-                                node_id: compiled_node.id.clone(),
+                                node_id: compiled_node.path.clone(),
                                 step,
                             });
                         }
@@ -365,7 +388,7 @@ where
                                 CheckpointBoundary::new(
                                     committed_superstep,
                                     step_base,
-                                    vec![compiled_node.id.clone()],
+                                    vec![compiled_node.path.clone()],
                                     false,
                                     Some(interrupt.clone()),
                                 ),
@@ -394,13 +417,13 @@ where
                             interrupt_id: interrupt.id(),
                             checkpoint_id: saved.id,
                             thread_id: saved.thread_id.clone(),
-                            node_id: compiled_node.id.clone(),
+                            node_id: compiled_node.path.clone(),
                             superstep: committed_superstep,
                             step: step_base,
                         });
                         debug!(
                             %run_id,
-                            node_id = %compiled_node.id,
+                            node_path = %compiled_node.path,
                             interrupt_id = %interrupt.id(),
                             step = step_base,
                             "graph run interrupted"
@@ -420,12 +443,12 @@ where
                 };
                 events.emit(|| GraphEvent::NodeCompleted {
                     run_id,
-                    node_id: compiled_node.id.clone(),
+                    node_id: compiled_node.path.clone(),
                     step: step_base + 1,
                 });
                 if let Some(error) = control.check(
                     run_id,
-                    Some(&compiled_node.id),
+                    Some(&compiled_node.path),
                     step_base + 1,
                     control.deadline(None),
                 ) {
@@ -455,7 +478,7 @@ where
                     let step = step_base + offset + 1;
                     if let Some(error) = control.check(
                         run_id,
-                        Some(&compiled_node.id),
+                        Some(&compiled_node.path),
                         step,
                         control.deadline(None),
                     ) {
@@ -465,7 +488,7 @@ where
                     let node_deadline = control.node_deadline(Instant::now());
                     let context = NodeContext::new(
                         step,
-                        compiled_node.id.clone(),
+                        compiled_node.path.clone(),
                         control.cancellation_token.clone(),
                         control.run_deadline,
                         (resume_node == Some(index))
@@ -474,15 +497,15 @@ where
                     );
                     events.emit(|| GraphEvent::NodeStarted {
                         run_id,
-                        node_id: compiled_node.id.clone(),
+                        node_id: compiled_node.path.clone(),
                         step,
                     });
-                    visited_nodes.push(compiled_node.id.clone());
-                    debug!(node_id = %compiled_node.id, step, superstep, "node started");
+                    visited_nodes.push(compiled_node.path.clone());
+                    debug!(node_path = %compiled_node.path, step, superstep, "node started");
 
                     if let Some(error) = control.check(
                         run_id,
-                        Some(&compiled_node.id),
+                        Some(&compiled_node.path),
                         step,
                         control.deadline(node_deadline),
                     ) {
@@ -529,28 +552,28 @@ where
                     let update = match outcome {
                         NodeOutcome::Update(update) => update,
                         NodeOutcome::Interrupt(request) => {
-                            let interrupt = request.into_checkpoint(compiled_node.id.clone());
+                            let interrupt = request.into_checkpoint(compiled_node.path.clone());
                             events.emit(|| GraphEvent::NodeInterrupted {
                                 run_id,
                                 interrupt_id: interrupt.id(),
-                                node_id: compiled_node.id.clone(),
+                                node_id: compiled_node.path.clone(),
                                 step,
                             });
                             return events.fail(GraphRunError::UnsupportedParallelInterrupt {
                                 interrupt_id: interrupt.id(),
-                                node_id: compiled_node.id.clone(),
+                                node_id: compiled_node.path.clone(),
                                 step,
                             });
                         }
                     };
                     events.emit(|| GraphEvent::NodeCompleted {
                         run_id,
-                        node_id: compiled_node.id.clone(),
+                        node_id: compiled_node.path.clone(),
                         step,
                     });
                     if let Some(error) = control.check(
                         run_id,
-                        Some(&compiled_node.id),
+                        Some(&compiled_node.path),
                         step,
                         control.deadline(None),
                     ) {
@@ -567,7 +590,7 @@ where
                 }
                 let node_ids = frontier
                     .iter()
-                    .map(|index| self.node_at(*index).id.clone())
+                    .map(|index| self.node_at(*index).path.clone())
                     .collect::<Vec<_>>();
                 let batch = node_ids
                     .iter()
@@ -596,13 +619,13 @@ where
                 let step = step_base + offset + 1;
                 events.emit(|| GraphEvent::StateUpdated {
                     run_id,
-                    node_id: compiled_node.id.clone(),
+                    node_id: compiled_node.path.clone(),
                     step,
                 });
-                debug!(node_id = %compiled_node.id, step, superstep, "state updated");
+                debug!(node_path = %compiled_node.path, step, superstep, "state updated");
                 if let Some(error) = control.check(
                     run_id,
-                    Some(&compiled_node.id),
+                    Some(&compiled_node.path),
                     step,
                     control.deadline(None),
                 ) {
@@ -611,23 +634,19 @@ where
             }
 
             next_frontier.clear();
+            let current_graph_path = self.node_at(frontier[0]).graph_path.clone();
             for (offset, index) in frontier.iter().copied().enumerate() {
                 let compiled_node = self.node_at(index);
-                let node_id = &compiled_node.id;
+                let node_id = &compiled_node.path;
                 let step = step_base + offset + 1;
                 match &compiled_node.transition {
                     CompiledTransition::Fixed(target) => {
-                        if *target != self.end_index {
+                        if let Some(target) = target {
                             next_frontier.push(*target);
                         }
                     }
                     CompiledTransition::FanOut(targets) => {
-                        next_frontier.extend(
-                            targets
-                                .iter()
-                                .copied()
-                                .filter(|target| *target != self.end_index),
-                        );
+                        next_frontier.extend(targets.iter().flatten().copied());
                     }
                     CompiledTransition::Conditional {
                         router,
@@ -646,17 +665,21 @@ where
                         let Some(target_index) = allowed_targets.get(&target_id).copied() else {
                             return events.fail(GraphRunError::InvalidRouteTarget {
                                 node_id: node_id.clone(),
-                                target: target_id,
+                                target: NodePath::new(&compiled_node.graph_path, target_id),
                                 step,
                             });
                         };
+                        let target_path = target_index.map_or_else(
+                            || NodePath::new(&compiled_node.graph_path, target_id.clone()),
+                            |index| self.path_at(index),
+                        );
                         events.emit(|| GraphEvent::RouteSelected {
                             run_id,
                             source: node_id.clone(),
-                            target: target_id,
+                            target: target_path,
                             step,
                         });
-                        if target_index != self.end_index {
+                        if let Some(target_index) = target_index {
                             next_frontier.push(target_index);
                         }
                     }
@@ -671,11 +694,26 @@ where
 
             next_frontier.sort_unstable_by_key(|index| index.index());
             next_frontier.dedup();
+            if next_frontier.is_empty() {
+                if let Some(exit) = self.scope_exits.get(&current_graph_path) {
+                    next_frontier.push(*exit);
+                }
+            }
+            let subgraph_boundaries = match self.normalize_frontier(
+                &mut next_frontier,
+                &state,
+                &mut events,
+                run_id,
+                steps,
+            ) {
+                Ok(boundaries) => boundaries,
+                Err(error) => return events.fail(error),
+            };
             let completed = next_frontier.is_empty();
             if checkpoints.should_save(completed) {
                 let next_node_ids = next_frontier
                     .iter()
-                    .map(|index| self.node_at(*index).id.clone())
+                    .map(|index| self.node_at(*index).path.clone())
                     .collect();
                 let save_result = await_run_boundary(
                     &control,
@@ -704,6 +742,9 @@ where
                     return events.fail(error);
                 }
             }
+            for boundary in subgraph_boundaries {
+                boundary.emit(&mut events, run_id);
+            }
             if is_parallel {
                 events.emit(|| GraphEvent::SuperstepCompleted { run_id, superstep });
             }
@@ -729,6 +770,103 @@ where
             visited_nodes,
             events: events.into_retained(),
         }))
+    }
+
+    fn path_at(&self, index: NodeIndex) -> NodePath {
+        match self.item_at(index) {
+            CompiledItem::Node(node) => node.path.clone(),
+            CompiledItem::EnterSubgraph { graph_path, .. } => graph_path.mount_path(),
+            CompiledItem::ExitSubgraph { mount_path, .. } => mount_path.clone(),
+        }
+    }
+
+    fn normalize_frontier(
+        &self,
+        frontier: &mut Vec<NodeIndex>,
+        state: &S,
+        events: &mut EventEmitter<'_>,
+        run_id: RunId,
+        step: usize,
+    ) -> Result<Vec<SubgraphBoundary>, GraphRunError> {
+        let mut boundaries = Vec::new();
+        loop {
+            if frontier.is_empty() {
+                return Ok(boundaries);
+            }
+            if frontier.len() != 1 {
+                debug_assert!(
+                    frontier
+                        .iter()
+                        .all(|index| matches!(self.item_at(*index), CompiledItem::Node(_))),
+                    "compiled parent frontier cannot mix subgraphs and parallel nodes"
+                );
+                return Ok(boundaries);
+            }
+            let index = frontier[0];
+            match self.item_at(index) {
+                CompiledItem::Node(_) => return Ok(boundaries),
+                CompiledItem::EnterSubgraph { graph_path, target } => {
+                    let graph_path = graph_path.clone();
+                    let target = *target;
+                    boundaries.push(SubgraphBoundary::Started(graph_path));
+                    frontier.clear();
+                    frontier.extend(target);
+                }
+                CompiledItem::ExitSubgraph {
+                    graph_path,
+                    mount_path,
+                    transition,
+                } => {
+                    let graph_path = graph_path.clone();
+                    let mount_path = mount_path.clone();
+                    frontier.clear();
+                    match transition {
+                        CompiledTransition::Fixed(target) => frontier.extend(*target),
+                        CompiledTransition::FanOut(targets) => {
+                            frontier.extend(targets.iter().flatten().copied());
+                        }
+                        CompiledTransition::Conditional {
+                            router,
+                            allowed_targets,
+                        } => {
+                            let target_id =
+                                router(state).map_err(|source| GraphRunError::RouteFailed {
+                                    node_id: mount_path.clone(),
+                                    step,
+                                    source,
+                                })?;
+                            let Some(target) = allowed_targets.get(&target_id).copied() else {
+                                return Err(GraphRunError::InvalidRouteTarget {
+                                    node_id: mount_path.clone(),
+                                    target: NodePath::new(&mount_path.graph_path(), target_id),
+                                    step,
+                                });
+                            };
+                            let target_path = target.map_or_else(
+                                || NodePath::new(&mount_path.graph_path(), target_id.clone()),
+                                |target| self.path_at(target),
+                            );
+                            events.emit(|| GraphEvent::RouteSelected {
+                                run_id,
+                                source: mount_path.clone(),
+                                target: target_path,
+                                step,
+                            });
+                            frontier.extend(target);
+                        }
+                    }
+                    boundaries.push(SubgraphBoundary::Completed(graph_path));
+                    frontier.sort_unstable_by_key(|target| target.index());
+                    frontier.dedup();
+                    if frontier.is_empty() {
+                        let parent_path = mount_path.graph_path();
+                        if let Some(exit) = self.scope_exits.get(&parent_path) {
+                            frontier.push(*exit);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -853,7 +991,7 @@ where
                     thread_id,
                     checkpoint_id: checkpoint.id(),
                     interrupt_id: interrupt.id(),
-                    node_id: interrupt.node_id().clone(),
+                    node_id: interrupt.node_path().clone(),
                     step: checkpoint_step,
                 });
             }
@@ -895,6 +1033,18 @@ where
             step: checkpoint_step,
             superstep: checkpoint.superstep(),
         });
+        if let Some(first) = frontier.first() {
+            let graph_path = &self.node_at(*first).graph_path;
+            debug_assert!(
+                frontier
+                    .iter()
+                    .all(|index| self.node_at(*index).graph_path == *graph_path),
+                "one resumable frontier cannot span graph namespaces"
+            );
+            for graph_path in graph_path.prefixes() {
+                events.emit(|| GraphEvent::SubgraphStarted { run_id, graph_path });
+            }
+        }
 
         let checkpoint_config = CheckpointConfig::new(thread_id, checkpointer, checkpoint_policy)
             .with_expected_parent(Some(checkpoint.id()));
@@ -965,9 +1115,9 @@ where
         }
         if let Some(interrupt) = checkpoint.interrupt() {
             let frontier = checkpoint.next_frontier();
-            if frontier.len() != 1 || frontier.first() != Some(interrupt.node_id()) {
+            if frontier.len() != 1 || frontier.first() != Some(interrupt.node_path()) {
                 return Err(CheckpointIncompatibility::InvalidInterruptFrontier {
-                    interrupt_node: interrupt.node_id().clone(),
+                    interrupt_node: interrupt.node_path().clone(),
                     frontier: frontier.to_vec(),
                 });
             }
@@ -975,16 +1125,16 @@ where
         checkpoint
             .next_frontier()
             .iter()
-            .map(|node_id| {
-                if node_id.is_start() {
+            .map(|node_path| {
+                if node_path.leaf().is_start() {
                     return Err(CheckpointIncompatibility::StartInFrontier);
                 }
-                if node_id.is_end() {
+                if node_path.leaf().is_end() {
                     return Err(CheckpointIncompatibility::EndInFrontier);
                 }
-                self.node_indices.get(node_id).copied().ok_or_else(|| {
+                self.node_paths.get(node_path).copied().ok_or_else(|| {
                     CheckpointIncompatibility::UnknownFrontierNode {
-                        node_id: node_id.clone(),
+                        node_id: node_path.clone(),
                     }
                 })
             })
@@ -1000,7 +1150,7 @@ struct SavedCheckpoint {
 struct CheckpointBoundary {
     superstep: usize,
     step: usize,
-    next_frontier: Vec<NodeId>,
+    next_frontier: Vec<NodePath>,
     completed: bool,
     interrupt: Option<CheckpointInterrupt>,
 }
@@ -1009,7 +1159,7 @@ impl CheckpointBoundary {
     fn new(
         superstep: usize,
         step: usize,
-        next_frontier: Vec<NodeId>,
+        next_frontier: Vec<NodePath>,
         completed: bool,
         interrupt: Option<CheckpointInterrupt>,
     ) -> Self {
@@ -1197,7 +1347,7 @@ async fn execute_node<S>(
 where
     S: GraphState,
 {
-    let node_id = &compiled_node.id;
+    let node_id = &compiled_node.path;
     let step = context.step();
     let active_deadline = control.deadline(node_deadline);
     if let Some(error) = control.check(run_id, Some(node_id), step, active_deadline) {
@@ -1205,9 +1355,17 @@ where
     }
 
     let node_result = if control.is_disabled() {
-        compiled_node.node.run(state, context).await
+        match &compiled_node.kind {
+            NodeKind::Normal(node) => node.run(state, context).await.map(NodeOutcome::Update),
+            NodeKind::Interruptible(node) => node.run(state, context).await,
+        }
     } else {
-        let node_future = compiled_node.node.run(state, context);
+        let node_future = async {
+            match &compiled_node.kind {
+                NodeKind::Normal(node) => node.run(state, context).await.map(NodeOutcome::Update),
+                NodeKind::Interruptible(node) => node.run(state, context).await,
+            }
+        };
         tokio::pin!(node_future);
         tokio::select! {
             biased;
@@ -1335,7 +1493,7 @@ impl ActiveControl {
     fn check(
         &self,
         run_id: RunId,
-        node_id: Option<&NodeId>,
+        node_id: Option<&NodePath>,
         step: usize,
         deadline: Option<ActiveDeadline>,
     ) -> Option<GraphRunError> {
@@ -1351,7 +1509,7 @@ impl ActiveControl {
     fn deadline_error(
         &self,
         run_id: RunId,
-        node_id: Option<&NodeId>,
+        node_id: Option<&NodePath>,
         step: usize,
         deadline: ActiveDeadline,
     ) -> GraphRunError {
@@ -1368,7 +1526,7 @@ impl ActiveControl {
     fn cancelled_error(
         &self,
         run_id: RunId,
-        node_id: Option<&NodeId>,
+        node_id: Option<&NodePath>,
         step: usize,
     ) -> GraphRunError {
         GraphRunError::Cancelled {
@@ -1381,7 +1539,7 @@ impl ActiveControl {
     fn run_timeout_error(
         &self,
         run_id: RunId,
-        node_id: Option<&NodeId>,
+        node_id: Option<&NodePath>,
         step: usize,
     ) -> GraphRunError {
         GraphRunError::RunTimedOut {
@@ -1394,7 +1552,7 @@ impl ActiveControl {
         }
     }
 
-    fn node_timeout_error(&self, run_id: RunId, node_id: &NodeId, step: usize) -> GraphRunError {
+    fn node_timeout_error(&self, run_id: RunId, node_id: &NodePath, step: usize) -> GraphRunError {
         GraphRunError::NodeTimedOut {
             run_id,
             timeout: self
@@ -1657,8 +1815,8 @@ mod resume_validation_tests {
 
     use super::*;
     use crate::{
-        Checkpointer, CheckpointerError, END, GraphVersion, Node, NodeError, START, SnapshotError,
-        StateError, StateGraph,
+        Checkpointer, CheckpointerError, END, GraphPath, GraphVersion, Node, NodeError, START,
+        SnapshotError, StateError, StateGraph,
     };
 
     #[derive(Debug, Default)]
@@ -1755,9 +1913,32 @@ mod resume_validation_tests {
         graph.compile().expect("graph should compile")
     }
 
+    fn nested_validation_graph() -> CompiledGraph<ValidationState> {
+        let mut child = StateGraph::new();
+        child
+            .add_node("valid", NoopNode)
+            .expect("child node should register");
+        child.add_edge(START, "valid").add_edge("valid", END);
+        let mut parent = StateGraph::new();
+        parent.set_version("validation-v1");
+        parent
+            .add_subgraph("child", child.compile().expect("child should compile"))
+            .expect("child should mount");
+        parent.add_edge(START, "child").add_edge("child", END);
+        parent.compile().expect("parent should compile")
+    }
+
     fn forged_checkpoint(
-        frontier: Vec<NodeId>,
+        frontier: Vec<NodePath>,
         completed: bool,
+    ) -> (Arc<Checkpoint<ValidationSnapshot>>, Arc<AtomicUsize>) {
+        forged_checkpoint_with_interrupt(frontier, completed, None)
+    }
+
+    fn forged_checkpoint_with_interrupt(
+        frontier: Vec<NodePath>,
+        completed: bool,
+        interrupt: Option<CheckpointInterrupt>,
     ) -> (Arc<Checkpoint<ValidationSnapshot>>, Arc<AtomicUsize>) {
         let restore_calls = Arc::new(AtomicUsize::new(0));
         let request = CheckpointRequest::new(
@@ -1776,20 +1957,30 @@ mod resume_validation_tests {
             }),
             frontier,
             completed,
-            None,
+            interrupt,
         );
         (Arc::new(request.into_checkpoint()), restore_calls)
     }
 
     async fn assert_incompatible_before_restore(
-        frontier: Vec<NodeId>,
+        frontier: Vec<NodePath>,
+        completed: bool,
+        expected: CheckpointIncompatibility,
+    ) {
+        assert_incompatible_before_restore_with(validation_graph(), frontier, completed, expected)
+            .await;
+    }
+
+    async fn assert_incompatible_before_restore_with(
+        graph: CompiledGraph<ValidationState>,
+        frontier: Vec<NodePath>,
         completed: bool,
         expected: CheckpointIncompatibility,
     ) {
         let (checkpoint, restore_calls) = forged_checkpoint(frontier, completed);
         let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
             Arc::new(StaticCheckpointer { checkpoint });
-        let error = validation_graph()
+        let error = graph
             .resume(ResumeConfig::new("validation-thread", store))
             .await
             .expect_err("forged checkpoint should be incompatible");
@@ -1805,7 +1996,7 @@ mod resume_validation_tests {
     #[tokio::test]
     async fn start_frontier_is_rejected_before_restore() {
         assert_incompatible_before_restore(
-            vec![NodeId::start()],
+            vec![NodePath::from(crate::NodeId::start())],
             false,
             CheckpointIncompatibility::StartInFrontier,
         )
@@ -1815,7 +2006,7 @@ mod resume_validation_tests {
     #[tokio::test]
     async fn end_frontier_is_rejected_before_restore() {
         assert_incompatible_before_restore(
-            vec![NodeId::end()],
+            vec![NodePath::from(crate::NodeId::end())],
             false,
             CheckpointIncompatibility::EndInFrontier,
         )
@@ -1825,7 +2016,7 @@ mod resume_validation_tests {
     #[tokio::test]
     async fn invalid_completed_frontier_combinations_are_rejected_before_restore() {
         assert_incompatible_before_restore(
-            vec![NodeId::from("valid")],
+            vec![NodePath::from("valid")],
             true,
             CheckpointIncompatibility::CompletedWithFrontier,
         )
@@ -1836,5 +2027,80 @@ mod resume_validation_tests {
             CheckpointIncompatibility::IncompleteWithoutFrontier,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_interrupt_metadata_is_rejected_before_restore() {
+        let interrupt = crate::InterruptRequest::new("approval")
+            .into_checkpoint(NodePath::new(&GraphPath::new(["child"]), "valid"));
+        let (checkpoint, restore_calls) =
+            forged_checkpoint_with_interrupt(vec![NodePath::from("valid")], false, Some(interrupt));
+        let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
+            Arc::new(StaticCheckpointer { checkpoint });
+        let error = validation_graph()
+            .resume(ResumeConfig::new("validation-thread", store))
+            .await
+            .expect_err("mismatched interrupt metadata should be incompatible");
+        assert!(matches!(
+            error,
+            GraphRunError::CheckpointIncompatible {
+                reason: CheckpointIncompatibility::InvalidInterruptFrontier { .. },
+                ..
+            }
+        ));
+        assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_nested_frontier_and_wrong_namespace_are_rejected_before_restore() {
+        let unknown_nested = NodePath::new(&GraphPath::new(["child"]), "missing");
+        assert_incompatible_before_restore_with(
+            nested_validation_graph(),
+            vec![unknown_nested.clone()],
+            false,
+            CheckpointIncompatibility::UnknownFrontierNode {
+                node_id: unknown_nested,
+            },
+        )
+        .await;
+
+        let wrong_namespace = NodePath::new(&GraphPath::new(["wrong"]), "valid");
+        assert_incompatible_before_restore_with(
+            nested_validation_graph(),
+            vec![wrong_namespace.clone()],
+            false,
+            CheckpointIncompatibility::UnknownFrontierNode {
+                node_id: wrong_namespace,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_nested_interrupt_metadata_is_rejected_before_restore() {
+        let valid = NodePath::new(&GraphPath::new(["child"]), "valid");
+        let invalid_interrupt_path = NodePath::new(&GraphPath::new(["child"]), "other");
+        let interrupt = crate::InterruptRequest::new("approval")
+            .into_checkpoint(invalid_interrupt_path.clone());
+        let (checkpoint, restore_calls) =
+            forged_checkpoint_with_interrupt(vec![valid.clone()], false, Some(interrupt));
+        let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
+            Arc::new(StaticCheckpointer { checkpoint });
+        let error = nested_validation_graph()
+            .resume(ResumeConfig::new("validation-thread", store))
+            .await
+            .expect_err("nested interrupt metadata should be incompatible");
+        assert!(matches!(
+            error,
+            GraphRunError::CheckpointIncompatible {
+                reason:
+                    CheckpointIncompatibility::InvalidInterruptFrontier {
+                        interrupt_node,
+                        frontier,
+                    },
+                ..
+            } if interrupt_node == invalid_interrupt_path && frontier == vec![valid]
+        ));
+        assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
     }
 }

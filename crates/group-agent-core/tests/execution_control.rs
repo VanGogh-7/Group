@@ -167,7 +167,7 @@ async fn cancellation_requested_before_first_node_fails_before_node_started() {
         Some(&GraphEvent::RunFailed {
             run_id,
             failure: RunFailure::Cancelled {
-                node_id: Some(NodeId::from("controlled")),
+                node_id: Some(NodeId::from("controlled").into()),
                 step: 1,
             },
         })
@@ -371,7 +371,7 @@ async fn run_timeout_uses_invocation_deadline_and_drops_node_future() {
             run_id,
             failure: RunFailure::RunTimedOut {
                 timeout: Duration::from_secs(5),
-                node_id: Some(NodeId::from("controlled")),
+                node_id: Some(NodeId::from("controlled").into()),
                 step: 1,
             },
         })
@@ -433,7 +433,7 @@ async fn node_timeout_is_measured_from_node_started() {
             run_id,
             failure: RunFailure::NodeTimedOut {
                 timeout: Duration::from_secs(3),
-                node_id: NodeId::from("controlled"),
+                node_id: NodeId::from("controlled").into(),
                 step: 1,
             },
         })
@@ -502,7 +502,7 @@ async fn expired_deadlines_are_classified_by_earliest_instant_with_run_winning_t
             ));
             RunFailure::RunTimedOut {
                 timeout: run_timeout,
-                node_id: Some(NodeId::from("controlled")),
+                node_id: Some(NodeId::from("controlled").into()),
                 step: 1,
             }
         } else {
@@ -519,7 +519,7 @@ async fn expired_deadlines_are_classified_by_earliest_instant_with_run_winning_t
             ));
             RunFailure::NodeTimedOut {
                 timeout: node_timeout,
-                node_id: NodeId::from("controlled"),
+                node_id: NodeId::from("controlled").into(),
                 step: 1,
             }
         };

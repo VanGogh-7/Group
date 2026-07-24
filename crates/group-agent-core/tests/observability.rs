@@ -202,7 +202,7 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
             RunConfig::default(),
             vec!["run_started", "node_started", "run_failed"],
             RunFailure::NodeFailed {
-                node_id: NodeId::from("observed"),
+                node_id: NodeId::from("observed").into(),
                 step: 1,
             },
         ),
@@ -216,7 +216,7 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
                 "run_failed",
             ],
             RunFailure::StateUpdateFailed {
-                node_id: NodeId::from("observed"),
+                node_id: NodeId::from("observed").into(),
                 step: 1,
             },
         ),
@@ -231,7 +231,7 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
                 "run_failed",
             ],
             RunFailure::RouteFailed {
-                node_id: NodeId::from("observed"),
+                node_id: NodeId::from("observed").into(),
                 step: 1,
             },
         ),
@@ -246,8 +246,8 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
                 "run_failed",
             ],
             RunFailure::InvalidRouteTarget {
-                node_id: NodeId::from("observed"),
-                target: NodeId::from("undeclared"),
+                node_id: NodeId::from("observed").into(),
+                target: NodeId::from("undeclared").into(),
                 step: 1,
             },
         ),
@@ -257,7 +257,7 @@ async fn every_runtime_failure_emits_partial_events_then_run_failed() {
             vec!["run_started", "run_failed"],
             RunFailure::MaxStepsExceeded {
                 max_steps: 0,
-                node_id: NodeId::from("observed"),
+                node_id: NodeId::from("observed").into(),
                 step: 1,
             },
         ),

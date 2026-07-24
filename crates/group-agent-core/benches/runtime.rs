@@ -222,6 +222,49 @@ fn interrupt_graph() -> CompiledGraph<BenchState> {
     graph.compile().expect("interrupt graph should compile")
 }
 
+fn subgraph_graph(node_count: usize) -> CompiledGraph<BenchState> {
+    let mut parent = StateGraph::new();
+    parent.set_version("subgraph-benchmark-v1");
+    parent
+        .add_subgraph("child", fixed_graph(node_count))
+        .expect("benchmark child should mount");
+    parent.add_edge(START, "child").add_edge("child", END);
+    parent.compile().expect("subgraph benchmark should compile")
+}
+
+fn nested_subgraph_graph() -> CompiledGraph<BenchState> {
+    let mut middle = StateGraph::new();
+    middle
+        .add_subgraph("inner", fixed_graph(5))
+        .expect("inner benchmark child should mount");
+    middle.add_edge(START, "inner").add_edge("inner", END);
+    let middle = middle
+        .compile()
+        .expect("middle benchmark graph should compile");
+
+    let mut root = StateGraph::new();
+    root.set_version("nested-subgraph-benchmark-v1");
+    root.add_subgraph("outer", middle)
+        .expect("outer benchmark child should mount");
+    root.add_edge(START, "outer").add_edge("outer", END);
+    root.compile()
+        .expect("nested benchmark graph should compile")
+}
+
+fn subgraph_interrupt_graph() -> CompiledGraph<BenchState> {
+    let mut parent = StateGraph::new();
+    parent.set_version("subgraph-interrupt-benchmark-v1");
+    parent
+        .add_subgraph("approval_flow", interrupt_graph())
+        .expect("interrupt child should mount");
+    parent
+        .add_edge(START, "approval_flow")
+        .add_edge("approval_flow", END);
+    parent
+        .compile()
+        .expect("subgraph interrupt benchmark should compile")
+}
+
 fn runtime_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("Tokio benchmark runtime should start");
     let fixed_10 = fixed_graph(10);
@@ -234,6 +277,10 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let parallel_delayed_8 = parallel_graph(8, true);
     let conditional_1_000 = conditional_loop_graph();
     let interrupt_graph = interrupt_graph();
+    let subgraph_10 = subgraph_graph(10);
+    let nested_subgraph = nested_subgraph_graph();
+    let subgraph_resume_graph = subgraph_graph(2);
+    let subgraph_interrupt_graph = subgraph_interrupt_graph();
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
     let uncancelled_token = CancellationToken::new();
@@ -302,6 +349,54 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         checkpoint: interrupted_checkpoint,
     });
 
+    let subgraph_middle_store = Arc::new(InMemoryCheckpointer::new());
+    runtime
+        .block_on(subgraph_resume_graph.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "subgraph-resume-benchmark",
+                Arc::clone(&subgraph_middle_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect_err("one-step setup should stop at the second child node");
+    let subgraph_middle_checkpoint = runtime
+        .block_on(subgraph_middle_store.latest(&ThreadId::from("subgraph-resume-benchmark")))
+        .expect("subgraph checkpoint query should succeed")
+        .expect("subgraph checkpoint should exist");
+    let subgraph_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
+        checkpoint: subgraph_middle_checkpoint,
+    });
+
+    let subgraph_interrupted_store = Arc::new(InMemoryCheckpointer::new());
+    runtime
+        .block_on(subgraph_interrupt_graph.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "subgraph-interrupt-resume-benchmark",
+                Arc::clone(&subgraph_interrupted_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect("subgraph interrupt setup should succeed");
+    let subgraph_interrupted_checkpoint = runtime
+        .block_on(
+            subgraph_interrupted_store
+                .latest(&ThreadId::from("subgraph-interrupt-resume-benchmark")),
+        )
+        .expect("subgraph interrupt checkpoint query should succeed")
+        .expect("subgraph interrupt checkpoint should exist");
+    let subgraph_interrupt_resume_store: Arc<dyn Checkpointer<usize>> =
+        Arc::new(ResumeBenchCheckpointer {
+            checkpoint: subgraph_interrupted_checkpoint,
+        });
+
     criterion.bench_function("compile_fixed_linear_100_nodes", |bencher| {
         bencher.iter(|| {
             black_box(
@@ -333,6 +428,82 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
                         .await
                         .expect("benchmark invocation should succeed");
                     black_box(report.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+
+    criterion.bench_function("invoke_normal_node_single_box_path_10_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = fixed_10
+                .invoke(BenchState::default())
+                .await
+                .expect("normal-node benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("invoke_shared_state_subgraph_10_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = subgraph_10
+                .invoke(BenchState::default())
+                .await
+                .expect("subgraph benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function("invoke_two_level_nested_subgraph_5_nodes", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let report = nested_subgraph
+                .invoke(BenchState::default())
+                .await
+                .expect("nested subgraph benchmark invocation should succeed");
+            black_box(report.steps());
+        });
+    });
+
+    criterion.bench_function(
+        "subgraph_resume_load_restore_one_node_and_final_save",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    ResumeConfig::new(
+                        "subgraph-resume-benchmark",
+                        Arc::clone(&subgraph_resume_store),
+                    )
+                    .with_run_config(RunConfig::new(1))
+                },
+                |config| async {
+                    let outcome = subgraph_resume_graph
+                        .resume(config)
+                        .await
+                        .expect("subgraph resume benchmark should succeed");
+                    black_box(outcome.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+
+    criterion.bench_function(
+        "subgraph_interrupt_resume_restore_one_node_and_final_save",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    ResumeConfig::new(
+                        "subgraph-interrupt-resume-benchmark",
+                        Arc::clone(&subgraph_interrupt_resume_store),
+                    )
+                    .with_resume_value(())
+                },
+                |config| async {
+                    let outcome = subgraph_interrupt_graph
+                        .resume(config)
+                        .await
+                        .expect("subgraph interrupt resume benchmark should succeed");
+                    black_box(outcome.steps());
                 },
                 BatchSize::SmallInput,
             );

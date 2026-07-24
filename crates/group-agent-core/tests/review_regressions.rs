@@ -274,17 +274,17 @@ async fn successful_event_order_and_steps_are_consistent() {
             },
             GraphEvent::NodeStarted {
                 run_id,
-                node_id: NodeId::from("node"),
+                node_id: NodeId::from("node").into(),
                 step: 1,
             },
             GraphEvent::NodeCompleted {
                 run_id,
-                node_id: NodeId::from("node"),
+                node_id: NodeId::from("node").into(),
                 step: 1,
             },
             GraphEvent::StateUpdated {
                 run_id,
-                node_id: NodeId::from("node"),
+                node_id: NodeId::from("node").into(),
                 step: 1,
             },
             GraphEvent::RunCompleted { run_id, steps: 1 },

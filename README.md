@@ -7,13 +7,14 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 8 adds typed suspension and human-provided resume values while preserving
-latest-only checkpoint lineage:
+Stage 9 adds shared-state subgraphs and structured execution namespaces while
+preserving typed suspension and latest-only checkpoint lineage:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
                   successful boundary -> Checkpoint
                   node interrupt -> Interrupted Checkpoint -> Resume value
+START -> prepare -> research.{search -> verify} -> answer -> END
 ```
 
 Every node in one parallel frontier inspects the same immutable state snapshot.
@@ -40,6 +41,9 @@ The current core includes:
 - explicit graph-version compatibility and latest-only resume checks;
 - typed interrupt payloads and resume values without Serde bounds;
 - interrupted checkpoints and completed-or-interrupted execution outcomes;
+- shared-state `CompiledGraph<S>` mounting through `add_subgraph`;
+- structured `GraphPath` and `NodePath` namespaces for nested execution;
+- subgraph-aware events, errors, checkpoints, resume, and interrupts;
 - explicit loops protected by a per-run `max_steps`;
 - immutable, reusable, concurrently shareable compiled graphs;
 - immediate lifecycle delivery through a thread-safe `EventSink`;
@@ -50,6 +54,72 @@ The current core includes:
 - ordered successful run reports and extensible lifecycle events;
 - source-preserving structured errors;
 - topology, edge-shape, whitelist, and reachability validation.
+
+## Shared-state subgraphs and execution namespaces
+
+A compiled graph using the same `GraphState` can be mounted as a structural
+item in a parent:
+
+```rust
+let research = research_builder.compile()?;
+
+let mut graph = StateGraph::new();
+graph.set_version("agent-v4");
+graph.add_node("prepare", Prepare)?;
+graph.add_subgraph("research", research)?;
+graph.add_node("answer", Answer)?;
+graph
+    .add_edge(START, "prepare")
+    .add_edge("prepare", "research")
+    .add_edge("research", "answer")
+    .add_edge("answer", END);
+```
+
+The mount is not a node, performs no user code, and consumes neither a step nor
+a super-step. Child real nodes borrow and update the same Runtime-owned State,
+use the same `RunId`, cancellation token, run deadline, event configuration,
+and checkpoint lineage, and contribute to the parent's cumulative step and
+super-step counters. Reaching child `END` follows the mount's parent
+transition; it does not complete the parent run. `START -> END` children return
+to the parent immediately. Nested subgraphs are supported.
+
+`GraphPath` is a structured sequence of mount identifiers. `NodePath` is that
+namespace plus one leaf `NodeId`; for example, `/research/verify` displays two
+segments rather than a string that Runtime later parses. Display uses
+slash-prefixed segments and percent-escapes `%` and `/` within identifiers, so
+identifiers containing `.`, `/`, `%`, or an empty string remain unambiguous.
+The root `GraphPath` displays as `<root>`. Both types are cheap to clone through
+shared storage and implement `Display`, `Debug`, equality, and hashing.
+Runtime lookup and `Eq`/`Hash` use the structured segments, not displayed text.
+`NodeContext::node_path()` exposes the complete path while `node_id()` remains
+a leaf compatibility accessor. Node lifecycle events, node-related run errors,
+interrupt metadata, visited nodes, state batch sources, and checkpoint
+frontiers use `NodePath`.
+
+Entering and leaving a child emits `SubgraphStarted` and
+`SubgraphCompleted`. A child does not create a second top-level `RunStarted` or
+`RunCompleted`. Failure or interruption before child exit omits
+`SubgraphCompleted`. On resume inside a child, event order begins
+`RunStarted -> RunResumed -> SubgraphStarted` for each containing namespace,
+then continues with node events.
+
+Compilation pre-resolves child entry, exit, paths, and internal transitions.
+`add_subgraph` takes ownership of an already immutable compiled child, so
+direct and indirect reference cycles are unrepresentable through the safe
+builder API; flattening still guards path uniqueness as a compiler invariant.
+For Stage 9, a subgraph mount cannot run beside another active parent-frontier
+item; such topology is rejected with `SubgraphInParallelFrontier`. `END` exits
+only its own branch and is removed before this check, so a fan-out such as
+`[END, child]` is valid because only the child remains active. A subgraph plus
+an ordinary active node remains invalid, directly or through later
+transitions. Parallel super-steps inside a child remain supported.
+Parent/child State mapping and conditional fan-out are not implemented. See
+[`examples/subgraph.rs`](crates/group-agent-core/examples/subgraph.rs).
+
+One root `GraphVersion` is the compatibility version of the complete composed
+graph. Change it whenever a mounted child's topology, State/Snapshot schema,
+batch reducer, router behavior, or interrupt meaning becomes incompatible with
+saved checkpoints.
 
 ## Parallel super-steps
 
@@ -82,7 +152,8 @@ frontier position that would exceed the limit.
 ### Deterministic state merge
 
 `GraphState::apply_batch` receives `Vec<NodeUpdate<S::Update>>` in compiled node
-order. Each entry exposes its source `NodeId` and update:
+order. Each entry exposes its complete source `NodePath`, leaf `NodeId`, and
+update:
 
 ```rust
 fn apply_batch(
@@ -92,7 +163,7 @@ fn apply_batch(
     // Validate the entire batch without mutating self.
     let validated = updates
         .iter()
-        .map(|item| validate(item.node_id(), item.update()))
+        .map(|item| validate(item.node_path(), item.update()))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Commit only after all validation succeeds.
@@ -170,9 +241,10 @@ graph.set_version("agent-graph-v3");
 let compiled = graph.compile()?;
 ```
 
-The version is stored in every new checkpoint. Update it whenever graph
-topology, state/Snapshot schema, batch reducer behavior, or router semantics
-change in a way that makes an old frontier or state unsafe to continue.
+The root version is stored in every new checkpoint and covers the complete
+composed graph. Update it whenever parent or child topology, state/Snapshot
+schema, batch reducer behavior, router semantics, or interrupt meaning changes
+in a way that makes an old frontier or state unsafe to continue.
 Unversioned checkpoints and unversioned compiled graphs cannot resume.
 
 `CheckpointConfig::new` explicitly starts from state with no parent checkpoint.
@@ -196,8 +268,8 @@ let config = CheckpointConfig::new(
 `CheckpointPolicy::EverySuperstep` saves after every successful super-step.
 `FinalOnly` creates only the final completed checkpoint. Each immutable
 `Checkpoint` records its `CheckpointId`, `ThreadId`, `RunId`, parent, graph
-version, super-step, cumulative step count, shared `Arc<Snapshot>`, stable next
-frontier, completed flag, and optional interrupt metadata.
+version, super-step, cumulative step count, shared `Arc<Snapshot>`, stable
+`NodePath` next frontier, completed flag, and optional interrupt metadata.
 `Checkpointer::latest`, `get`, and `history`
 return shared `Arc<Checkpoint<_>>` values, so queries do not deep-copy
 snapshots. `get` is scoped by both `ThreadId` and `CheckpointId`; it never
@@ -276,19 +348,21 @@ let report = compiled
 
 Resume loads a specified checkpoint through `get`, or uses `latest` by
 default. A specified checkpoint must still equal current latest; otherwise
-`ResumeConflict` is returned because Stage 7 does not implement Fork. The
+`ResumeConflict` is returned because Fork is not implemented. The
 Runtime validates ThreadId, latest-only status, explicit graph version,
-completed/frontier consistency, and every frontier NodeId, resolving the saved
-frontier to compiled internal indices in O(F). `START`, explicit `END`, unknown
-nodes, unversioned data, and version mismatches produce
+completed/frontier consistency, and every saved frontier `NodePath`, resolving
+it to compiled internal indices in O(F). `START`, explicit
+`END`, unknown or invalid namespaced nodes, unversioned data, and version
+mismatches produce
 `CheckpointIncompatible`.
 
 Only after every compatibility check and frontier resolution succeeds does the
 Runtime call `CheckpointState::restore` outside the storage lock. The resolved
 indices are reused directly for execution rather than parsed again. Events are
-ordered `RunStarted`, `RunResumed`, then the continued node lifecycle. Restore
-failure instead emits `RunStarted` followed by one `RunFailed`. `RunResumed`
-identifies the thread, checkpoint, cumulative step, and super-step position.
+ordered `RunStarted`, `RunResumed`, then any containing `SubgraphStarted`
+boundaries and the continued node lifecycle. Restore failure instead emits
+`RunStarted` followed by one `RunFailed`. `RunResumed` identifies the thread,
+checkpoint, cumulative step, and super-step position.
 
 Steps and super-steps continue from the checkpoint. `RunConfig::max_steps`
 means the additional number of nodes allowed by this resume call; error and
@@ -318,7 +392,12 @@ impl InterruptibleNode<AgentState> for ApprovalNode {
         _state: &AgentState,
         context: &NodeContext,
     ) -> Result<NodeOutcome<AgentUpdate>, NodeError> {
-        if let Some(decision) = context.resume_value::<ApprovalDecision>() {
+        if context.has_resume_value() {
+            let decision = context
+                .require_resume_value::<ApprovalDecision>()
+                .map_err(|source| {
+                    NodeError::with_source("invalid approval value", source)
+                })?;
             return Ok(NodeOutcome::update(AgentUpdate::Approved(
                 decision.clone(),
             )));
@@ -335,6 +414,12 @@ impl InterruptibleNode<AgentState> for ApprovalNode {
 behind `Arc` and accessed with safe `downcast_ref`; neither State, Snapshot,
 payload, nor Resume value requires Serde. Ordinary `Node` execution creates no
 interrupt payload allocation.
+
+`NodeContext::require_resume_value<T>()` distinguishes a missing value from a
+concrete type mismatch through `ResumeValueError`; mismatch context includes
+the expected and actual Rust type names and can be preserved as a
+`NodeError` source. The older `resume_value<T>() -> Option<&T>` remains
+available for optional inspection.
 
 Checkpoint-enabled invocation and Resume now return
 `ExecutionOutcome::{Completed, Interrupted}`. A singleton node interrupt:
@@ -370,17 +455,19 @@ The checkpoint must be latest and graph-compatible as before. An interrupted
 checkpoint without a value returns `MissingResumeValue`; a normal or completed
 checkpoint rejects an unexpected value. Runtime restores State, re-executes the
 interrupted node, and exposes the value only through that node's `NodeContext`.
-After the node returns an Update, the value is cleared before successor
-execution. The next save uses the interrupted checkpoint as expected parent.
-Repeated interrupts create fresh InterruptId and CheckpointId values along one
-continuous lineage.
+The value is valid only for this one re-execution attempt. After the node
+returns an Update, it is cleared before successor execution. If the node
+interrupts again, the old value is not stored in the new checkpoint and is not
+automatically reused; a later resume must supply a new value. The next save
+uses the interrupted checkpoint as expected parent. Repeated interrupts create
+fresh InterruptId and CheckpointId values along one continuous lineage.
 
 Re-execution can repeat code and external side effects that ran before the
 interrupt. Runtime does not roll those effects back or deduplicate them.
 Pre-interrupt work must therefore be idempotent, and irreversible effects
 should normally occur only after the node validates its Resume value.
 
-Stage 8 supports interrupts only from singleton frontiers. An interrupt observed
+Interrupts are supported only from singleton frontiers. An interrupt observed
 in a parallel frontier drops remaining futures, commits none of that
 super-step's updates, and returns `UnsupportedParallelInterrupt`. Payloads are
 process-local and have no persistent serialization format. See
@@ -448,7 +535,12 @@ failures emit the corresponding typed `RunFailed`; they do not emit
 
 Resume emits `RunResumed` only after loading, latest/version/frontier
 validation, and successful state restoration. It precedes every continued node
-event.
+event. A resume frontier inside a child then emits `SubgraphStarted` for its
+containing namespaces before restarting nodes.
+
+Subgraph entry and successful exit emit `SubgraphStarted` and
+`SubgraphCompleted` with a structured `GraphPath`. They share the parent
+`RunId`; nested children do not emit additional top-level run events.
 
 Successful suspension emits `NodeInterrupted -> CheckpointSaved ->
 RunInterrupted` after `NodeStarted`. It emits neither `NodeCompleted`,
@@ -471,6 +563,21 @@ Constructing event variants and matching every named field are therefore
 breaking changes from the Stage 2 API. Consumers should include `run_id` when
 constructing an event and use `..` when a match does not need every field. The
 enum remains `#[non_exhaustive]`.
+
+### Execution namespace API migration in Stage 9
+
+Stage 9 changed node-location fields from leaf-only `NodeId` values to
+structured `NodePath` values. This affects node-related fields in
+`GraphEvent`, execution context in `GraphRunError` and `RunFailure`,
+`RunReport::visited_nodes`, `NodeUpdate` sources, checkpoint next frontiers,
+and checkpoint/returned interrupt metadata. Code that constructs these values
+or exhaustively matches their field types must migrate accordingly.
+
+Use `NodePath::leaf()` or `NodePath::as_str()` when only the leaf is needed.
+Compatibility accessors named `node_id()` remain available on
+`NodeContext`, `NodeUpdate`, and checkpoint interrupt metadata; use their
+`node_path()` accessors when the complete namespace is required. Display output
+is diagnostic only and must not be parsed for Runtime navigation.
 
 ## Execution control
 
@@ -578,19 +685,33 @@ Public graph construction uses readable `NodeId` values backed by `Arc<str>`.
 Compilation aggregates fixed successors, static fan-out targets, source counts,
 conditional routers, and successor presence once, then reuses that data for
 shape validation, outgoing-edge completeness, and transition compilation.
-Together with topology construction and reachability traversal, compilation
-targets approximately O(V + E). It resolves all transitions and conditional
+Together with topology construction and reachability traversal, ordinary
+compilation remains approximately O(V + E). Parents that combine subgraph
+mounts with fan-out additionally run a composition-only reachable-frontier-pair
+check so indirect mixed subgraph frontiers fail at compile time. It operates on
+each produced frontier, removes `END` branches before co-activity checks, uses
+structured identifiers rather than path strings, and does not affect graphs
+without both features. Compilation resolves all transitions and conditional
 target whitelists to internal graph indices. Runtime execution uses those
 indices directly. Fixed transitions remain O(1); fan-out targets are already
-resolved. Frontier sorting and deduplication operate only on produced successor
-indices, not by scanning the complete graph. Internal `petgraph` types remain
-private.
+resolved.
+Frontier sorting and deduplication operate only on produced successor indices,
+not by scanning the complete graph. Internal `petgraph` types remain private.
+Subgraph mounting flattens structural entry/exit items and precomputes
+structured paths at compile time, so Runtime neither concatenates nor parses
+path strings. Subgraph resume resolves only its saved frontier.
 
 Each invocation owns its state, frontier, events, visited-node list, and step
 counter. The Runtime does not clone complete states, take a global execution
 lock, spawn each node, create mandatory channels, or repeat full graph
 validation. `GraphState` does not require `Clone`; `RunReport<S>` is cloneable
 only when `S: Clone`.
+
+Compiled items distinguish normal nodes, interruptible nodes, and structural
+subgraphs. Runtime matches the item kind and directly awaits the selected
+public trait future. A normal `async-trait` node therefore keeps its one
+required boxed trait future instead of passing through a second boxed adapter
+future.
 
 Checkpointing adds no storage call, snapshot creation, or lock acquisition to a
 normal invocation. Enabled runs construct only next-frontier metadata and never
@@ -613,8 +734,10 @@ fan-out, so they are not presented as equivalent topologies. Stage 6 adds
 checkpoint-disabled and in-memory checkpoint-enabled invocation baselines.
 Stage 7 adds load-plus-restore-plus-one-immediate-node and completed-checkpoint
 no-op resume baselines. Stage 8 adds singleton interrupt-save and
-interrupt-resume-plus-final-save baselines. These are regression baselines without performance
-thresholds or cross-framework claims.
+interrupt-resume-plus-final-save baselines. Stage 9 adds the normal-node
+single-box path, a ten-node shared-state child, two-level nesting, child
+checkpoint/resume, and child interrupt/resume. These are regression baselines
+without performance thresholds or cross-framework claims.
 
 ## Workspace
 
@@ -636,7 +759,8 @@ thresholds or cross-framework claims.
         │   ├── interrupt.rs
         │   ├── linear.rs
         │   ├── parallel.rs
-        │   └── resume.rs
+        │   ├── resume.rs
+        │   └── subgraph.rs
         ├── src
         │   ├── checkpoint.rs
         │   ├── context.rs
@@ -646,6 +770,7 @@ thresholds or cross-framework claims.
         │   ├── graph.rs
         │   ├── lib.rs
         │   ├── node.rs
+        │   ├── path.rs
         │   ├── runtime.rs
         │   └── state.rs
         └── tests
@@ -658,6 +783,7 @@ thresholds or cross-framework claims.
             ├── observability.rs
             ├── parallel_execution.rs
             ├── resume.rs
+            ├── subgraph.rs
             └── review_regressions.rs
 ```
 
@@ -671,21 +797,25 @@ cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
+cargo run -p group-agent-core --example subgraph
 cargo bench --workspace --no-run
 ```
 
 ## Current exclusions
 
-This stage does not support parallel interrupts, Replay, Fork, Time Travel,
-SQLite, PostgreSQL, SQLx, snapshot or payload serialization, conditional or dynamic
-fan-out, built-in Tokio channels or streams, standalone reducer registration,
-LLM or tool APIs, MCP, RAG, token streaming, subgraphs, Tower middleware, Axum,
-HTTP services, distributed workers, macro DSLs, or visualization. The event
-sink and Checkpointer are adapter boundaries for later integrations; those
-excluded capabilities are not implemented here.
+This stage does not support parent/child State mapping, parent-frontier parallel
+subgraphs, parallel interrupts, Replay, Fork, Time Travel, SQLite, PostgreSQL,
+SQLx, snapshot or payload serialization, conditional or dynamic fan-out,
+built-in Tokio channels or streams, standalone reducer registration, LLM or
+tool APIs, MCP, RAG, token streaming, Tower middleware, Axum, HTTP services,
+distributed workers, macro DSLs, or visualization. The event sink and
+Checkpointer are adapter boundaries for later integrations; those excluded
+capabilities are not implemented here.
 
 ## Architecture review cadence
 
 After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before continuing feature stages. Corrective
 stages such as Stage 5.1 do not count toward this ten-stage cadence.
+After Stage 9 Review passes, Stage 10 is the next full-repository architecture
+review.

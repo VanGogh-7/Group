@@ -3,7 +3,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{CheckpointId, GraphEvent, GraphState, NodeId, RunId, ThreadId};
+use thiserror::Error;
+
+use crate::{CheckpointId, GraphEvent, GraphState, NodeId, NodePath, RunId, ThreadId};
 
 static NEXT_INTERRUPT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -137,6 +139,21 @@ impl ResumeValue {
     }
 }
 
+/// A typed resume-value access failure inside a node.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum ResumeValueError {
+    /// The current node execution has no resume value.
+    #[error("resume value is missing; expected type `{expected}`")]
+    Missing { expected: &'static str },
+    /// The supplied resume value has a different concrete type.
+    #[error("resume value type mismatch: expected `{expected}`, actual `{actual}`")]
+    TypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+}
+
 /// A node request to suspend execution with a typed payload.
 #[derive(Clone, Debug)]
 pub struct InterruptRequest {
@@ -169,10 +186,10 @@ impl InterruptRequest {
         &self.payload
     }
 
-    pub(crate) fn into_checkpoint(self, node_id: NodeId) -> CheckpointInterrupt {
+    pub(crate) fn into_checkpoint(self, node_path: NodePath) -> CheckpointInterrupt {
         CheckpointInterrupt {
             id: self.id,
-            node_id,
+            node_path,
             payload: self.payload,
         }
     }
@@ -215,7 +232,7 @@ impl<U> From<U> for NodeOutcome<U> {
 #[derive(Clone, Debug)]
 pub struct CheckpointInterrupt {
     id: InterruptId,
-    node_id: NodeId,
+    node_path: NodePath,
     payload: InterruptPayload,
 }
 
@@ -228,8 +245,14 @@ impl CheckpointInterrupt {
 
     /// Returns the node that must be re-executed on resume.
     #[must_use]
-    pub const fn node_id(&self) -> &NodeId {
-        &self.node_id
+    pub fn node_id(&self) -> &NodeId {
+        self.node_path.leaf()
+    }
+
+    /// Returns the complete structured path of the interrupted node.
+    #[must_use]
+    pub const fn node_path(&self) -> &NodePath {
+        &self.node_path
     }
 
     /// Returns the shared typed payload.
@@ -239,7 +262,9 @@ impl CheckpointInterrupt {
     }
 
     pub(crate) fn matches(&self, other: &Self) -> bool {
-        self.id == other.id && self.node_id == other.node_id && self.payload.ptr_eq(&other.payload)
+        self.id == other.id
+            && self.node_path == other.node_path
+            && self.payload.ptr_eq(&other.payload)
     }
 }
 
@@ -298,7 +323,7 @@ where
 
     /// Returns node attempts observed by this invocation.
     #[must_use]
-    pub fn visited_nodes(&self) -> &[NodeId] {
+    pub fn visited_nodes(&self) -> &[NodePath] {
         match self {
             Self::Completed(report) => report.visited_nodes(),
             Self::Interrupted(report) => report.visited_nodes(),
@@ -343,7 +368,7 @@ where
     pub(crate) state: S,
     pub(crate) steps: usize,
     pub(crate) superstep: usize,
-    pub(crate) visited_nodes: Vec<NodeId>,
+    pub(crate) visited_nodes: Vec<NodePath>,
     pub(crate) events: Vec<GraphEvent>,
     pub(crate) checkpoint_id: CheckpointId,
     pub(crate) thread_id: ThreadId,
@@ -380,7 +405,7 @@ where
 
     /// Returns node attempts observed by this invocation.
     #[must_use]
-    pub fn visited_nodes(&self) -> &[NodeId] {
+    pub fn visited_nodes(&self) -> &[NodePath] {
         &self.visited_nodes
     }
 

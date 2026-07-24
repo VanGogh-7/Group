@@ -24,6 +24,9 @@ The current core supports immutable compiled state graphs with:
 - restoration of state, frontier, cumulative steps, and super-step position;
 - typed node interrupts, interrupted checkpoints, and typed resume values;
 - completed-or-interrupted execution outcomes for checkpoint-enabled runs;
+- shared-state compiled subgraphs with nested execution namespaces;
+- structured `GraphPath` and `NodePath` metadata across Runtime boundaries;
+- subgraph-aware checkpoint, resume, interrupt, error, and event behavior;
 - synchronous conditional edges with declared target whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
@@ -57,14 +60,16 @@ The current core supports immutable compiled state graphs with:
   `GraphState`.
 - Resume values belong to `NodeContext`, never `GraphState`, and are visible
   only while re-executing the node retained by an interrupted checkpoint.
+- A Resume value is valid for one re-execution attempt. A repeated interrupt
+  neither persists nor automatically reuses the old value.
 - `GraphState` must not gain `Clone` or Serde bounds for checkpointing.
   Checkpoint-enabled state implements the separate `CheckpointState` capability.
 
 ## Graph responsibilities
 
 - `StateGraph` is the mutable declaration builder. It owns node registrations,
-  fixed-edge declarations, static fan-out declarations, conditional routers,
-  and target whitelists.
+  shared-state subgraph mounts, fixed-edge declarations, static fan-out
+  declarations, conditional routers, and target whitelists.
 - The compiler validates all identifiers, edge-shape constraints, possible
   reachability, and possible END reachability. It performs expensive resolution
   work once.
@@ -72,11 +77,44 @@ The current core supports immutable compiled state graphs with:
   indices and must not expose `petgraph` or other internal cursor types.
 - Graphs intended for resume use an explicit `GraphVersion`. Checkpoints from
   unversioned graphs are saveable but cannot be resumed.
+- The root `GraphVersion` covers the complete composed graph. Any incompatible
+  child topology or semantic change requires a new root version.
 - Runtime invocation owns its input state, events, visited nodes, and step count.
   It also owns the active frontier and per-super-step update collection.
   Separate invocations must remain isolated, including concurrent invocations.
 - Every lifecycle event carries a `RunId`. A shared sink must be able to
   distinguish concurrent invocations without receiving state or update values.
+
+## Shared-state subgraph boundaries
+
+- `StateGraph::add_subgraph` mounts an owned `CompiledGraph<S>` using the same
+  `GraphState`; Stage 9 does not map between different State types.
+- A mount is structural. It executes no `Node`, consumes no step or super-step,
+  and follows its parent transition only after the child reaches `END`.
+- Child real nodes share the parent invocation's State ownership, RunId,
+  cancellation, run deadline, EventSink, event retention, checkpoint lineage,
+  and cumulative counters.
+- Empty and finitely nested children are valid. Child `END` returns to its
+  mount; it does not complete the parent run.
+- `GraphPath` and `NodePath` are structured `Arc`-backed segment sequences.
+  Runtime must not concatenate or parse strings to navigate nested execution.
+  Display uses slash-prefixed, percent-escaped segments so dots and empty
+  identifiers are unambiguous; Runtime lookup and Eq/Hash remain structural.
+- Node events, node errors, interrupts, visited attempts, batch-update sources,
+  and checkpoint frontiers carry complete `NodePath` values. `node_id()` is a
+  leaf compatibility accessor.
+- `SubgraphStarted` and `SubgraphCompleted` are lightweight boundary events.
+  Children never create independent top-level run events, and failure or
+  interruption before exit emits no `SubgraphCompleted`.
+- Stage 9 forbids subgraphs beside other active items in a parent parallel
+  frontier. `END` exits only its branch and must be removed before this
+  co-activity check, so `[END, child]` is valid while `[node, child]` is not.
+  Parallel super-steps inside a child remain valid.
+- Compilation flattens and pre-resolves child entries, exits, paths, and
+  transitions. Internal graph indices remain private.
+- Mounting takes ownership of an immutable compiled child, making direct and
+  indirect mount-reference cycles unrepresentable through the safe builder
+  API. Flattening must still reject duplicate structured paths.
 
 ## Observability boundaries
 
@@ -122,7 +160,7 @@ The current core supports immutable compiled state graphs with:
 - In a parallel super-step, node errors, cancellation, and timeouts drop all
   remaining futures and discard every uncommitted update from that super-step.
   The first failure observed by Runtime wins.
-- Stage 8 interrupt is supported only for singleton frontiers. An observed
+- Interrupt is supported only for singleton frontiers. An observed
   parallel interrupt drops pending siblings, commits no update from that
   super-step, and returns `UnsupportedParallelInterrupt`.
 - `GraphState::apply`, `GraphState::apply_batch`, routers, and sink callbacks are
@@ -185,7 +223,8 @@ The current core supports immutable compiled state graphs with:
 - A legal `START -> END` graph saves exactly one completed checkpoint under
   either policy, with super-step and step zero and an empty frontier.
 - Checkpoints retain checkpoint/thread/run identifiers, parent, super-step,
-  cumulative step count, next frontier, Snapshot, and completed state.
+  cumulative step count, complete `NodePath` next frontier, Snapshot, and
+  completed state.
 - Parent means the state lineage used by execution, not storage insertion
   order. A new-state configuration explicitly expects no parent; a run based on
   a checkpoint must supply that checkpoint as `expected_parent`.
@@ -209,9 +248,9 @@ The current core supports immutable compiled state graphs with:
 - `latest`, `get`, and `history` return shared checkpoint `Arc` values. `get`
   is scoped by both ThreadId and CheckpointId.
 - An interrupted checkpoint is neither completed nor a successful super-step
-  commit. It retains an InterruptId, node identifier, shared typed payload,
-  unchanged state snapshot, committed step/super-step counters, and a
-  singleton frontier containing the interrupted node.
+  commit. It retains an InterruptId, complete node path, shared typed payload,
+  unchanged state snapshot, committed step/super-step counters, and a singleton
+  frontier containing the interrupted node.
 - Interrupt checkpoints are mandatory regardless of `CheckpointPolicy`. A
   node interrupt without checkpointing is `InterruptRequiresCheckpoint`.
 
@@ -222,12 +261,13 @@ The current core supports immutable compiled state graphs with:
 - Resume loads a specified checkpoint or latest. A specified checkpoint must
   still be latest; otherwise return `ResumeConflict`. Fork is not implicit.
 - Validate ThreadId, latest-only status, explicit graph version,
-  completion/frontier consistency, and each frontier NodeId before calling
-  `CheckpointState::restore`. START, explicit END, unknown nodes, unversioned
-  graphs/checkpoints, and version mismatch are `CheckpointIncompatible`.
+  completion/frontier consistency, interrupt metadata, and each frontier
+  `NodePath` before calling `CheckpointState::restore`. START, explicit END,
+  unknown or illegal namespaced nodes, unversioned graphs/checkpoints, and
+  version mismatch are `CheckpointIncompatible`.
 - Graph version must change when topology, State/Snapshot schema, reducer, or
   router semantics become incompatible with existing checkpoints.
-- Resolve only the actual saved frontier through the compiled NodeId index
+- Resolve only the actual saved frontier through the compiled NodePath index
   before restore, then reuse those internal indices for execution. Never scan
   all graph nodes or resolve the frontier twice during resume.
 - After all compatibility checks and frontier resolution succeed, call
@@ -235,6 +275,7 @@ The current core supports immutable compiled state graphs with:
   is not preemptible; observe cancellation and run timeout again after it
   returns.
 - Resume assigns a new RunId and emits `RunStarted`, then `RunResumed`, then
+  containing `SubgraphStarted` boundaries when resuming inside a child, then
   continued execution events. Preparation failure emits one `RunFailed` and no
   `RunResumed`.
 - Restore cumulative step and super-step counters. `RunConfig::max_steps` is
@@ -252,7 +293,7 @@ The current core supports immutable compiled state graphs with:
 - Cancellation and run timeout start at resume entry and remain active during
   checkpoint loading and subsequent execution. Resume failure saves no new
   checkpoint.
-- Stage 8 provides no replay, fork, time travel, parallel interrupt, database
+- There is no replay, fork, time travel, parallel interrupt, database
   persistence, or payload/snapshot serialization.
 
 ## Suspension boundaries
@@ -260,6 +301,10 @@ The current core supports immutable compiled state graphs with:
 - `InterruptRequest` and `ResumeValue` use safe type erasure and shared `Arc`
   storage. They require neither GraphState nor payload types to implement
   Clone or Serde.
+- `NodeContext::require_resume_value<T>()` is the fallible typed accessor. It
+  distinguishes missing values from type mismatches and reports expected and
+  actual type names through `ResumeValueError`; preserve it in a `NodeError`
+  source chain.
 - A singleton node interrupt applies no update and performs no normal routing.
   Runtime emits `NodeInterrupted`, snapshots unchanged committed state, and
   saves a checkpoint whose frontier is that same node.
@@ -269,8 +314,8 @@ The current core supports immutable compiled state graphs with:
   `GraphRunError`, emits one `RunFailed`, and does not return an interrupted
   outcome. Run timeout and cancellation remain active during the save future.
 - Repeated interrupts allocate new InterruptId and CheckpointId values and
-  continue lineage from the prior interrupted checkpoint. Latest-only and CAS
-  rules remain unchanged.
+  continue lineage from the prior interrupted checkpoint. The old Resume value
+  is not checkpointed or reused. Latest-only and CAS rules remain unchanged.
 - The node is re-executed on resume. Runtime neither rolls back nor deduplicates
   external effects performed before suspension. Pre-interrupt work must be
   idempotent, and irreversible effects should be deferred until after the node
@@ -282,17 +327,22 @@ The current core supports immutable compiled state graphs with:
 
 - Aggregate fixed edges, fan-out targets, conditional routers, source counts,
   and successor presence once during compilation and reuse the result across
-  validation and transition compilation. Compilation should remain
-  approximately O(V + E).
+  validation and transition compilation. Ordinary compilation should remain
+  approximately O(V + E). The composition-only frontier-pair validation may
+  run only when a parent contains both fan-out and a subgraph mount. It must
+  discard `END` and process only members of each produced active frontier.
 - Use internal indices on the Runtime hot path.
 - Fixed and fan-out transitions must remain pre-resolved to internal indices.
+- Subgraph entry, exit, namespace paths, and transitions must be pre-resolved
+  during compilation. Runtime must not repeatedly build or parse path strings.
+- Resume from a child checkpoint traverses only the actual saved frontier.
 - Frontier deduplication must operate on produced successors and must not scan
   every compiled graph node.
 - Do not clone complete state values per step.
 - Do not use a global Mutex or RwLock for execution.
 - Do not spawn nodes; use in-task future concurrency for a super-step.
-- One `Arc<dyn Node<S>>` dispatch and the `async-trait` boxed future are accepted
-  costs at this stage.
+- A normal node uses one `Arc<dyn Node<S>>` dispatch and one `async-trait`
+  boxed future. Do not reintroduce a second boxed internal adapter future.
 - When no external token or timeout is configured, node execution should retain
   a direct-await fast path with only small control-state branches.
 - `EventRetention::None` without a sink should avoid constructing events.
@@ -307,13 +357,13 @@ The current core supports immutable compiled state graphs with:
 
 ## Out of scope
 
-Do not add replay, fork, time travel, parallel interrupts, SQLite, PostgreSQL,
-SQLx, forced Serde bounds, conditional or dynamic fan-out, built-in
-Tokio channels or streams, LLM providers, tool calling, MCP, RAG, token
-streaming, standalone reducer registration, subgraphs, Tower middleware, Axum,
-distributed workers, macro DSLs, or a visual interface unless a later stage
-explicitly authorizes them. Do not create placeholder crates for future
-capabilities.
+Do not add parent/child State mapping, parent-frontier parallel subgraphs,
+replay, fork, time travel, parallel interrupts, SQLite, PostgreSQL, SQLx,
+forced Serde bounds, conditional or dynamic fan-out, built-in Tokio channels or
+streams, LLM providers, tool calling, MCP, RAG, token streaming, standalone
+reducer registration, Tower middleware, Axum, distributed workers, macro DSLs,
+or a visual interface unless a later stage explicitly authorizes them. Do not
+create placeholder crates for future capabilities.
 
 ## Rust and code standards
 
@@ -341,6 +391,7 @@ cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
+cargo run -p group-agent-core --example subgraph
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
@@ -377,3 +428,5 @@ examples, supported features, and exclusions match the implementation.
 After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before starting the next feature stage.
 Corrective stages such as Stage 5.1 do not count toward this cadence.
+After Stage 9 Review passes, Stage 10 must be that full-repository architecture
+review.

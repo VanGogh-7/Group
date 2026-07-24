@@ -782,19 +782,79 @@ impl Node<TestState> for NoopNode {
     }
 }
 
+struct PendingSibling {
+    entered: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+    entered_notify: Arc<Notify>,
+}
+
+struct PendingGuard(Arc<AtomicUsize>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Node<TestState> for PendingSibling {
+    async fn run(
+        &self,
+        _state: &TestState,
+        _context: &NodeContext,
+    ) -> Result<TestUpdate, NodeError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _guard = PendingGuard(Arc::clone(&self.dropped));
+        self.entered_notify.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("pending sibling is cancelled with the failed super-step")
+    }
+}
+
+struct CoordinatedInterrupt {
+    sibling_entered: Arc<Notify>,
+}
+
+#[async_trait]
+impl InterruptibleNode<TestState> for CoordinatedInterrupt {
+    async fn run(
+        &self,
+        _state: &TestState,
+        _context: &NodeContext,
+    ) -> Result<NodeOutcome<TestUpdate>, NodeError> {
+        self.sibling_entered.notified().await;
+        Ok(NodeOutcome::interrupt("parallel"))
+    }
+}
+
 #[tokio::test]
 async fn parallel_interrupt_discards_the_complete_superstep() {
     let state = state();
     let apply_calls = Arc::clone(&state.apply_calls);
+    let sibling_entered = Arc::new(AtomicUsize::new(0));
+    let sibling_dropped = Arc::new(AtomicUsize::new(0));
+    let sibling_entered_notify = Arc::new(Notify::new());
     let mut graph = StateGraph::new();
     graph
         .add_node("prepare", NoopNode)
         .expect("prepare should register");
     graph
-        .add_interruptible_node("pause", AlwaysInterrupt)
+        .add_interruptible_node(
+            "pause",
+            CoordinatedInterrupt {
+                sibling_entered: Arc::clone(&sibling_entered_notify),
+            },
+        )
         .expect("pause should register");
     graph
-        .add_node("sibling", NoopNode)
+        .add_node(
+            "sibling",
+            PendingSibling {
+                entered: Arc::clone(&sibling_entered),
+                dropped: Arc::clone(&sibling_dropped),
+                entered_notify: Arc::clone(&sibling_entered_notify),
+            },
+        )
         .expect("sibling should register");
     graph
         .add_edge(group_agent_core::START, "prepare")
@@ -821,6 +881,12 @@ async fn parallel_interrupt_discards_the_complete_superstep() {
         apply_calls.load(Ordering::SeqCst),
         1,
         "only the earlier prepare super-step may commit"
+    );
+    assert_eq!(sibling_entered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sibling_dropped.load(Ordering::SeqCst),
+        1,
+        "the pending sibling future must be destroyed"
     );
 }
 

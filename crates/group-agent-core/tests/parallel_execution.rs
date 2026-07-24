@@ -880,7 +880,7 @@ impl GraphState for CompletionOrderState {
             .lock()
             .expect("batch order lock should not be poisoned") = updates
             .into_iter()
-            .map(|update| update.into_parts().0)
+            .map(|update| update.into_parts().0.leaf().clone())
             .collect();
         Ok(())
     }

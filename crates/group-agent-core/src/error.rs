@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{CheckpointId, GraphVersion, InterruptId, NodeId, RunId, ThreadId};
+use crate::{CheckpointId, GraphVersion, InterruptId, NodeId, NodePath, RunId, ThreadId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -34,6 +34,9 @@ pub enum GraphBuildError {
     /// A source attempted to register more than one fan-out transition.
     #[error("node `{source_node}` already has a fan-out transition")]
     MultipleFanOutTransitions { source_node: NodeId },
+    /// A subgraph mount identifier was registered more than once.
+    #[error("subgraph mount `{node_id}` is already registered")]
+    DuplicateSubgraphMount { node_id: NodeId },
 }
 
 /// An error found while compiling graph topology.
@@ -46,14 +49,14 @@ pub enum GraphCompileError {
         to: NodeId,
         node_id: NodeId,
     },
-    /// A conditional edge source is not a registered normal node.
-    #[error("conditional edge source `{source_node}` is not a registered node")]
+    /// A conditional edge source is not a registered graph item.
+    #[error("conditional edge source `{source_node}` is not a registered graph item")]
     UnknownConditionalSource { source_node: NodeId },
     /// A conditional target does not name a registered node or `END`.
     #[error("conditional edge from `{source_node}` references unknown target `{target}`")]
     UnknownConditionalTarget { source_node: NodeId, target: NodeId },
-    /// A fan-out source is not a registered normal node.
-    #[error("fan-out source `{source_node}` is not a registered node")]
+    /// A fan-out source is not a registered graph item.
+    #[error("fan-out source `{source_node}` is not a registered graph item")]
     UnknownFanOutSource { source_node: NodeId },
     /// A fan-out target does not name a registered node or `END`.
     #[error("fan-out from `{source_node}` references unknown target `{target}`")]
@@ -97,6 +100,12 @@ pub enum GraphCompileError {
     /// No possible directed route from `START` reaches `END`.
     #[error("END is not reachable from START")]
     NoReachableEnd,
+    /// A parent fan-out would execute a subgraph mount beside another branch.
+    #[error("subgraph mount `{node_id}` cannot appear in a parent parallel frontier")]
+    SubgraphInParallelFrontier { node_id: NodeId },
+    /// Flattened subgraph namespaces produced the same real node path.
+    #[error("composed graph contains duplicate node path `{node_path}`")]
+    DuplicateNodePath { node_path: NodePath },
 }
 
 macro_rules! define_source_error {
@@ -188,7 +197,7 @@ pub enum CheckpointIncompatibility {
     ThreadMismatch { actual_thread: ThreadId },
     /// The restored frontier names an unknown executable node.
     #[error("checkpoint frontier contains unknown node `{node_id}`")]
-    UnknownFrontierNode { node_id: NodeId },
+    UnknownFrontierNode { node_id: NodePath },
     /// `START` cannot appear in a checkpoint frontier.
     #[error("checkpoint frontier contains START")]
     StartInFrontier,
@@ -210,8 +219,8 @@ pub enum CheckpointIncompatibility {
          {frontier:?}"
     )]
     InvalidInterruptFrontier {
-        interrupt_node: NodeId,
-        frontier: Vec<NodeId>,
+        interrupt_node: NodePath,
+        frontier: Vec<NodePath>,
     },
 }
 
@@ -222,7 +231,7 @@ pub enum GraphRunError {
     #[error("run `{run_id}` was cancelled at step {step} near node {node_id:?}")]
     Cancelled {
         run_id: RunId,
-        node_id: Option<NodeId>,
+        node_id: Option<NodePath>,
         step: usize,
     },
     /// The configured run timeout elapsed.
@@ -230,7 +239,7 @@ pub enum GraphRunError {
     RunTimedOut {
         run_id: RunId,
         timeout: Duration,
-        node_id: Option<NodeId>,
+        node_id: Option<NodePath>,
         step: usize,
     },
     /// The configured timeout for one node elapsed.
@@ -238,7 +247,7 @@ pub enum GraphRunError {
     NodeTimedOut {
         run_id: RunId,
         timeout: Duration,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// The configured step limit was reached before `END`.
@@ -247,13 +256,13 @@ pub enum GraphRunError {
     )]
     MaxStepsExceeded {
         max_steps: usize,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node failed.
     #[error("node `{node_id}` failed at step {step}: {source}")]
     NodeFailed {
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
         #[source]
         source: NodeError,
@@ -261,7 +270,7 @@ pub enum GraphRunError {
     /// A state update could not be applied.
     #[error("state update from node `{node_id}` failed at step {step}: {source}")]
     StateUpdateFailed {
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
         #[source]
         source: StateError,
@@ -269,7 +278,7 @@ pub enum GraphRunError {
     /// A parallel state-update batch could not be applied.
     #[error("parallel state-update batch from nodes {node_ids:?} failed at step {step}: {source}")]
     StateBatchUpdateFailed {
-        node_ids: Vec<NodeId>,
+        node_ids: Vec<NodePath>,
         step: usize,
         #[source]
         source: StateError,
@@ -384,7 +393,7 @@ pub enum GraphRunError {
     )]
     InterruptRequiresCheckpoint {
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A node interrupted while other nodes shared the active frontier.
@@ -394,7 +403,7 @@ pub enum GraphRunError {
     )]
     UnsupportedParallelInterrupt {
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// An interrupted checkpoint was resumed without a value.
@@ -406,7 +415,7 @@ pub enum GraphRunError {
         thread_id: ThreadId,
         checkpoint_id: CheckpointId,
         interrupt_id: InterruptId,
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
     },
     /// A resume value was supplied for a checkpoint that was not interrupted.
@@ -423,7 +432,7 @@ pub enum GraphRunError {
     /// A conditional router failed.
     #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]
     RouteFailed {
-        node_id: NodeId,
+        node_id: NodePath,
         step: usize,
         #[source]
         source: RouteError,
@@ -433,8 +442,8 @@ pub enum GraphRunError {
         "conditional router for node `{node_id}` selected undeclared target `{target}` at step {step}"
     )]
     InvalidRouteTarget {
-        node_id: NodeId,
-        target: NodeId,
+        node_id: NodePath,
+        target: NodePath,
         step: usize,
     },
 }

@@ -3,13 +3,13 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::{NodeId, ResumeValue};
+use crate::{NodeId, NodePath, ResumeValue, ResumeValueError};
 
 /// Per-node execution context.
 #[derive(Clone, Debug)]
 pub struct NodeContext {
     step: usize,
-    node_id: NodeId,
+    node_path: NodePath,
     cancellation_token: CancellationToken,
     run_deadline: Option<Instant>,
     resume_value: Option<ResumeValue>,
@@ -18,7 +18,7 @@ pub struct NodeContext {
 impl PartialEq for NodeContext {
     fn eq(&self, other: &Self) -> bool {
         // Live control handles do not change the identity of a node position.
-        self.step == other.step && self.node_id == other.node_id
+        self.step == other.step && self.node_path == other.node_path
     }
 }
 
@@ -27,14 +27,14 @@ impl Eq for NodeContext {}
 impl NodeContext {
     pub(crate) fn new(
         step: usize,
-        node_id: NodeId,
+        node_path: NodePath,
         cancellation_token: CancellationToken,
         run_deadline: Option<Instant>,
         resume_value: Option<ResumeValue>,
     ) -> Self {
         Self {
             step,
-            node_id,
+            node_path,
             cancellation_token,
             run_deadline,
             resume_value,
@@ -49,8 +49,14 @@ impl NodeContext {
 
     /// Returns the node currently being executed.
     #[must_use]
-    pub const fn node_id(&self) -> &NodeId {
-        &self.node_id
+    pub fn node_id(&self) -> &NodeId {
+        self.node_path.leaf()
+    }
+
+    /// Returns the complete structured path of the current node.
+    #[must_use]
+    pub const fn node_path(&self) -> &NodePath {
+        &self.node_path
     }
 
     /// Returns a clone of the cancellation token for this invocation.
@@ -96,6 +102,22 @@ impl NodeContext {
         T: Send + Sync + 'static,
     {
         self.resume_value.as_ref()?.downcast_ref()
+    }
+
+    /// Requires a resume value of concrete type `T`.
+    pub fn require_resume_value<T>(&self) -> Result<&T, ResumeValueError>
+    where
+        T: Send + Sync + 'static,
+    {
+        let expected = std::any::type_name::<T>();
+        let value = self
+            .resume_value
+            .as_ref()
+            .ok_or(ResumeValueError::Missing { expected })?;
+        value.downcast_ref().ok_or(ResumeValueError::TypeMismatch {
+            expected,
+            actual: value.type_name(),
+        })
     }
 }
 

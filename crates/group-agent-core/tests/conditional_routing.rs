@@ -81,38 +81,38 @@ async fn router_selects_first_branch_after_observing_applied_update() {
             },
             GraphEvent::NodeStarted {
                 run_id,
-                node_id: NodeId::from("router"),
+                node_id: NodeId::from("router").into(),
                 step: 1,
             },
             GraphEvent::NodeCompleted {
                 run_id,
-                node_id: NodeId::from("router"),
+                node_id: NodeId::from("router").into(),
                 step: 1,
             },
             GraphEvent::StateUpdated {
                 run_id,
-                node_id: NodeId::from("router"),
+                node_id: NodeId::from("router").into(),
                 step: 1,
             },
             GraphEvent::RouteSelected {
                 run_id,
-                source: NodeId::from("router"),
-                target: NodeId::from("answer"),
+                source: NodeId::from("router").into(),
+                target: NodeId::from("answer").into(),
                 step: 1,
             },
             GraphEvent::NodeStarted {
                 run_id,
-                node_id: NodeId::from("answer"),
+                node_id: NodeId::from("answer").into(),
                 step: 2,
             },
             GraphEvent::NodeCompleted {
                 run_id,
-                node_id: NodeId::from("answer"),
+                node_id: NodeId::from("answer").into(),
                 step: 2,
             },
             GraphEvent::StateUpdated {
                 run_id,
-                node_id: NodeId::from("answer"),
+                node_id: NodeId::from("answer").into(),
                 step: 2,
             },
             GraphEvent::RunCompleted { run_id, steps: 2 },
@@ -155,8 +155,16 @@ async fn router_selects_second_branch_and_loop_eventually_exits() {
     assert_eq!(
         selected_routes,
         [
-            (NodeId::from("router"), NodeId::from("revise"), 1),
-            (NodeId::from("router"), NodeId::from("answer"), 3),
+            (
+                NodeId::from("router").into(),
+                NodeId::from("revise").into(),
+                1,
+            ),
+            (
+                NodeId::from("router").into(),
+                NodeId::from("answer").into(),
+                3,
+            ),
         ]
     );
 }
