@@ -11,8 +11,8 @@ use group_agent_core::{
     CompiledGraph, END, EncodedValue, EventConfig, EventRetention, GraphState, GraphVersion,
     InMemoryCheckpointStore, InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node,
     NodeContext, NodeError, NodeId, NodeOutcome, NodePath, NodeUpdate, RecordCheckpointer,
-    ResumeConfig, RunConfig, RunControl, RunId, START, SnapshotError, StateError, StateGraph,
-    ThreadId,
+    ReplayConfig, ResumeConfig, RunConfig, RunControl, RunId, START, SnapshotError, StateError,
+    StateGraph, ThreadId,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -232,8 +232,25 @@ fn conditional_loop_graph() -> CompiledGraph<BenchState> {
     graph.compile().expect("benchmark graph should compile")
 }
 
-fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchState> {
+fn single_conditional_graph() -> CompiledGraph<BenchState> {
     let mut graph = StateGraph::new();
+    graph
+        .add_node("router", ImmediateNode)
+        .expect("benchmark node should register");
+    graph.add_edge(START, "router");
+    graph
+        .add_conditional_edges("router", [END], |_| Ok(NodeId::end()))
+        .expect("benchmark router should register");
+    graph.compile().expect("benchmark graph should compile")
+}
+
+fn fan_out_graph(
+    branch_count: usize,
+    delayed: bool,
+    conditional: bool,
+) -> CompiledGraph<BenchState> {
+    let mut graph = StateGraph::new();
+    graph.set_version(format!("fan-out-{branch_count}-v1"));
     graph
         .add_node("fork", ImmediateNode)
         .expect("fork node should register");
@@ -253,10 +270,25 @@ fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchStat
         graph.add_edge(node_id.clone(), END);
     }
     graph.add_edge(START, "fork");
-    graph
-        .add_fan_out("fork", branch_ids)
-        .expect("benchmark fan-out should register");
+    if conditional {
+        let selected = branch_ids.iter().rev().cloned().collect::<Vec<_>>();
+        graph
+            .add_conditional_fan_out("fork", branch_ids, move |_| Ok(selected.clone()))
+            .expect("benchmark conditional fan-out should register");
+    } else {
+        graph
+            .add_fan_out("fork", branch_ids)
+            .expect("benchmark static fan-out should register");
+    }
     graph.compile().expect("parallel graph should compile")
+}
+
+fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchState> {
+    fan_out_graph(branch_count, delayed, false)
+}
+
+fn conditional_fan_out_graph(branch_count: usize) -> CompiledGraph<BenchState> {
+    fan_out_graph(branch_count, false, true)
 }
 
 fn interrupt_graph() -> CompiledGraph<BenchState> {
@@ -322,6 +354,10 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let parallel_8 = parallel_graph(8, false);
     let parallel_32 = parallel_graph(32, false);
     let parallel_delayed_8 = parallel_graph(8, true);
+    let single_conditional = single_conditional_graph();
+    let conditional_fan_out_2 = conditional_fan_out_graph(2);
+    let conditional_fan_out_8 = conditional_fan_out_graph(8);
+    let conditional_fan_out_32 = conditional_fan_out_graph(32);
     let conditional_1_000 = conditional_loop_graph();
     let interrupt_graph = interrupt_graph();
     let subgraph_10 = subgraph_graph(10);
@@ -349,6 +385,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .block_on(middle_store.latest(&ThreadId::from("resume-middle-benchmark")))
         .expect("middle checkpoint query should succeed")
         .expect("middle checkpoint should exist");
+    let middle_checkpoint_id = middle_checkpoint.id();
     let middle_record = runtime
         .block_on(
             middle_store
@@ -359,6 +396,29 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .expect("middle record should exist");
     let middle_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
         checkpoint: middle_checkpoint,
+    });
+
+    let fan_out_store = Arc::new(InMemoryCheckpointer::new(BenchCodec));
+    runtime
+        .block_on(conditional_fan_out_2.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "conditional-fan-out-resume-benchmark",
+                Arc::clone(&fan_out_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect_err("one-step setup should stop before the branch frontier");
+    let fan_out_checkpoint = runtime
+        .block_on(fan_out_store.latest(&ThreadId::from("conditional-fan-out-resume-benchmark")))
+        .expect("fan-out checkpoint query should succeed")
+        .expect("fan-out checkpoint should exist");
+    let fan_out_checkpoint_id = fan_out_checkpoint.id();
+    let fan_out_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
+        checkpoint: fan_out_checkpoint,
     });
 
     let record_checkpoint_id = CheckpointId::new();
@@ -400,6 +460,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .block_on(completed_store.latest(&ThreadId::from("resume-completed-benchmark")))
         .expect("completed checkpoint query should succeed")
         .expect("completed checkpoint should exist");
+    let completed_checkpoint_id = completed_checkpoint.id();
     let completed_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
         checkpoint: completed_checkpoint,
     });
@@ -691,6 +752,68 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         );
     });
 
+    criterion.bench_function("replay_middle_checkpoint_one_immediate_node", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ReplayConfig::new(
+                    "resume-middle-benchmark",
+                    middle_checkpoint_id,
+                    Arc::clone(&middle_resume_store),
+                )
+                .with_run_config(RunConfig::new(1))
+            },
+            |config| async {
+                let report = fixed_2
+                    .replay(config)
+                    .await
+                    .expect("middle replay benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    criterion.bench_function("replay_completed_checkpoint_noop", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ReplayConfig::new(
+                    "resume-completed-benchmark",
+                    completed_checkpoint_id,
+                    Arc::clone(&completed_resume_store),
+                )
+            },
+            |config| async {
+                let report = fixed_2
+                    .replay(config)
+                    .await
+                    .expect("completed replay benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    criterion.bench_function("replay_multi_node_frontier_2_targets", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ReplayConfig::new(
+                    "conditional-fan-out-resume-benchmark",
+                    fan_out_checkpoint_id,
+                    Arc::clone(&fan_out_resume_store),
+                )
+                .with_run_config(RunConfig::new(2))
+            },
+            |config| async {
+                let report = conditional_fan_out_2
+                    .replay(config)
+                    .await
+                    .expect("multi-frontier replay benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     criterion.bench_function("interrupt_save_single_node", |bencher| {
         bencher.to_async(&runtime).iter_batched(
             || {
@@ -840,21 +963,65 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         });
     });
 
+    criterion.bench_function("single_conditional_one_target", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            BenchState::default,
+            |initial_state| async {
+                let report = single_conditional
+                    .invoke(initial_state)
+                    .await
+                    .expect("single conditional benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     for (name, graph) in [
         ("parallel_immediate_2_nodes", &parallel_2),
         ("parallel_immediate_8_nodes", &parallel_8),
         ("parallel_immediate_32_nodes", &parallel_32),
+        ("conditional_fan_out_2_targets", &conditional_fan_out_2),
+        ("conditional_fan_out_8_targets", &conditional_fan_out_8),
+        ("conditional_fan_out_32_targets", &conditional_fan_out_32),
     ] {
         criterion.bench_function(name, |bencher| {
-            bencher.to_async(&runtime).iter(|| async {
-                let report = graph
-                    .invoke(BenchState::default())
-                    .await
-                    .expect("parallel benchmark invocation should succeed");
-                black_box(report.steps());
-            });
+            bencher.to_async(&runtime).iter_batched(
+                BenchState::default,
+                |initial_state| async {
+                    let report = graph
+                        .invoke(initial_state)
+                        .await
+                        .expect("fan-out benchmark invocation should succeed");
+                    black_box(report.steps());
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
+
+    criterion.bench_function(
+        "checkpoint_resume_conditional_fan_out_2_target_frontier",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    ResumeConfig::new(
+                        "conditional-fan-out-resume-benchmark",
+                        Arc::clone(&fan_out_resume_store),
+                    )
+                    .with_run_config(RunConfig::new(2))
+                },
+                |config| async {
+                    let outcome = conditional_fan_out_2
+                        .resume(config)
+                        .await
+                        .expect("conditional fan-out resume benchmark should succeed");
+                    black_box(outcome.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
 
     criterion.bench_function("parallel_short_wait_8_nodes", |bencher| {
         bencher.to_async(&runtime).iter(|| async {

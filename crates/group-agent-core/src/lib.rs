@@ -2,7 +2,8 @@
 //!
 //! Nodes in one super-step inspect the same immutable state and return updates.
 //! The runtime owns state mutation, deterministically commits sequential or
-//! parallel update batches, and then selects fixed, fan-out, or conditional
+//! parallel update batches, and then uses one transition kernel to select
+//! fixed, static fan-out, single-target conditional, or conditional fan-out
 //! successors.
 
 mod checkpoint;
@@ -20,11 +21,12 @@ mod node;
 mod path;
 mod runtime;
 mod state;
+mod transition;
 
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointPolicy, CheckpointRequest, CheckpointState,
     CheckpointWriteError, Checkpointer, GraphVersion, InMemoryCheckpointer, RecordCheckpointer,
-    ResumeConfig, ResumeTarget, ThreadId,
+    ReplayConfig, ResumeConfig, ResumeTarget, ThreadId,
 };
 pub use checkpoint_codec::{
     CheckpointCodec, CheckpointCodecError, CheckpointEncodingError, CheckpointReconstructionError,
@@ -50,5 +52,5 @@ pub use interrupt::{
 };
 pub use node::{InterruptibleNode, Node};
 pub use path::{GraphPath, NodePath};
-pub use runtime::RunReport;
+pub use runtime::{ReplayReport, RunReport};
 pub use state::{GraphState, NodeUpdate};

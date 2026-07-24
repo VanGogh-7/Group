@@ -168,7 +168,7 @@ pub enum RunFailure {
         thread_id: ThreadId,
         checkpoint_id: Option<CheckpointId>,
     },
-    /// No checkpoint matched the resume target.
+    /// No checkpoint matched the requested continuation target.
     CheckpointNotFound {
         thread_id: ThreadId,
         checkpoint_id: Option<CheckpointId>,
@@ -220,10 +220,26 @@ pub enum RunFailure {
         checkpoint_id: CheckpointId,
         step: usize,
     },
+    /// A node attempted to suspend during a read-only replay.
+    ReplayInterruptUnsupported {
+        source_thread_id: ThreadId,
+        source_checkpoint_id: CheckpointId,
+        interrupt_id: InterruptId,
+        node_id: NodePath,
+        step: usize,
+    },
     /// A conditional router returned an error.
     RouteFailed { node_id: NodePath, step: usize },
     /// A router selected a target outside its declared whitelist.
     InvalidRouteTarget {
+        node_id: NodePath,
+        target: NodePath,
+        step: usize,
+    },
+    /// A conditional fan-out router selected no target.
+    EmptyRouteTargets { node_id: NodePath, step: usize },
+    /// A conditional fan-out router selected the same target more than once.
+    DuplicateRouteTarget {
         node_id: NodePath,
         target: NodePath,
         step: usize,
@@ -243,6 +259,14 @@ pub enum GraphEvent {
         run_id: RunId,
         thread_id: ThreadId,
         checkpoint_id: CheckpointId,
+        step: usize,
+        superstep: usize,
+    },
+    /// A read-only replay restored one exact historical checkpoint.
+    ReplayStarted {
+        run_id: RunId,
+        source_thread_id: ThreadId,
+        source_checkpoint_id: CheckpointId,
         step: usize,
         superstep: usize,
     },
@@ -282,6 +306,13 @@ pub enum GraphEvent {
         run_id: RunId,
         source: NodePath,
         target: NodePath,
+        step: usize,
+    },
+    /// A conditional fan-out router selected distinct allowed targets.
+    RoutesSelected {
+        run_id: RunId,
+        source: NodePath,
+        targets: Vec<NodePath>,
         step: usize,
     },
     /// A super-step committed its updates and selected its successors.
@@ -328,12 +359,14 @@ impl GraphEvent {
         match self {
             Self::RunStarted { run_id, .. }
             | Self::RunResumed { run_id, .. }
+            | Self::ReplayStarted { run_id, .. }
             | Self::SuperstepStarted { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeInterrupted { run_id, .. }
             | Self::NodeCompleted { run_id, .. }
             | Self::StateUpdated { run_id, .. }
             | Self::RouteSelected { run_id, .. }
+            | Self::RoutesSelected { run_id, .. }
             | Self::SuperstepCompleted { run_id, .. }
             | Self::SubgraphStarted { run_id, .. }
             | Self::SubgraphCompleted { run_id, .. }

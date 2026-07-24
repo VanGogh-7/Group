@@ -9,28 +9,34 @@ implement or claim to implement a mathematical group.
 
 ## Current capability
 
-The current core supports immutable compiled state graphs with:
+The current workspace provides an immutable compiled state-graph core with:
 
 - asynchronous trait-based nodes;
-- sequential fixed edges and static fan-out transitions;
+- sequential fixed edges plus static and conditional fan-out transitions;
 - parallel super-steps over one immutable state snapshot;
 - fan-in barriers with deterministic frontier ordering and deduplication;
 - explicit deterministic parallel update merging through `apply_batch`;
 - optional checkpoint snapshots after successful super-step boundaries;
 - asynchronous replaceable checkpointers and an in-memory implementation;
+- an independent SQLx SQLite durable `CheckpointStore` with embedded
+  migrations, file-restart recovery, transactional idempotency, and lineage CAS;
 - checkpoint latest/history queries and CAS-protected state lineage by logical
   thread;
 - latest-only resume from specified or latest versioned checkpoints;
+- read-only replay from an explicitly selected historical checkpoint without
+  changing thread head, history, or lineage;
 - restoration of state, frontier, cumulative steps, and super-step position;
 - typed node interrupts, interrupted checkpoints, and typed resume values;
 - completed-or-interrupted execution outcomes for checkpoint-enabled runs;
 - shared-state compiled subgraphs with nested execution namespaces;
 - structured `GraphPath` and `NodePath` metadata across Runtime boundaries;
 - subgraph-aware checkpoint, resume, interrupt, error, and event behavior;
-- synchronous conditional edges with declared target whitelists;
+- synchronous single-target and fan-out conditional edges with declared target
+  whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
 - synchronous, thread-safe event sinks;
+- an independent bounded Tokio broadcast adapter with explicit subscriber lag;
 - cooperative cancellation with Tokio Util `CancellationToken`;
 - optional run-level and per-node Tokio timeouts;
 - per-run identifiers and typed failure lifecycle events;
@@ -69,14 +75,15 @@ The current core supports immutable compiled state graphs with:
 
 - `StateGraph` is the mutable declaration builder. It owns node registrations,
   shared-state subgraph mounts, fixed-edge declarations, static fan-out
-  declarations, conditional routers, and target whitelists.
+  declarations, both conditional router forms, and target whitelists.
 - The compiler validates all identifiers, edge-shape constraints, possible
   reachability, and possible END reachability. It performs expensive resolution
   work once.
 - `CompiledGraph` is immutable and reusable. It stores pre-resolved internal
   indices and must not expose `petgraph` or other internal cursor types.
-- Graphs intended for resume use an explicit `GraphVersion`. Checkpoints from
-  unversioned graphs are saveable but cannot be resumed.
+- Graphs intended for resume or replay use an explicit `GraphVersion`.
+  Checkpoints from unversioned graphs are saveable but cannot be resumed or
+  replayed.
 - The root `GraphVersion` covers the complete composed graph. Any incompatible
   child topology or semantic change requires a new root version.
 - Runtime invocation owns its input state, events, visited nodes, and step count.
@@ -129,7 +136,23 @@ The current core supports immutable compiled state graphs with:
   the Runtime emits all reached lifecycle events followed by `RunFailed`.
 - `RunFailed` contains a typed stable failure classification and execution
   context. It does not copy state, updates, or stringify the error source chain.
-- There is no built-in channel or stream adapter in this stage.
+- Core has no channel or stream dependency. The independent
+  `group-agent-observability-tokio` crate adapts `EventSink` to Tokio broadcast
+  without changing Runtime scheduling.
+- The Tokio adapter uses a bounded channel and synchronous non-blocking send.
+  Slow subscribers receive `Lagged { skipped }`; gaps must never be hidden.
+- Subscriptions start at the call to `subscribe` and have independent cursors.
+  No subscribers or closed subscribers must not fail graph execution.
+- `EventRetention` and stream delivery are independent. Events still reach a
+  configured stream Sink when retention is `None`.
+- Multiple runs may interleave in one stream. Per-run emission order remains
+  stable and consumers distinguish runs through `GraphEvent::run_id()`.
+- The stream is process-local and lossy, not reliable durable delivery. It
+  provides no event-history replay, custom backpressure, disk queue, or network
+  transport.
+- `EventBroadcast::new` uses checked power-of-two rounding for Tokio's shared
+  bounded ring buffer. Zero returns `ZeroCapacity`, an unrepresentable request
+  returns `CapacityTooLarge`, and `capacity()` returns the effective capacity.
 - The four valid configurations are All/no Sink, All/Sink, None/Sink, and
   None/no Sink. The last configuration skips event construction.
 - Stage 3 added `RunId` to every `GraphEvent`; variant construction and exact
@@ -174,9 +197,14 @@ The current core supports immutable compiled state graphs with:
 - `START` has exactly one fixed successor and cannot use conditional routing.
 - `END` has no outgoing edge.
 - Each executable node has exactly one transition kind: one fixed successor,
-  one static fan-out, or one conditional router.
-- Static fan-out declares a non-empty, duplicate-free target set. Conditional
-  fan-out is not supported.
+  one static fan-out, one single-target conditional router, or one conditional
+  fan-out router.
+- Static fan-out declares a non-empty, duplicate-free target set.
+- Conditional fan-out declares a non-empty, duplicate-free whitelist of
+  ordinary nodes and `END`. It cannot directly target a subgraph mount.
+- One internal transition kernel resolves fixed, conditional, fan-out, and
+  structural subgraph enter/exit transitions only after the source update or
+  complete parallel batch has committed.
 - Runtime maintains an active frontier. Every node in one multi-node frontier
   borrows the same immutable state and is polled concurrently without
   `tokio::spawn`.
@@ -190,7 +218,11 @@ The current core supports immutable compiled state graphs with:
 - Runtime calls a conditional router only after the source update is applied.
 - For a parallel frontier, Runtime calls routers after the complete batch is
   applied, in stable source order.
-- A router result outside the whitelist is a structured run error.
+- Conditional fan-out results must be non-empty and duplicate-free. Empty,
+  duplicate, and out-of-whitelist results are structured run errors and emit
+  no `RoutesSelected`.
+- Conditional fan-out targets are sorted by compiled internal index. `END` may
+  accompany executable targets and exits only the source branch.
 - Conditional routes may revisit nodes. START and END do not count as steps.
 - `max_steps = N` permits at most N real node executions.
 - Runtime never executes a partial parallel frontier to consume the remaining
@@ -204,12 +236,19 @@ The current core supports immutable compiled state graphs with:
 - `NodeCompleted` follows observed future-completion order and may vary.
 - `StateUpdated` is emitted only after a successful batch commit and in stable
   node order.
+- Single-target conditional routing emits `RouteSelected`; conditional fan-out
+  emits one `RoutesSelected` with targets in stable `NodePath` order.
+- Historical execution Replay emits one `ReplayStarted` after successful
+  validation and restore, before containing subgraph boundaries or node events.
 - `SuperstepCompleted` is emitted only after batch commit and all routing
   succeed. When checkpointing requires a save at that boundary, the save must
   also succeed first.
 
 ## Checkpoint boundaries
 
+- The Stage 10.1 durable checkpoint contract has passed architecture review.
+  Transition work must preserve its Record, Codec, lineage, CAS, restore
+  validation, and lock boundaries.
 - Checkpointing is opt-in. Normal invocation must not create a snapshot, enter a
   checkpointer method, or acquire a checkpoint lock.
 - `CheckpointState` defines a separate `Snapshot`, snapshot creation, and future
@@ -224,6 +263,17 @@ The current core supports immutable compiled state graphs with:
 - `CheckpointStore` exchanges only records. `RecordCheckpointer<T>` adapts it
   to the typed Runtime port. Third-party persistence implementations must not
   depend on private Runtime constructors.
+- `group-agent-checkpoint-sqlite` is the first reference durable backend. It
+  depends on Core, while Core has no SQLx or adapter dependency. Applications
+  still provide the Codec.
+- SQLite stores UUID identifiers as exact 16-byte values and durable `u64`
+  counters as sortable eight-byte big-endian blobs, never through a lossy
+  signed-integer conversion. Adapter-private Serde DTOs may encode structured
+  paths without adding Serde bounds to Core types.
+- SQLite save uses one SQLx-tracked `BEGIN IMMEDIATE` transaction. It queries
+  the operation ID before head CAS, inserts the complete Record, and advances
+  the per-thread head atomically. Busy or lock errors remain storage errors,
+  never lineage conflicts.
 - `CheckpointId`, `InterruptId`, and `RunId` use UUID v4 rather than
   process-local counters and support display, parsing, hashing, and stable-byte
   reconstruction.
@@ -318,9 +368,50 @@ The current core supports immutable compiled state graphs with:
 - Cancellation and run timeout start at resume entry and remain active during
   checkpoint loading and subsequent execution. Resume failure saves no new
   checkpoint.
-- There is no replay, fork, time travel, parallel interrupt, or database
-  persistence. Encoding is user-defined through codecs; no built-in Serde
-  format is imposed.
+- There is no fork, branch head, time travel, parallel interrupt, or PostgreSQL
+  persistence. SQLite is provided by an independent Store adapter. Encoding is
+  user-defined through codecs; no built-in Serde format is imposed.
+
+## Replay boundaries
+
+- `ReplayConfig` requires an explicit `ThreadId`, `CheckpointId`, and typed
+  Checkpointer. Replay never selects latest implicitly and does not reuse
+  `ResumeTarget`.
+- Replay loads exactly through `Checkpointer::get`. The source checkpoint need
+  not be latest, and Runtime performs no later latest query or parent CAS.
+- GraphVersion, thread ownership, completion/frontier consistency, interrupt
+  metadata, and canonical O(F) frontier resolution use the same pre-restore
+  validation as Resume. Resolved internal indices are reused for execution.
+- Restore remains synchronous, outside storage locks, and non-preemptible.
+  Cancellation and run timeout begin at replay entry, cover exact checkpoint
+  loading, are observed before and after restore, and continue through normal
+  execution. Node timeout is unchanged.
+- Replay assigns a new `RunId`, restores historical cumulative step and
+  super-step counters, and treats `RunConfig::max_steps` as an additional node
+  budget for this call.
+- Successful order is `RunStarted -> ReplayStarted -> continued events ->
+  RunCompleted`. `ReplayStarted` carries source thread/checkpoint and historical
+  step/super-step. Preparation failure emits no `ReplayStarted`; every failure
+  emits exactly one final `RunFailed`.
+- Replay uses the existing execution and transition kernel with checkpoint
+  writes unconditionally disabled. It creates no snapshot, record, parent link,
+  head update, history entry, branch, or implicit Fork. Concurrent advancement
+  of the source thread does not affect an already loaded replay.
+- A completed source checkpoint is restored and returns a no-op `ReplayReport`.
+  `ReplayReport` identifies the source checkpoint separately from its new
+  replay RunId.
+- An interrupted source checkpoint requires a Resume value; a normal or
+  completed checkpoint rejects one. The value remains scoped to the retained
+  node's single re-execution attempt.
+- Any new node interrupt during Replay returns
+  `ReplayInterruptUnsupported`, emits no `RunInterrupted`, and performs no
+  checkpoint write. This applies even if the interrupt occurs in a parallel
+  replay frontier.
+- Replay re-executes user nodes and can duplicate external database, network,
+  tool, or other side effects. Runtime provides no rollback, sandbox, or
+  automatic deduplication.
+- Replay is not Fork. `BranchId`, branch heads, and writable descendants from a
+  historical checkpoint are deferred to Stage 15.
 
 ## Suspension boundaries
 
@@ -351,17 +442,22 @@ The current core supports immutable compiled state graphs with:
 
 ## Performance principles
 
-- Aggregate fixed edges, fan-out targets, conditional routers, source counts,
-  and successor presence once during compilation and reuse the result across
-  validation and transition compilation. Ordinary compilation should remain
-  approximately O(V + E). The composition-only frontier-pair validation may
-  run only when a parent contains both fan-out and a subgraph mount. It must
+- Aggregate fixed edges, fan-out targets, both conditional router forms, source
+  counts, and successor presence once during compilation and reuse the result
+  across validation and transition compilation. Ordinary compilation should
+  remain approximately O(V + E). The composition-only frontier-pair validation
+  may run only when a parent contains both fan-out and a subgraph mount. It must
   discard `END` and process only members of each produced active frontier.
 - Use internal indices on the Runtime hot path.
 - Fixed and fan-out transitions must remain pre-resolved to internal indices.
+- Conditional fan-out resolution must inspect only selected targets and remain
+  approximately Router plus O(T log T) stable sorting.
 - Subgraph entry, exit, namespace paths, and transitions must be pre-resolved
   during compilation. Runtime must not repeatedly build or parse path strings.
 - Resume from a child checkpoint traverses only the actual saved frontier.
+- Replay traverses only its exact saved frontier, performs one exact
+  `Checkpointer::get`, and reuses the same execution kernel with storage writes
+  disabled. It must not add ordinary invoke or Resume hot-path work.
 - Frontier deduplication must operate on produced successors and must not scan
   every compiled graph node.
 - Do not clone complete state values per step.
@@ -379,18 +475,31 @@ The current core supports immutable compiled state graphs with:
 - `InMemoryCheckpointStore` may lock only briefly while atomically applying
   idempotency/CAS/insertion or cloning record handles. Never execute Snapshot
   or Codec code while holding its mutex.
+- SQLite uses pooled connections and short transactions. Never run user Codec,
+  snapshot, restore, node, router, or sink code inside a database transaction.
+- Ordinary invocation and `group-agent-core` must not depend on the SQLite
+  crate or enter SQLx paths.
+- Without the observability adapter, Core's event hot path must remain
+  unchanged. Core must not depend on `tokio-stream`.
+- The Tokio broadcast Sink may clone only the lightweight `GraphEvent` needed
+  for channel ownership. It must not block, await, spawn per node, or allocate
+  an unbounded queue.
 - Performance conclusions require repeatable benchmarks. Do not make comparative
   performance claims from architecture alone.
 
 ## Out of scope
 
-Do not add parent/child State mapping, parent-frontier parallel subgraphs,
-replay, fork, time travel, parallel interrupts, SQLite, PostgreSQL, SQLx,
-forced Serde bounds or built-in Serde codecs, conditional or dynamic fan-out,
-built-in Tokio channels or streams, LLM providers, tool calling, MCP, RAG,
-token streaming, standalone
+Do not add parent/child State mapping, parent-frontier parallel subgraphs, Fork,
+`BranchId`, branch heads, Replay writes, historical State modification, time
+travel, parallel interrupts, PostgreSQL, forced Serde bounds or built-in Serde
+codecs, arbitrary Node Command or Send APIs, conditional fan-out into subgraph
+mounts, custom asynchronous event backpressure, disk event queues,
+OpenTelemetry or metrics exporters, WebSocket or SSE servers, network event
+proxies, LLM providers, tool calling, MCP, RAG, token streaming, standalone
 reducer registration, Tower middleware, Axum, distributed workers, macro DSLs,
-or a visual interface unless a later stage explicitly authorizes them. Do not
+or a visual interface unless a later stage explicitly authorizes them. SQLite
+is the sole reference database backend and Tokio broadcast is the sole stream
+adapter in this stage. Fork and branch heads are deferred to Stage 15. Do not
 create placeholder crates for future capabilities.
 
 ## Rust and code standards
@@ -413,13 +522,9 @@ Run these commands after implementation changes:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo run -p group-agent-core --example linear
-cargo run -p group-agent-core --example conditional
-cargo run -p group-agent-core --example parallel
-cargo run -p group-agent-core --example checkpoint
+cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
-cargo run -p group-agent-core --example subgraph
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
@@ -429,6 +534,14 @@ Also validate the declared MSRV:
 ```bash
 cargo +1.85.0 check --workspace --all-targets --all-features
 cargo +1.85.0 test --workspace
+```
+
+Inspect the resolved dependency direction and finally check the working-tree
+diff:
+
+```bash
+cargo tree --workspace
+git diff --check
 ```
 
 Run benchmarks for measurements with:
@@ -456,5 +569,6 @@ examples, supported features, and exclusions match the implementation.
 After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before starting the next feature stage.
 Corrective stages such as Stage 5.1 do not count toward this cadence.
-Stage 9.1 Review has passed. Stage 10.1 is the durable-checkpoint contract
-correction identified by the Stage 10 architecture review.
+Stage 9.1 Review has passed. Stage 10.1 supplied the durable-checkpoint contract
+correction identified by the Stage 10 architecture review. Stages 11 through
+14 preserve that reviewed Record/Codec/Store boundary.

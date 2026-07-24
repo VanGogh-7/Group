@@ -445,9 +445,6 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
         .add_node("choose", Add(1))
         .expect("choose should register");
     child
-        .add_node("fork", Add(0))
-        .expect("fork should register");
-    child
         .add_node("left", Add(2))
         .expect("left should register");
     child
@@ -455,17 +452,14 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
         .expect("right should register");
     child.add_edge(START, "choose");
     child
-        .add_conditional_edges("choose", ["fork", END], |state: &SharedState| {
+        .add_conditional_fan_out("choose", ["left", "right", END], |state: &SharedState| {
             Ok(if state.value == 1 {
-                NodeId::from("fork")
+                vec![NodeId::from("right"), NodeId::from("left")]
             } else {
-                NodeId::end()
+                vec![NodeId::end()]
             })
         })
         .expect("router should register");
-    child
-        .add_fan_out("fork", ["left", "right"])
-        .expect("fan-out should register");
     child.add_edge("left", END).add_edge("right", END);
 
     let mut parent = StateGraph::new();
@@ -489,13 +483,12 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
         .expect("parallel child should complete");
     let report = outcome.as_completed().expect("run should complete");
     assert_eq!(report.final_state().value, 6);
-    assert_eq!(report.steps(), 4);
+    assert_eq!(report.steps(), 3);
     let namespace = GraphPath::new(["research"]);
     assert_eq!(
         report.visited_nodes(),
         [
             NodePath::new(&namespace, "choose"),
-            NodePath::new(&namespace, "fork"),
             NodePath::new(&namespace, "left"),
             NodePath::new(&namespace, "right"),
         ]
@@ -505,8 +498,8 @@ async fn child_conditional_fan_out_and_fan_in_use_the_shared_runtime() {
         .await
         .expect("latest should load")
         .expect("final checkpoint should exist");
-    assert_eq!(final_checkpoint.step(), 4);
-    assert_eq!(final_checkpoint.superstep(), 3);
+    assert_eq!(final_checkpoint.step(), 3);
+    assert_eq!(final_checkpoint.superstep(), 2);
     assert!(final_checkpoint.completed());
 }
 

@@ -1,0 +1,26 @@
+[package]
+name = "group-agent-observability-tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded Tokio event stream adapter for Group"
+
+[dependencies]
+group-agent-core = { path = "../group-agent-core" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+criterion.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
+
+[[bench]]
+name = "event_broadcast"
+harness = false
+
+[lints]
+workspace = true

@@ -103,6 +103,8 @@ impl FanOutEdge {
 }
 
 pub(crate) type Router<S> = Arc<dyn Fn(&S) -> Result<NodeId, RouteError> + Send + Sync + 'static>;
+pub(crate) type FanOutRouter<S> =
+    Arc<dyn Fn(&S) -> Result<Vec<NodeId>, RouteError> + Send + Sync + 'static>;
 
 pub(crate) struct ConditionalEdge<S>
 where
@@ -111,6 +113,32 @@ where
     pub(crate) source: NodeId,
     pub(crate) allowed_targets: Vec<NodeId>,
     pub(crate) router: Router<S>,
+}
+
+pub(crate) struct ConditionalFanOutEdge<S>
+where
+    S: GraphState,
+{
+    pub(crate) source: NodeId,
+    pub(crate) allowed_targets: Vec<NodeId>,
+    pub(crate) router: FanOutRouter<S>,
+}
+
+impl<S> ConditionalFanOutEdge<S>
+where
+    S: GraphState,
+{
+    pub(crate) fn new(
+        source: NodeId,
+        allowed_targets: Vec<NodeId>,
+        router: FanOutRouter<S>,
+    ) -> Self {
+        Self {
+            source,
+            allowed_targets,
+            router,
+        }
+    }
 }
 
 impl<S> ConditionalEdge<S>

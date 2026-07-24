@@ -202,6 +202,233 @@ fn duplicate_conditional_target_is_rejected() {
 }
 
 #[test]
+fn empty_and_duplicate_conditional_fan_out_whitelists_are_rejected() {
+    let mut graph = graph_with_nodes(&["router", "answer"]);
+    assert_eq!(
+        graph
+            .add_conditional_fan_out("router", Vec::<NodeId>::new(), |_| Ok(Vec::new()))
+            .err()
+            .expect("empty whitelist should fail"),
+        GraphBuildError::EmptyConditionalFanOutTargets {
+            source_node: NodeId::from("router"),
+        }
+    );
+    assert_eq!(
+        graph
+            .add_conditional_fan_out("router", ["answer", "answer"], |_| {
+                Ok(vec![NodeId::from("answer")])
+            })
+            .err()
+            .expect("duplicate whitelist should fail"),
+        GraphBuildError::DuplicateConditionalFanOutTarget {
+            source_node: NodeId::from("router"),
+            target: NodeId::from("answer"),
+        }
+    );
+}
+
+#[test]
+fn conditional_fan_out_endpoints_and_transition_conflicts_are_structured() {
+    let mut unknown_source = graph_with_nodes(&["node"]);
+    unknown_source.add_edge(START, "node").add_edge("node", END);
+    unknown_source
+        .add_conditional_fan_out("missing", [END], |_| Ok(vec![NodeId::end()]))
+        .expect("declaration should register");
+    assert_eq!(
+        unknown_source.compile().err().expect("source should fail"),
+        GraphCompileError::UnknownConditionalFanOutSource {
+            source_node: NodeId::from("missing"),
+        }
+    );
+
+    let mut unknown_target = graph_with_nodes(&["router"]);
+    unknown_target.add_edge(START, "router");
+    unknown_target
+        .add_conditional_fan_out("router", ["first-missing", "second-missing"], |_| {
+            Ok(vec![NodeId::from("first-missing")])
+        })
+        .expect("declaration should register");
+    assert_eq!(
+        unknown_target.compile().err().expect("target should fail"),
+        GraphCompileError::UnknownConditionalFanOutTarget {
+            source_node: NodeId::from("router"),
+            target: NodeId::from("first-missing"),
+        }
+    );
+
+    let mut mixed = graph_with_nodes(&["router", "answer"]);
+    mixed
+        .add_edge(START, "router")
+        .add_edge("router", "answer")
+        .add_edge("answer", END);
+    mixed
+        .add_conditional_fan_out("router", ["answer"], |_| Ok(vec![NodeId::from("answer")]))
+        .expect("fan-out should register");
+    assert_eq!(
+        mixed.compile().err().expect("mixed transition should fail"),
+        GraphCompileError::MixedOutgoingEdgeKinds {
+            node_id: NodeId::from("router"),
+        }
+    );
+
+    let mut conditional_mixed = graph_with_nodes(&["router", "answer"]);
+    conditional_mixed
+        .add_edge(START, "router")
+        .add_edge("answer", END);
+    conditional_mixed
+        .add_conditional_edges("router", ["answer"], |_| Ok(NodeId::from("answer")))
+        .expect("single router should register");
+    conditional_mixed
+        .add_conditional_fan_out("router", ["answer"], |_| Ok(vec![NodeId::from("answer")]))
+        .expect("fan-out router should register");
+    assert_eq!(
+        conditional_mixed
+            .compile()
+            .err()
+            .expect("mixed conditional transition should fail"),
+        GraphCompileError::MixedOutgoingEdgeKinds {
+            node_id: NodeId::from("router"),
+        }
+    );
+
+    let mut static_mixed = graph_with_nodes(&["router", "answer"]);
+    static_mixed
+        .add_edge(START, "router")
+        .add_edge("answer", END);
+    static_mixed
+        .add_fan_out("router", ["answer"])
+        .expect("static fan-out should register");
+    static_mixed
+        .add_conditional_fan_out("router", ["answer"], |_| Ok(vec![NodeId::from("answer")]))
+        .expect("conditional fan-out should register");
+    assert_eq!(
+        static_mixed
+            .compile()
+            .err()
+            .expect("mixed fan-out transition should fail"),
+        GraphCompileError::MixedOutgoingEdgeKinds {
+            node_id: NodeId::from("router"),
+        }
+    );
+}
+
+#[test]
+fn multiple_conditional_fan_out_routers_are_rejected_by_the_builder() {
+    let mut graph = graph_with_nodes(&["router", "answer"]);
+    graph
+        .add_conditional_fan_out("router", ["answer"], |_| Ok(vec![NodeId::from("answer")]))
+        .expect("first router should register");
+    assert_eq!(
+        graph
+            .add_conditional_fan_out("router", [END], |_| Ok(vec![NodeId::end()]))
+            .err()
+            .expect("second router should fail"),
+        GraphBuildError::MultipleConditionalFanOutRouters {
+            source_node: NodeId::from("router"),
+        }
+    );
+}
+
+#[test]
+fn conditional_fan_out_cannot_target_a_subgraph_mount() {
+    let mut child = graph_with_nodes(&["child-node"]);
+    child
+        .add_edge(START, "child-node")
+        .add_edge("child-node", END);
+    let child = child.compile().expect("child should compile");
+
+    let mut parent = graph_with_nodes(&["router"]);
+    parent
+        .add_subgraph("child", child)
+        .expect("child should mount");
+    parent.add_edge(START, "router").add_edge("child", END);
+    parent
+        .add_conditional_fan_out("router", ["child", END], |_| {
+            Ok(vec![NodeId::from("child")])
+        })
+        .expect("declaration should register");
+
+    assert_eq!(
+        parent.compile().err().expect("mount target should fail"),
+        GraphCompileError::ConditionalFanOutTargetsSubgraph {
+            source_node: NodeId::from("router"),
+            target: NodeId::from("child"),
+        }
+    );
+}
+
+#[test]
+fn conditional_fan_out_reserved_sources_and_start_target_are_rejected() {
+    let mut start = graph_with_nodes(&["node"]);
+    start
+        .add_conditional_fan_out(START, ["node"], |_| Ok(vec![NodeId::from("node")]))
+        .expect("declaration should register");
+    assert_eq!(
+        start.compile().err().expect("START source should fail"),
+        GraphCompileError::StartHasConditionalFanOut
+    );
+
+    let mut end = graph_with_nodes(&["node"]);
+    end.add_edge(START, "node").add_edge("node", END);
+    end.add_conditional_fan_out(END, ["node"], |_| Ok(vec![NodeId::from("node")]))
+        .expect("declaration should register");
+    assert_eq!(
+        end.compile().err().expect("END source should fail"),
+        GraphCompileError::EndHasConditionalFanOut
+    );
+
+    let mut target = graph_with_nodes(&["node"]);
+    target.add_edge(START, "node");
+    target
+        .add_conditional_fan_out("node", [START, END], |_| Ok(vec![NodeId::end()]))
+        .expect("declaration should register");
+    assert_eq!(
+        target.compile().err().expect("START target should fail"),
+        GraphCompileError::StartHasIncoming {
+            from: NodeId::from("node"),
+        }
+    );
+}
+
+#[test]
+fn conditional_fan_out_compile_validation_never_panics_for_invalid_inputs() {
+    let mut graphs = Vec::new();
+
+    let mut missing_source = graph_with_nodes(&["node"]);
+    missing_source.add_edge(START, "node").add_edge("node", END);
+    missing_source
+        .add_conditional_fan_out("missing", [END], |_| Ok(vec![NodeId::end()]))
+        .expect("declaration");
+    graphs.push(missing_source);
+
+    let mut missing_target = graph_with_nodes(&["router"]);
+    missing_target.add_edge(START, "router");
+    missing_target
+        .add_conditional_fan_out("router", ["missing"], |_| Ok(vec![NodeId::from("missing")]))
+        .expect("declaration");
+    graphs.push(missing_target);
+
+    let mut mixed = graph_with_nodes(&["router", "answer"]);
+    mixed
+        .add_edge(START, "router")
+        .add_edge("router", "answer")
+        .add_edge("answer", END);
+    mixed
+        .add_conditional_fan_out("router", ["answer"], |_| Ok(vec![NodeId::from("answer")]))
+        .expect("declaration");
+    graphs.push(mixed);
+
+    for graph in graphs {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| graph.compile()));
+        assert!(result.is_ok(), "compile must not panic");
+        assert!(
+            result.expect("compile should return").is_err(),
+            "invalid graph must return a structured error"
+        );
+    }
+}
+
+#[test]
 fn empty_and_duplicate_fan_out_targets_are_rejected() {
     let mut graph = graph_with_nodes(&["source", "target"]);
     assert_eq!(

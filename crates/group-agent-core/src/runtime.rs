@@ -10,15 +10,16 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::checkpoint::{CheckpointLineage, ResumeParts};
-use crate::graph::{CompiledItem, CompiledNode, CompiledTransition};
+use crate::checkpoint::{CheckpointLineage, ReplayParts, ResumeParts};
+use crate::graph::{CompiledItem, CompiledNode};
 use crate::node::NodeKind;
+use crate::transition::{CompiledTransition, RouteDecision, TransitionError};
 use crate::{
     Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointInterrupt,
     CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph,
     EventConfig, EventRetention, ExecutionOutcome, GraphEvent, GraphRunError, GraphState,
-    InterruptReport, NodeContext, NodeOutcome, NodePath, NodeUpdate, ResumeConfig, ResumeTarget,
-    ResumeValue, RunConfig, RunControl, RunFailure, RunId, ThreadId,
+    InterruptReport, NodeContext, NodeOutcome, NodePath, NodeUpdate, ReplayConfig, ResumeConfig,
+    ResumeTarget, ResumeValue, RunConfig, RunControl, RunFailure, RunId, ThreadId,
 };
 
 /// The completed report produced when a graph reaches an empty frontier.
@@ -72,6 +73,96 @@ where
     #[must_use]
     pub fn events(&self) -> &[GraphEvent] {
         &self.events
+    }
+}
+
+/// The completed result of a read-only historical replay.
+#[derive(Clone, Debug)]
+pub struct ReplayReport<S>
+where
+    S: GraphState,
+{
+    source_thread_id: ThreadId,
+    source_checkpoint_id: CheckpointId,
+    source_step: usize,
+    source_superstep: usize,
+    run: RunReport<S>,
+}
+
+impl<S> ReplayReport<S>
+where
+    S: GraphState,
+{
+    /// Returns the new invocation identifier assigned to the replay.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run.run_id()
+    }
+
+    /// Returns the logical thread containing the source checkpoint.
+    #[must_use]
+    pub const fn source_thread_id(&self) -> &ThreadId {
+        &self.source_thread_id
+    }
+
+    /// Returns the exact historical checkpoint that was replayed.
+    #[must_use]
+    pub const fn source_checkpoint_id(&self) -> CheckpointId {
+        self.source_checkpoint_id
+    }
+
+    /// Returns the cumulative node count at the source checkpoint.
+    #[must_use]
+    pub const fn source_step(&self) -> usize {
+        self.source_step
+    }
+
+    /// Returns the cumulative super-step count at the source checkpoint.
+    #[must_use]
+    pub const fn source_superstep(&self) -> usize {
+        self.source_superstep
+    }
+
+    /// Returns the final state after replay execution.
+    #[must_use]
+    pub const fn final_state(&self) -> &S {
+        self.run.final_state()
+    }
+
+    /// Consumes the report and returns the final state.
+    #[must_use]
+    pub fn into_final_state(self) -> S {
+        self.run.into_final_state()
+    }
+
+    /// Returns the cumulative number of executed nodes after replay.
+    #[must_use]
+    pub const fn steps(&self) -> usize {
+        self.run.steps()
+    }
+
+    /// Returns node attempts made by this replay invocation.
+    #[must_use]
+    pub fn visited_nodes(&self) -> &[NodePath] {
+        self.run.visited_nodes()
+    }
+
+    /// Returns retained replay lifecycle events.
+    #[must_use]
+    pub fn events(&self) -> &[GraphEvent] {
+        self.run.events()
+    }
+
+    /// Returns the underlying completed run report.
+    #[must_use]
+    pub const fn run_report(&self) -> &RunReport<S> {
+        &self.run
+    }
+
+    /// Consumes this report and returns the underlying completed run report.
+    #[must_use]
+    pub fn into_run_report(self) -> RunReport<S> {
+        self.run
     }
 }
 
@@ -370,12 +461,14 @@ where
                             node_id: compiled_node.path.clone(),
                             step,
                         });
-                        if !checkpoints.is_enabled() {
-                            return events.fail(GraphRunError::InterruptRequiresCheckpoint {
-                                interrupt_id: interrupt.id(),
-                                node_id: compiled_node.path.clone(),
-                                step,
-                            });
+                        if let Some(error) = checkpoints.interrupt_error(
+                            run_id,
+                            interrupt.id(),
+                            &compiled_node.path,
+                            step,
+                            false,
+                        ) {
+                            return events.fail(error);
                         }
 
                         let committed_superstep = superstep - 1;
@@ -560,11 +653,16 @@ where
                                 node_id: compiled_node.path.clone(),
                                 step,
                             });
-                            return events.fail(GraphRunError::UnsupportedParallelInterrupt {
-                                interrupt_id: interrupt.id(),
-                                node_id: compiled_node.path.clone(),
-                                step,
-                            });
+                            let error = checkpoints
+                                .interrupt_error(
+                                    run_id,
+                                    interrupt.id(),
+                                    &compiled_node.path,
+                                    step,
+                                    true,
+                                )
+                                .expect("parallel interrupts are never saveable");
+                            return events.fail(error);
                         }
                     };
                     events.emit(|| GraphEvent::NodeCompleted {
@@ -640,50 +738,17 @@ where
                 let compiled_node = self.node_at(index);
                 let node_id = &compiled_node.path;
                 let step = step_base + offset + 1;
-                match &compiled_node.transition {
-                    CompiledTransition::Fixed(target) => {
-                        if let Some(target) = target {
-                            next_frontier.push(*target);
-                        }
-                    }
-                    CompiledTransition::FanOut(targets) => {
-                        next_frontier.extend(targets.iter().flatten().copied());
-                    }
-                    CompiledTransition::Conditional {
-                        router,
-                        allowed_targets,
-                    } => {
-                        let target_id = match router(&state) {
-                            Ok(target_id) => target_id,
-                            Err(source) => {
-                                return events.fail(GraphRunError::RouteFailed {
-                                    node_id: node_id.clone(),
-                                    step,
-                                    source,
-                                });
-                            }
-                        };
-                        let Some(target_index) = allowed_targets.get(&target_id).copied() else {
-                            return events.fail(GraphRunError::InvalidRouteTarget {
-                                node_id: node_id.clone(),
-                                target: NodePath::new(&compiled_node.graph_path, target_id),
-                                step,
-                            });
-                        };
-                        let target_path = target_index.map_or_else(
-                            || NodePath::new(&compiled_node.graph_path, target_id.clone()),
-                            |index| self.path_at(index),
-                        );
-                        events.emit(|| GraphEvent::RouteSelected {
-                            run_id,
-                            source: node_id.clone(),
-                            target: target_path,
-                            step,
-                        });
-                        if let Some(target_index) = target_index {
-                            next_frontier.push(target_index);
-                        }
-                    }
+                if let Err(error) = self.resolve_transition(
+                    &compiled_node.transition,
+                    &state,
+                    &compiled_node.graph_path,
+                    node_id,
+                    step,
+                    &mut next_frontier,
+                    &mut events,
+                    run_id,
+                ) {
+                    return events.fail(error);
                 }
 
                 if let Some(error) =
@@ -806,12 +871,24 @@ where
             let index = frontier[0];
             match self.item_at(index) {
                 CompiledItem::Node(_) => return Ok(boundaries),
-                CompiledItem::EnterSubgraph { graph_path, target } => {
+                CompiledItem::EnterSubgraph {
+                    graph_path,
+                    transition,
+                } => {
                     let graph_path = graph_path.clone();
-                    let target = *target;
+                    let source = graph_path.mount_path();
                     boundaries.push(SubgraphBoundary::Started(graph_path));
                     frontier.clear();
-                    frontier.extend(target);
+                    self.resolve_transition(
+                        transition,
+                        state,
+                        &source.graph_path(),
+                        &source,
+                        step,
+                        frontier,
+                        events,
+                        run_id,
+                    )?;
                 }
                 CompiledItem::ExitSubgraph {
                     graph_path,
@@ -821,41 +898,16 @@ where
                     let graph_path = graph_path.clone();
                     let mount_path = mount_path.clone();
                     frontier.clear();
-                    match transition {
-                        CompiledTransition::Fixed(target) => frontier.extend(*target),
-                        CompiledTransition::FanOut(targets) => {
-                            frontier.extend(targets.iter().flatten().copied());
-                        }
-                        CompiledTransition::Conditional {
-                            router,
-                            allowed_targets,
-                        } => {
-                            let target_id =
-                                router(state).map_err(|source| GraphRunError::RouteFailed {
-                                    node_id: mount_path.clone(),
-                                    step,
-                                    source,
-                                })?;
-                            let Some(target) = allowed_targets.get(&target_id).copied() else {
-                                return Err(GraphRunError::InvalidRouteTarget {
-                                    node_id: mount_path.clone(),
-                                    target: NodePath::new(&mount_path.graph_path(), target_id),
-                                    step,
-                                });
-                            };
-                            let target_path = target.map_or_else(
-                                || NodePath::new(&mount_path.graph_path(), target_id.clone()),
-                                |target| self.path_at(target),
-                            );
-                            events.emit(|| GraphEvent::RouteSelected {
-                                run_id,
-                                source: mount_path.clone(),
-                                target: target_path,
-                                step,
-                            });
-                            frontier.extend(target);
-                        }
-                    }
+                    self.resolve_transition(
+                        transition,
+                        state,
+                        &mount_path.graph_path(),
+                        &mount_path,
+                        step,
+                        frontier,
+                        events,
+                        run_id,
+                    )?;
                     boundaries.push(SubgraphBoundary::Completed(graph_path));
                     frontier.sort_unstable_by_key(|target| target.index());
                     frontier.dedup();
@@ -868,6 +920,64 @@ where
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn resolve_transition(
+        &self,
+        transition: &CompiledTransition<S>,
+        state: &S,
+        graph_path: &crate::GraphPath,
+        source: &NodePath,
+        step: usize,
+        targets: &mut Vec<NodeIndex>,
+        events: &mut EventEmitter<'_>,
+        run_id: RunId,
+    ) -> Result<(), GraphRunError> {
+        let decision = transition
+            .resolve_into(state, graph_path, targets, |index| self.path_at(index))
+            .map_err(|error| match error {
+                TransitionError::Router(source_error) => GraphRunError::RouteFailed {
+                    node_id: source.clone(),
+                    step,
+                    source: source_error,
+                },
+                TransitionError::InvalidTarget(target) => GraphRunError::InvalidRouteTarget {
+                    node_id: source.clone(),
+                    target: NodePath::new(graph_path, target),
+                    step,
+                },
+                TransitionError::EmptyTargets => GraphRunError::EmptyRouteTargets {
+                    node_id: source.clone(),
+                    step,
+                },
+                TransitionError::DuplicateTarget(target) => GraphRunError::DuplicateRouteTarget {
+                    node_id: source.clone(),
+                    target: NodePath::new(graph_path, target),
+                    step,
+                },
+            })?;
+        match decision {
+            Some(RouteDecision::Single(target)) => {
+                events.emit(|| GraphEvent::RouteSelected {
+                    run_id,
+                    source: source.clone(),
+                    target,
+                    step,
+                });
+            }
+            Some(RouteDecision::Multiple(selected_targets)) => {
+                events.emit(|| GraphEvent::RoutesSelected {
+                    run_id,
+                    source: source.clone(),
+                    targets: selected_targets,
+                    step,
+                });
+            }
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -972,7 +1082,7 @@ where
             }
         }
 
-        let frontier = match self.validate_and_resolve_resume_frontier(&checkpoint) {
+        let frontier = match self.validate_and_resolve_checkpoint_frontier(&checkpoint) {
             Ok(frontier) => frontier,
             Err(reason) => {
                 return events.fail(GraphRunError::CheckpointIncompatible {
@@ -1063,6 +1173,184 @@ where
         .await
     }
 
+    /// Re-executes from one exact historical checkpoint without writing lineage.
+    ///
+    /// Replay does not require the checkpoint to be latest and never saves a
+    /// checkpoint, updates the source thread head, or creates a branch. Nodes
+    /// are executed normally and may therefore repeat external side effects.
+    pub async fn replay(
+        &self,
+        replay_config: ReplayConfig<S::Snapshot>,
+    ) -> Result<ReplayReport<S>, GraphRunError> {
+        let invocation_started = Instant::now();
+        let ReplayParts {
+            thread_id,
+            checkpoint_id,
+            checkpointer,
+            run_config,
+            event_config,
+            control: run_control,
+            resume_value,
+        } = replay_config.into_parts();
+        let run_id = RunId::next();
+        let control = ActiveControl::new(run_control, invocation_started);
+        let mut events = EventEmitter::new(run_id, &event_config);
+        events.emit(|| GraphEvent::RunStarted {
+            run_id,
+            max_steps: run_config.max_steps,
+        });
+        debug!(
+            %run_id,
+            %thread_id,
+            %checkpoint_id,
+            max_steps = run_config.max_steps,
+            "graph replay started"
+        );
+
+        if let Some(error) = control.check(run_id, None, 0, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        let load = async {
+            checkpointer
+                .get(&thread_id, checkpoint_id)
+                .await
+                .map_err(|source| GraphRunError::CheckpointLoadFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: Some(checkpoint_id),
+                    source,
+                })?
+                .ok_or_else(|| GraphRunError::CheckpointNotFound {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: Some(checkpoint_id),
+                })
+        };
+        let checkpoint = match await_run_boundary(&control, run_id, 0, load).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return events.fail(error),
+        };
+        let checkpoint_step = checkpoint.step();
+        let checkpoint_superstep = checkpoint.superstep();
+
+        if checkpoint.thread_id() != &thread_id {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id,
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::ThreadMismatch {
+                    actual_thread: checkpoint.thread_id().clone(),
+                },
+            });
+        }
+
+        let frontier = match self.validate_and_resolve_checkpoint_frontier(&checkpoint) {
+            Ok(frontier) => frontier,
+            Err(reason) => {
+                return events.fail(GraphRunError::CheckpointIncompatible {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    step: checkpoint_step,
+                    reason,
+                });
+            }
+        };
+        let (resume_node, resume_value) = match (checkpoint.interrupt(), resume_value) {
+            (Some(_), Some(value)) => (frontier.first().copied(), Some(value)),
+            (Some(interrupt), None) => {
+                return events.fail(GraphRunError::MissingResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    interrupt_id: interrupt.id(),
+                    node_id: interrupt.node_path().clone(),
+                    step: checkpoint_step,
+                });
+            }
+            (None, Some(_)) => {
+                return events.fail(GraphRunError::UnexpectedResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    step: checkpoint_step,
+                });
+            }
+            (None, None) => (None, None),
+        };
+
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+        let state = match S::restore(checkpoint.snapshot()) {
+            Ok(state) => state,
+            Err(source) => {
+                return events.fail(GraphRunError::RestoreFailed {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    superstep: checkpoint_superstep,
+                    step: checkpoint_step,
+                    source,
+                });
+            }
+        };
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        events.emit(|| GraphEvent::ReplayStarted {
+            run_id,
+            source_thread_id: thread_id.clone(),
+            source_checkpoint_id: checkpoint_id,
+            step: checkpoint_step,
+            superstep: checkpoint_superstep,
+        });
+        if let Some(first) = frontier.first() {
+            let graph_path = &self.node_at(*first).graph_path;
+            for graph_path in graph_path.prefixes() {
+                events.emit(|| GraphEvent::SubgraphStarted { run_id, graph_path });
+            }
+        }
+
+        let outcome = self
+            .execute_internal(
+                Execution {
+                    run_id,
+                    state,
+                    steps: checkpoint_step,
+                    visited_nodes: Vec::new(),
+                    events,
+                    frontier,
+                    superstep: checkpoint_superstep,
+                    save_empty_checkpoint: false,
+                    resume_node,
+                    resume_value,
+                },
+                run_config,
+                control,
+                ReadOnlyReplayCheckpoint {
+                    source_thread_id: thread_id.clone(),
+                    source_checkpoint_id: checkpoint_id,
+                },
+            )
+            .await?;
+        match outcome {
+            ExecutionOutcome::Completed(run) => Ok(ReplayReport {
+                source_thread_id: thread_id,
+                source_checkpoint_id: checkpoint_id,
+                source_step: checkpoint_step,
+                source_superstep: checkpoint_superstep,
+                run,
+            }),
+            ExecutionOutcome::Interrupted(_) => {
+                unreachable!("read-only replay rejects every node interrupt")
+            }
+        }
+    }
+
     /// Invokes with checkpointing and returns completion or saved suspension.
     pub async fn invoke_with_checkpoint(
         &self,
@@ -1082,7 +1370,7 @@ where
         .await
     }
 
-    fn validate_and_resolve_resume_frontier(
+    fn validate_and_resolve_checkpoint_frontier(
         &self,
         checkpoint: &Checkpoint<S::Snapshot>,
     ) -> Result<Vec<NodeIndex>, CheckpointIncompatibility> {
@@ -1207,7 +1495,14 @@ trait RuntimeCheckpoint<S>: Send
 where
     S: GraphState,
 {
-    fn is_enabled(&self) -> bool;
+    fn interrupt_error(
+        &self,
+        run_id: RunId,
+        interrupt_id: crate::InterruptId,
+        node_id: &NodePath,
+        step: usize,
+        parallel: bool,
+    ) -> Option<GraphRunError>;
 
     fn should_save(&self, completed: bool) -> bool;
 
@@ -1226,8 +1521,27 @@ impl<S> RuntimeCheckpoint<S> for DisabledCheckpoint
 where
     S: GraphState,
 {
-    fn is_enabled(&self) -> bool {
-        false
+    fn interrupt_error(
+        &self,
+        _run_id: RunId,
+        interrupt_id: crate::InterruptId,
+        node_id: &NodePath,
+        step: usize,
+        parallel: bool,
+    ) -> Option<GraphRunError> {
+        Some(if parallel {
+            GraphRunError::UnsupportedParallelInterrupt {
+                interrupt_id,
+                node_id: node_id.clone(),
+                step,
+            }
+        } else {
+            GraphRunError::InterruptRequiresCheckpoint {
+                interrupt_id,
+                node_id: node_id.clone(),
+                step,
+            }
+        })
     }
 
     fn should_save(&self, _completed: bool) -> bool {
@@ -1241,6 +1555,48 @@ where
         _boundary: CheckpointBoundary,
     ) -> Result<SavedCheckpoint, GraphRunError> {
         unreachable!("disabled checkpointing never enters the storage path")
+    }
+}
+
+struct ReadOnlyReplayCheckpoint {
+    source_thread_id: ThreadId,
+    source_checkpoint_id: CheckpointId,
+}
+
+#[async_trait]
+impl<S> RuntimeCheckpoint<S> for ReadOnlyReplayCheckpoint
+where
+    S: GraphState,
+{
+    fn interrupt_error(
+        &self,
+        run_id: RunId,
+        interrupt_id: crate::InterruptId,
+        node_id: &NodePath,
+        step: usize,
+        _parallel: bool,
+    ) -> Option<GraphRunError> {
+        Some(GraphRunError::ReplayInterruptUnsupported {
+            run_id,
+            source_thread_id: self.source_thread_id.clone(),
+            source_checkpoint_id: self.source_checkpoint_id,
+            interrupt_id,
+            node_id: node_id.clone(),
+            step,
+        })
+    }
+
+    fn should_save(&self, _completed: bool) -> bool {
+        false
+    }
+
+    async fn save(
+        &mut self,
+        _run_id: RunId,
+        _state: &S,
+        _boundary: CheckpointBoundary,
+    ) -> Result<SavedCheckpoint, GraphRunError> {
+        unreachable!("read-only replay never enters the storage write path")
     }
 }
 
@@ -1275,8 +1631,19 @@ impl<S> RuntimeCheckpoint<S> for EnabledCheckpoint<S>
 where
     S: CheckpointState,
 {
-    fn is_enabled(&self) -> bool {
-        true
+    fn interrupt_error(
+        &self,
+        _run_id: RunId,
+        interrupt_id: crate::InterruptId,
+        node_id: &NodePath,
+        step: usize,
+        parallel: bool,
+    ) -> Option<GraphRunError> {
+        parallel.then(|| GraphRunError::UnsupportedParallelInterrupt {
+            interrupt_id,
+            node_id: node_id.clone(),
+            step,
+        })
     }
 
     fn should_save(&self, completed: bool) -> bool {
@@ -1836,6 +2203,20 @@ impl From<&GraphRunError> for RunFailure {
                 checkpoint_id: *checkpoint_id,
                 step: *step,
             },
+            GraphRunError::ReplayInterruptUnsupported {
+                source_thread_id,
+                source_checkpoint_id,
+                interrupt_id,
+                node_id,
+                step,
+                ..
+            } => Self::ReplayInterruptUnsupported {
+                source_thread_id: source_thread_id.clone(),
+                source_checkpoint_id: *source_checkpoint_id,
+                interrupt_id: *interrupt_id,
+                node_id: node_id.clone(),
+                step: *step,
+            },
             GraphRunError::RouteFailed { node_id, step, .. } => Self::RouteFailed {
                 node_id: node_id.clone(),
                 step: *step,
@@ -1845,6 +2226,19 @@ impl From<&GraphRunError> for RunFailure {
                 target,
                 step,
             } => Self::InvalidRouteTarget {
+                node_id: node_id.clone(),
+                target: target.clone(),
+                step: *step,
+            },
+            GraphRunError::EmptyRouteTargets { node_id, step } => Self::EmptyRouteTargets {
+                node_id: node_id.clone(),
+                step: *step,
+            },
+            GraphRunError::DuplicateRouteTarget {
+                node_id,
+                target,
+                step,
+            } => Self::DuplicateRouteTarget {
                 node_id: node_id.clone(),
                 target: target.clone(),
                 step: *step,

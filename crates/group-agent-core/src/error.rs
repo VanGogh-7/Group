@@ -28,6 +28,15 @@ pub enum GraphBuildError {
     /// A source attempted to register more than one conditional router.
     #[error("node `{source_node}` already has a conditional router")]
     MultipleConditionalRouters { source_node: NodeId },
+    /// A conditional fan-out declared no possible target.
+    #[error("conditional fan-out from `{source_node}` must declare at least one allowed target")]
+    EmptyConditionalFanOutTargets { source_node: NodeId },
+    /// A conditional fan-out declared the same target more than once.
+    #[error("conditional fan-out from `{source_node}` declares duplicate target `{target}`")]
+    DuplicateConditionalFanOutTarget { source_node: NodeId, target: NodeId },
+    /// A source attempted to register more than one conditional fan-out router.
+    #[error("node `{source_node}` already has a conditional fan-out router")]
+    MultipleConditionalFanOutRouters { source_node: NodeId },
     /// A fan-out edge declared no targets.
     #[error("fan-out edge from `{source_node}` must declare at least one target")]
     EmptyFanOutTargets { source_node: NodeId },
@@ -58,6 +67,17 @@ pub enum GraphCompileError {
     /// A conditional target does not name a registered node or `END`.
     #[error("conditional edge from `{source_node}` references unknown target `{target}`")]
     UnknownConditionalTarget { source_node: NodeId, target: NodeId },
+    /// A conditional fan-out source is not a registered graph item.
+    #[error("conditional fan-out source `{source_node}` is not a registered graph item")]
+    UnknownConditionalFanOutSource { source_node: NodeId },
+    /// A conditional fan-out target does not name a registered node or `END`.
+    #[error("conditional fan-out from `{source_node}` references unknown target `{target}`")]
+    UnknownConditionalFanOutTarget { source_node: NodeId, target: NodeId },
+    /// A conditional fan-out whitelist names a structural subgraph mount.
+    #[error(
+        "conditional fan-out from `{source_node}` cannot directly target subgraph mount `{target}`"
+    )]
+    ConditionalFanOutTargetsSubgraph { source_node: NodeId, target: NodeId },
     /// A fan-out source is not a registered graph item.
     #[error("fan-out source `{source_node}` is not a registered graph item")]
     UnknownFanOutSource { source_node: NodeId },
@@ -73,6 +93,9 @@ pub enum GraphCompileError {
     /// `START` attempted to use conditional routing.
     #[error("START cannot have a conditional edge")]
     StartHasConditionalEdge,
+    /// `START` attempted to use conditional fan-out.
+    #[error("START cannot have a conditional fan-out transition")]
+    StartHasConditionalFanOut,
     /// `START` attempted to use fan-out.
     #[error("START cannot have a fan-out transition")]
     StartHasFanOut,
@@ -82,6 +105,9 @@ pub enum GraphCompileError {
     /// `END` attempted to use conditional routing.
     #[error("END cannot have a conditional edge")]
     EndHasConditionalEdge,
+    /// `END` attempted to use conditional fan-out.
+    #[error("END cannot have a conditional fan-out transition")]
+    EndHasConditionalFanOut,
     /// `END` attempted to use fan-out.
     #[error("END cannot have a fan-out transition")]
     EndHasFanOut,
@@ -92,10 +118,16 @@ pub enum GraphCompileError {
     #[error("node `{node_id}` has {count} outgoing fixed edges; at most one is allowed")]
     MultipleOutgoingEdges { node_id: NodeId, count: usize },
     /// A node declared more than one transition kind.
-    #[error("node `{node_id}` cannot combine fixed, fan-out, and conditional transitions")]
+    #[error(
+        "node `{node_id}` cannot combine fixed, fan-out, conditional, and conditional fan-out \
+         transitions"
+    )]
     MixedOutgoingEdgeKinds { node_id: NodeId },
     /// A reachable normal node has no successor.
-    #[error("node `{node_id}` has no outgoing fixed, fan-out, or conditional transition")]
+    #[error(
+        "node `{node_id}` has no outgoing fixed, fan-out, conditional, or conditional fan-out \
+         transition"
+    )]
     MissingOutgoingEdge { node_id: NodeId },
     /// A registered node cannot be reached from `START`.
     #[error("node `{node_id}` is unreachable from START")]
@@ -380,7 +412,7 @@ pub enum GraphRunError {
         #[source]
         source: CheckpointerError,
     },
-    /// No checkpoint matched the requested resume target.
+    /// No checkpoint matched the requested continuation target.
     #[error("checkpoint {checkpoint_id:?} was not found for thread `{thread_id}`")]
     CheckpointNotFound {
         run_id: RunId,
@@ -465,6 +497,20 @@ pub enum GraphRunError {
         checkpoint_id: CheckpointId,
         step: usize,
     },
+    /// A node attempted to interrupt during a read-only historical replay.
+    #[error(
+        "node `{node_id}` requested interrupt `{interrupt_id}` at step {step} while replaying \
+         checkpoint `{source_checkpoint_id}` from thread `{source_thread_id}`; read-only replay \
+         cannot save an interrupted checkpoint"
+    )]
+    ReplayInterruptUnsupported {
+        run_id: RunId,
+        source_thread_id: ThreadId,
+        source_checkpoint_id: CheckpointId,
+        interrupt_id: InterruptId,
+        node_id: NodePath,
+        step: usize,
+    },
     /// A conditional router failed.
     #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]
     RouteFailed {
@@ -478,6 +524,19 @@ pub enum GraphRunError {
         "conditional router for node `{node_id}` selected undeclared target `{target}` at step {step}"
     )]
     InvalidRouteTarget {
+        node_id: NodePath,
+        target: NodePath,
+        step: usize,
+    },
+    /// A conditional fan-out router selected no target.
+    #[error("conditional fan-out router for node `{node_id}` selected no targets at step {step}")]
+    EmptyRouteTargets { node_id: NodePath, step: usize },
+    /// A conditional fan-out router selected the same target more than once.
+    #[error(
+        "conditional fan-out router for node `{node_id}` selected duplicate target `{target}` at \
+         step {step}"
+    )]
+    DuplicateRouteTarget {
         node_id: NodePath,
         target: NodePath,
         step: usize,

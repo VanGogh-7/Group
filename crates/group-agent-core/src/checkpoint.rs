@@ -777,6 +777,146 @@ where
     }
 }
 
+/// Centralized configuration for one read-only historical replay.
+///
+/// Replay always names an exact checkpoint and never selects or updates the
+/// thread's latest checkpoint. The configured checkpointer is used only for
+/// loading that source checkpoint.
+#[derive(Clone)]
+pub struct ReplayConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    thread_id: ThreadId,
+    checkpoint_id: CheckpointId,
+    checkpointer: Arc<dyn Checkpointer<T>>,
+    run_config: RunConfig,
+    event_config: EventConfig,
+    control: RunControl,
+    resume_value: Option<ResumeValue>,
+}
+
+pub(crate) struct ReplayParts<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub(crate) thread_id: ThreadId,
+    pub(crate) checkpoint_id: CheckpointId,
+    pub(crate) checkpointer: Arc<dyn Checkpointer<T>>,
+    pub(crate) run_config: RunConfig,
+    pub(crate) event_config: EventConfig,
+    pub(crate) control: RunControl,
+    pub(crate) resume_value: Option<ResumeValue>,
+}
+
+impl<T> ReplayConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    /// Creates a replay configuration for one exact historical checkpoint.
+    #[must_use]
+    pub fn new(
+        thread_id: impl Into<ThreadId>,
+        checkpoint_id: CheckpointId,
+        checkpointer: Arc<dyn Checkpointer<T>>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            checkpoint_id,
+            checkpointer,
+            run_config: RunConfig::default(),
+            event_config: EventConfig::default(),
+            control: RunControl::default(),
+            resume_value: None,
+        }
+    }
+
+    /// Sets the additional node budget for this replay call.
+    #[must_use]
+    pub fn with_run_config(mut self, config: RunConfig) -> Self {
+        self.run_config = config;
+        self
+    }
+
+    /// Sets event delivery and successful-report retention.
+    #[must_use]
+    pub fn with_event_config(mut self, config: EventConfig) -> Self {
+        self.event_config = config;
+        self
+    }
+
+    /// Sets cancellation and timeout controls.
+    #[must_use]
+    pub fn with_control(mut self, control: RunControl) -> Self {
+        self.control = control;
+        self
+    }
+
+    /// Supplies the typed value consumed by an interrupted checkpoint's node.
+    #[must_use]
+    pub fn with_resume_value<TValue>(mut self, value: TValue) -> Self
+    where
+        TValue: Send + Sync + 'static,
+    {
+        self.resume_value = Some(ResumeValue::new(value));
+        self
+    }
+
+    /// Supplies an already type-erased replay resume value.
+    #[must_use]
+    pub fn with_shared_resume_value(mut self, value: ResumeValue) -> Self {
+        self.resume_value = Some(value);
+        self
+    }
+
+    /// Returns whether a resume value has been configured.
+    #[must_use]
+    pub const fn has_resume_value(&self) -> bool {
+        self.resume_value.is_some()
+    }
+
+    /// Returns the source logical thread.
+    #[must_use]
+    pub const fn thread_id(&self) -> &ThreadId {
+        &self.thread_id
+    }
+
+    /// Returns the exact source checkpoint.
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> CheckpointId {
+        self.checkpoint_id
+    }
+
+    pub(crate) fn into_parts(self) -> ReplayParts<T> {
+        ReplayParts {
+            thread_id: self.thread_id,
+            checkpoint_id: self.checkpoint_id,
+            checkpointer: self.checkpointer,
+            run_config: self.run_config,
+            event_config: self.event_config,
+            control: self.control,
+            resume_value: self.resume_value,
+        }
+    }
+}
+
+impl<T> fmt::Debug for ReplayConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplayConfig")
+            .field("thread_id", &self.thread_id)
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("run_config", &self.run_config)
+            .field("event_config", &self.event_config)
+            .field("control", &self.control)
+            .field("has_resume_value", &self.resume_value.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Checkpoint options for one invocation.
 #[derive(Clone)]
 pub struct CheckpointConfig<T>

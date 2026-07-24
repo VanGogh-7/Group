@@ -5,8 +5,9 @@ use indexmap::IndexMap;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::Dfs;
 
-use crate::edge::{ConditionalEdge, FanOutEdge, FixedEdge, Router};
+use crate::edge::{ConditionalEdge, ConditionalFanOutEdge, FanOutEdge, FixedEdge};
 use crate::node::NodeKind;
+use crate::transition::CompiledTransition;
 use crate::{
     GraphBuildError, GraphCompileError, GraphPath, GraphState, GraphVersion, InterruptibleNode,
     Node, NodeId, NodePath, RouteError,
@@ -17,6 +18,7 @@ enum TopologyEdge {
     Fixed,
     FanOut,
     Conditional,
+    ConditionalFanOut,
 }
 
 struct FixedOutgoing {
@@ -31,6 +33,7 @@ where
     fixed_by_source: HashMap<NodeId, FixedOutgoing>,
     fan_out_by_source: HashMap<NodeId, &'a FanOutEdge>,
     conditional_by_source: HashMap<NodeId, &'a ConditionalEdge<S>>,
+    conditional_fan_out_by_source: HashMap<NodeId, &'a ConditionalFanOutEdge<S>>,
 }
 
 enum DeclaredItem<S>
@@ -59,6 +62,7 @@ where
     fixed_edges: Vec<FixedEdge>,
     fan_out_edges: Vec<FanOutEdge>,
     conditional_edges: Vec<ConditionalEdge<S>>,
+    conditional_fan_out_edges: Vec<ConditionalFanOutEdge<S>>,
     version: Option<GraphVersion>,
 }
 
@@ -74,6 +78,7 @@ where
             fixed_edges: Vec::new(),
             fan_out_edges: Vec::new(),
             conditional_edges: Vec::new(),
+            conditional_fan_out_edges: Vec::new(),
             version: None,
         }
     }
@@ -251,6 +256,56 @@ where
         Ok(self)
     }
 
+    /// Registers one synchronous conditional fan-out router and its target whitelist.
+    ///
+    /// The router runs after the source update commits and must select one or
+    /// more distinct declared targets. `END` may be selected beside executable
+    /// targets and exits only the source branch.
+    pub fn add_conditional_fan_out<I, T, F>(
+        &mut self,
+        source: impl Into<NodeId>,
+        allowed_targets: I,
+        router: F,
+    ) -> Result<&mut Self, GraphBuildError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<NodeId>,
+        F: Fn(&S) -> Result<Vec<NodeId>, RouteError> + Send + Sync + 'static,
+    {
+        let source = source.into();
+        if self
+            .conditional_fan_out_edges
+            .iter()
+            .any(|edge| edge.source == source)
+        {
+            return Err(GraphBuildError::MultipleConditionalFanOutRouters {
+                source_node: source,
+            });
+        }
+        let allowed_targets: Vec<NodeId> = allowed_targets.into_iter().map(Into::into).collect();
+        if allowed_targets.is_empty() {
+            return Err(GraphBuildError::EmptyConditionalFanOutTargets {
+                source_node: source,
+            });
+        }
+        let mut unique_targets = HashSet::new();
+        for target in &allowed_targets {
+            if !unique_targets.insert(target.clone()) {
+                return Err(GraphBuildError::DuplicateConditionalFanOutTarget {
+                    source_node: source,
+                    target: target.clone(),
+                });
+            }
+        }
+        self.conditional_fan_out_edges
+            .push(ConditionalFanOutEdge::new(
+                source,
+                allowed_targets,
+                Arc::new(router),
+            ));
+        Ok(self)
+    }
+
     /// Validates and freezes the graph for repeated execution.
     pub fn compile(&self) -> Result<CompiledGraph<S>, GraphCompileError> {
         let edges = self.aggregate_edges()?;
@@ -293,6 +348,15 @@ where
                 );
             }
         }
+        for edge in &self.conditional_fan_out_edges {
+            for target in &edge.allowed_targets {
+                topology.add_edge(
+                    topology_indices[&edge.source],
+                    topology_indices[target],
+                    TopologyEdge::ConditionalFanOut,
+                );
+            }
+        }
         self.validate_reachability(&topology, &topology_indices, start_index, end_index, &edges)?;
         self.validate_subgraph_frontiers(&edges)?;
 
@@ -316,7 +380,7 @@ where
         }
 
         for (item_id, item) in &self.items {
-            let transition = self.compile_transition(item_id, &edges, &item_entries);
+            let transition = self.compile_transition(item_id, &edges, &item_entries)?;
             match item {
                 DeclaredItem::Node(kind) => {
                     let path = NodePath::new(&root_path, item_id.clone());
@@ -338,7 +402,7 @@ where
                         item_entries[item_id],
                         CompiledItem::EnterSubgraph {
                             graph_path: graph_path.clone(),
-                            target: child_entry.or(Some(exit)),
+                            transition: CompiledTransition::Fixed(child_entry.or(Some(exit))),
                         },
                     );
                     builder.set(
@@ -376,17 +440,15 @@ where
         item_id: &NodeId,
         edges: &EdgeAggregation<'_, S>,
         item_entries: &IndexMap<NodeId, NodeIndex>,
-    ) -> CompiledTransition<S> {
+    ) -> Result<CompiledTransition<S>, GraphCompileError> {
         let target = |node_id: &NodeId| (!node_id.is_end()).then(|| item_entries[node_id]);
-        if let Some(outgoing) = edges.fixed_by_source.get(item_id) {
+        let transition = if let Some(outgoing) = edges.fixed_by_source.get(item_id) {
             CompiledTransition::Fixed(target(&outgoing.successor))
         } else if let Some(edge) = edges.fan_out_by_source.get(item_id) {
-            CompiledTransition::FanOut(edge.targets.iter().map(target).collect())
-        } else {
-            let edge = edges
-                .conditional_by_source
-                .get(item_id)
-                .expect("validated item has one transition");
+            let mut targets = edge.targets.iter().filter_map(target).collect::<Vec<_>>();
+            targets.sort_unstable_by_key(|index| index.index());
+            CompiledTransition::StaticFanOut(targets)
+        } else if let Some(edge) = edges.conditional_by_source.get(item_id) {
             CompiledTransition::Conditional {
                 router: Arc::clone(&edge.router),
                 allowed_targets: edge
@@ -395,7 +457,21 @@ where
                     .map(|node_id| (node_id.clone(), target(node_id)))
                     .collect(),
             }
-        }
+        } else if let Some(edge) = edges.conditional_fan_out_by_source.get(item_id) {
+            CompiledTransition::ConditionalFanOut {
+                router: Arc::clone(&edge.router),
+                allowed_targets: edge
+                    .allowed_targets
+                    .iter()
+                    .map(|node_id| (node_id.clone(), target(node_id)))
+                    .collect(),
+            }
+        } else {
+            return Err(GraphCompileError::MissingOutgoingEdge {
+                node_id: item_id.clone(),
+            });
+        };
+        Ok(transition)
     }
 
     fn aggregate_edges(&self) -> Result<EdgeAggregation<'_, S>, GraphCompileError> {
@@ -487,10 +563,50 @@ where
             fan_out_by_source.insert(edge.source.clone(), edge);
         }
 
+        let mut conditional_fan_out_by_source =
+            HashMap::with_capacity(self.conditional_fan_out_edges.len());
+        for edge in &self.conditional_fan_out_edges {
+            if edge.source.is_start() {
+                return Err(GraphCompileError::StartHasConditionalFanOut);
+            }
+            if edge.source.is_end() {
+                return Err(GraphCompileError::EndHasConditionalFanOut);
+            }
+            if !self.items.contains_key(&edge.source) {
+                return Err(GraphCompileError::UnknownConditionalFanOutSource {
+                    source_node: edge.source.clone(),
+                });
+            }
+            for target in &edge.allowed_targets {
+                if target.is_start() {
+                    return Err(GraphCompileError::StartHasIncoming {
+                        from: edge.source.clone(),
+                    });
+                }
+                if target.is_end() {
+                    continue;
+                }
+                let Some(item) = self.items.get(target) else {
+                    return Err(GraphCompileError::UnknownConditionalFanOutTarget {
+                        source_node: edge.source.clone(),
+                        target: target.clone(),
+                    });
+                };
+                if item.is_subgraph() {
+                    return Err(GraphCompileError::ConditionalFanOutTargetsSubgraph {
+                        source_node: edge.source.clone(),
+                        target: target.clone(),
+                    });
+                }
+            }
+            conditional_fan_out_by_source.insert(edge.source.clone(), edge);
+        }
+
         Ok(EdgeAggregation {
             fixed_by_source,
             fan_out_by_source,
             conditional_by_source,
+            conditional_fan_out_by_source,
         })
     }
 
@@ -522,7 +638,8 @@ where
             }
             let kind_count = usize::from(fixed_count == 1)
                 + usize::from(edges.fan_out_by_source.contains_key(item_id))
-                + usize::from(edges.conditional_by_source.contains_key(item_id));
+                + usize::from(edges.conditional_by_source.contains_key(item_id))
+                + usize::from(edges.conditional_fan_out_by_source.contains_key(item_id));
             if kind_count > 1 {
                 return Err(GraphCompileError::MixedOutgoingEdgeKinds {
                     node_id: item_id.clone(),
@@ -556,6 +673,7 @@ where
             if !edges.fixed_by_source.contains_key(item_id)
                 && !edges.fan_out_by_source.contains_key(item_id)
                 && !edges.conditional_by_source.contains_key(item_id)
+                && !edges.conditional_fan_out_by_source.contains_key(item_id)
             {
                 return Err(GraphCompileError::MissingOutgoingEdge {
                     node_id: item_id.clone(),
@@ -572,7 +690,9 @@ where
         &self,
         edges: &EdgeAggregation<'_, S>,
     ) -> Result<(), GraphCompileError> {
-        if !self.items.values().any(DeclaredItem::is_subgraph) || edges.fan_out_by_source.is_empty()
+        if !self.items.values().any(DeclaredItem::is_subgraph)
+            || (edges.fan_out_by_source.is_empty()
+                && edges.conditional_fan_out_by_source.is_empty())
         {
             return Ok(());
         }
@@ -621,6 +741,9 @@ where
         for fan_out in &self.fan_out_edges {
             enqueue_frontier(fan_out.targets.clone(), &mut queued, &mut work)?;
         }
+        for fan_out in &self.conditional_fan_out_edges {
+            enqueue_frontier(fan_out.allowed_targets.clone(), &mut queued, &mut work)?;
+        }
 
         while let Some((left, right)) = work.pop_front() {
             let left_alternatives = self.transition_alternatives(&left, edges);
@@ -668,6 +791,15 @@ where
                     .cloned()
                     .collect(),
             ]
+        } else if let Some(fan_out) = edges.conditional_fan_out_by_source.get(source) {
+            vec![
+                fan_out
+                    .allowed_targets
+                    .iter()
+                    .filter(|target| !target.is_end())
+                    .cloned()
+                    .collect(),
+            ]
         } else {
             edges.conditional_by_source.get(source).map_or_else(
                 || vec![Vec::new()],
@@ -692,41 +824,6 @@ where
     }
 }
 
-pub(crate) enum CompiledTransition<S>
-where
-    S: GraphState,
-{
-    Fixed(Option<NodeIndex>),
-    FanOut(Vec<Option<NodeIndex>>),
-    Conditional {
-        router: Router<S>,
-        allowed_targets: IndexMap<NodeId, Option<NodeIndex>>,
-    },
-}
-
-impl<S> CompiledTransition<S>
-where
-    S: GraphState,
-{
-    fn remap(&self, mapping: &[NodeIndex]) -> Self {
-        let target = |target: Option<NodeIndex>| target.map(|index| mapping[index.index()]);
-        match self {
-            Self::Fixed(index) => Self::Fixed(target(*index)),
-            Self::FanOut(indices) => Self::FanOut(indices.iter().copied().map(target).collect()),
-            Self::Conditional {
-                router,
-                allowed_targets,
-            } => Self::Conditional {
-                router: Arc::clone(router),
-                allowed_targets: allowed_targets
-                    .iter()
-                    .map(|(node_id, index)| (node_id.clone(), target(*index)))
-                    .collect(),
-            },
-        }
-    }
-}
-
 pub(crate) struct CompiledNode<S>
 where
     S: GraphState,
@@ -744,7 +841,7 @@ where
     Node(CompiledNode<S>),
     EnterSubgraph {
         graph_path: GraphPath,
-        target: Option<NodeIndex>,
+        transition: CompiledTransition<S>,
     },
     ExitSubgraph {
         graph_path: GraphPath,
@@ -830,9 +927,12 @@ where
                     self.insert_node(mapping[old_index], compiled)?;
                     continue;
                 }
-                CompiledItem::EnterSubgraph { graph_path, target } => CompiledItem::EnterSubgraph {
+                CompiledItem::EnterSubgraph {
+                    graph_path,
+                    transition,
+                } => CompiledItem::EnterSubgraph {
                     graph_path: graph_path.prefixed(prefix),
-                    target: target.map(|index| mapping[index.index()]),
+                    transition: transition.remap(&mapping),
                 },
                 CompiledItem::ExitSubgraph {
                     graph_path,
