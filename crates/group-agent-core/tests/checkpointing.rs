@@ -167,7 +167,7 @@ async fn invoke_checkpointed(
     graph: &CompiledGraph<TestState>,
     initial_state: TestState,
     config: CheckpointConfig<TestSnapshot>,
-) -> Result<group_agent_core::RunReport<TestState>, GraphRunError> {
+) -> Result<group_agent_core::ExecutionOutcome<TestState>, GraphRunError> {
     graph
         .invoke_with_checkpoint(
             initial_state,

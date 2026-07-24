@@ -6,8 +6,10 @@ use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::Dfs;
 
 use crate::edge::{ConditionalEdge, FanOutEdge, FixedEdge, Router};
+use crate::node::{RuntimeNode, SuspendingNode, UpdateNode};
 use crate::{
-    GraphBuildError, GraphCompileError, GraphState, GraphVersion, Node, NodeId, RouteError,
+    GraphBuildError, GraphCompileError, GraphState, GraphVersion, InterruptibleNode, Node, NodeId,
+    RouteError,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +38,7 @@ pub struct StateGraph<S>
 where
     S: GraphState,
 {
-    nodes: IndexMap<NodeId, Arc<dyn Node<S>>>,
+    nodes: IndexMap<NodeId, Arc<dyn RuntimeNode<S>>>,
     fixed_edges: Vec<FixedEdge>,
     fan_out_edges: Vec<FanOutEdge>,
     conditional_edges: Vec<ConditionalEdge<S>>,
@@ -89,7 +91,28 @@ where
             return Err(GraphBuildError::DuplicateNode { node_id });
         }
 
-        self.nodes.insert(node_id, Arc::new(node));
+        self.nodes.insert(node_id, Arc::new(UpdateNode(node)));
+        Ok(self)
+    }
+
+    /// Registers a graph node that may return an update or request suspension.
+    pub fn add_interruptible_node<N>(
+        &mut self,
+        node_id: impl Into<NodeId>,
+        node: N,
+    ) -> Result<&mut Self, GraphBuildError>
+    where
+        N: InterruptibleNode<S> + 'static,
+    {
+        let node_id = node_id.into();
+        if node_id.is_reserved() {
+            return Err(GraphBuildError::ReservedNodeId { node_id });
+        }
+        if self.nodes.contains_key(&node_id) {
+            return Err(GraphBuildError::DuplicateNode { node_id });
+        }
+
+        self.nodes.insert(node_id, Arc::new(SuspendingNode(node)));
         Ok(self)
     }
 
@@ -506,7 +529,7 @@ where
     S: GraphState,
 {
     pub(crate) id: NodeId,
-    pub(crate) node: Arc<dyn Node<S>>,
+    pub(crate) node: Arc<dyn RuntimeNode<S>>,
     pub(crate) transition: CompiledTransition<S>,
 }
 

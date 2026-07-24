@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    CheckpointerError, EventConfig, GraphState, NodeId, RunConfig, RunControl, RunId, SnapshotError,
+    CheckpointInterrupt, CheckpointerError, EventConfig, GraphState, NodeId, ResumeValue,
+    RunConfig, RunControl, RunId, SnapshotError,
 };
 
 static NEXT_CHECKPOINT_ID: AtomicU64 = AtomicU64::new(1);
@@ -136,18 +137,20 @@ pub trait CheckpointState: GraphState {
         Self: Sized;
 }
 
-/// Controls when a checkpoint-enabled invocation saves.
+/// Controls committed-boundary saves.
+///
+/// Interrupted checkpoints are mandatory and are saved under either policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CheckpointPolicy {
     /// Save after every successful super-step.
     #[default]
     EverySuperstep,
-    /// Save only the completed checkpoint at the end of the run.
+    /// Save only the completed checkpoint, plus any mandatory interrupt.
     FinalOnly,
 }
 
-/// Immutable checkpoint data returned by a [`Checkpointer`].
+/// Immutable completed, resumable, or interrupted checkpoint data.
 #[derive(Clone, Debug)]
 pub struct Checkpoint<T>
 where
@@ -163,6 +166,7 @@ where
     snapshot: Arc<T>,
     next_frontier: Vec<NodeId>,
     completed: bool,
+    interrupt: Option<CheckpointInterrupt>,
 }
 
 impl<T> Checkpoint<T>
@@ -233,9 +237,22 @@ where
     pub const fn completed(&self) -> bool {
         self.completed
     }
+
+    /// Returns suspension metadata when this is an interrupted checkpoint.
+    #[must_use]
+    pub const fn interrupt(&self) -> Option<&CheckpointInterrupt> {
+        self.interrupt.as_ref()
+    }
+
+    /// Returns whether this checkpoint represents a node suspension.
+    #[must_use]
+    pub const fn interrupted(&self) -> bool {
+        self.interrupt.is_some()
+    }
 }
 
-/// A checkpoint write prepared by the Runtime after a successful super-step.
+/// A checkpoint write prepared by the Runtime at a committed or interrupt
+/// boundary.
 ///
 /// The identifier is an idempotency key for this write. `expected_parent`
 /// names the state lineage on which the Runtime executed. A checkpointer must
@@ -256,6 +273,7 @@ where
     snapshot: Arc<T>,
     next_frontier: Vec<NodeId>,
     completed: bool,
+    interrupt: Option<CheckpointInterrupt>,
 }
 
 pub(crate) struct CheckpointLineage {
@@ -295,6 +313,7 @@ where
         snapshot: Arc<T>,
         next_frontier: Vec<NodeId>,
         completed: bool,
+        interrupt: Option<CheckpointInterrupt>,
     ) -> Self {
         Self {
             checkpoint_id: lineage.checkpoint_id,
@@ -307,6 +326,7 @@ where
             snapshot,
             next_frontier,
             completed,
+            interrupt,
         }
     }
 
@@ -373,6 +393,12 @@ where
         self.completed
     }
 
+    /// Returns suspension metadata when this request saves an interrupt.
+    #[must_use]
+    pub const fn interrupt(&self) -> Option<&CheckpointInterrupt> {
+        self.interrupt.as_ref()
+    }
+
     /// Finalizes this request after the store has accepted its CAS condition.
     #[must_use]
     pub fn into_checkpoint(self) -> Checkpoint<T> {
@@ -387,6 +413,7 @@ where
             snapshot: self.snapshot,
             next_frontier: self.next_frontier,
             completed: self.completed,
+            interrupt: self.interrupt,
         }
     }
 }
@@ -424,7 +451,7 @@ where
     /// exact replay, including the same snapshot `Arc`, should return the
     /// original result even after the thread latest has advanced. Reusing the
     /// identifier with different lineage, boundary, frontier, completion,
-    /// version, or snapshot metadata must return
+    /// version, interrupt, or snapshot metadata must return
     /// [`CheckpointWriteError::IdempotencyConflict`].
     async fn save(
         &self,
@@ -481,6 +508,21 @@ where
     run_config: RunConfig,
     event_config: EventConfig,
     control: RunControl,
+    resume_value: Option<ResumeValue>,
+}
+
+pub(crate) struct ResumeParts<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub(crate) thread_id: ThreadId,
+    pub(crate) checkpointer: Arc<dyn Checkpointer<T>>,
+    pub(crate) target: ResumeTarget,
+    pub(crate) checkpoint_policy: CheckpointPolicy,
+    pub(crate) run_config: RunConfig,
+    pub(crate) event_config: EventConfig,
+    pub(crate) control: RunControl,
+    pub(crate) resume_value: Option<ResumeValue>,
 }
 
 impl<T> ResumeConfig<T>
@@ -498,6 +540,7 @@ where
             run_config: RunConfig::default(),
             event_config: EventConfig::default(),
             control: RunControl::default(),
+            resume_value: None,
         }
     }
 
@@ -536,6 +579,29 @@ where
         self
     }
 
+    /// Supplies the typed value consumed by an interrupted checkpoint's node.
+    #[must_use]
+    pub fn with_resume_value<TValue>(mut self, value: TValue) -> Self
+    where
+        TValue: Send + Sync + 'static,
+    {
+        self.resume_value = Some(ResumeValue::new(value));
+        self
+    }
+
+    /// Supplies an already type-erased resume value.
+    #[must_use]
+    pub fn with_shared_resume_value(mut self, value: ResumeValue) -> Self {
+        self.resume_value = Some(value);
+        self
+    }
+
+    /// Returns whether a resume value has been configured.
+    #[must_use]
+    pub const fn has_resume_value(&self) -> bool {
+        self.resume_value.is_some()
+    }
+
     /// Returns the logical thread to resume.
     #[must_use]
     pub const fn thread_id(&self) -> &ThreadId {
@@ -548,26 +614,17 @@ where
         self.target
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ThreadId,
-        Arc<dyn Checkpointer<T>>,
-        ResumeTarget,
-        CheckpointPolicy,
-        RunConfig,
-        EventConfig,
-        RunControl,
-    ) {
-        (
-            self.thread_id,
-            self.checkpointer,
-            self.target,
-            self.checkpoint_policy,
-            self.run_config,
-            self.event_config,
-            self.control,
-        )
+    pub(crate) fn into_parts(self) -> ResumeParts<T> {
+        ResumeParts {
+            thread_id: self.thread_id,
+            checkpointer: self.checkpointer,
+            target: self.target,
+            checkpoint_policy: self.checkpoint_policy,
+            run_config: self.run_config,
+            event_config: self.event_config,
+            control: self.control,
+            resume_value: self.resume_value,
+        }
     }
 }
 
@@ -584,6 +641,7 @@ where
             .field("run_config", &self.run_config)
             .field("event_config", &self.event_config)
             .field("control", &self.control)
+            .field("has_resume_value", &self.resume_value.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -823,6 +881,11 @@ where
         && checkpoint.step == request.step
         && checkpoint.next_frontier == request.next_frontier
         && checkpoint.completed == request.completed
+        && match (&checkpoint.interrupt, &request.interrupt) {
+            (Some(checkpoint), Some(request)) => checkpoint.matches(request),
+            (None, None) => true,
+            _ => false,
+        }
         && Arc::ptr_eq(&checkpoint.snapshot, &request.snapshot)
 }
 
@@ -854,6 +917,7 @@ mod tests {
                 vec![NodeId::from("next")]
             },
             step == 2,
+            None,
         )
     }
 

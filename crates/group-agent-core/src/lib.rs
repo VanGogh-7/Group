@@ -11,6 +11,7 @@ mod edge;
 mod error;
 mod event;
 mod graph;
+mod interrupt;
 mod node;
 mod runtime;
 mod state;
@@ -28,6 +29,10 @@ pub use error::{
 };
 pub use event::{EventConfig, EventRetention, EventSink, GraphEvent, RunFailure, RunId};
 pub use graph::{CompiledGraph, StateGraph};
-pub use node::Node;
+pub use interrupt::{
+    CheckpointInterrupt, ExecutionOutcome, InterruptId, InterruptPayload, InterruptReport,
+    InterruptRequest, NodeOutcome, ResumeValue,
+};
+pub use node::{InterruptibleNode, Node};
 pub use runtime::RunReport;
 pub use state::{GraphState, NodeUpdate};

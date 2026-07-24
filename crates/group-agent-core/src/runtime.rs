@@ -9,16 +9,17 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::checkpoint::CheckpointLineage;
+use crate::checkpoint::{CheckpointLineage, ResumeParts};
 use crate::graph::{CompiledNode, CompiledTransition};
 use crate::{
-    Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointPolicy,
-    CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph, EventConfig,
-    EventRetention, GraphEvent, GraphRunError, GraphState, NodeContext, NodeId, NodeUpdate,
-    ResumeConfig, ResumeTarget, RunConfig, RunControl, RunFailure, RunId, ThreadId,
+    Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointInterrupt,
+    CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph,
+    EventConfig, EventRetention, ExecutionOutcome, GraphEvent, GraphRunError, GraphState,
+    InterruptReport, NodeContext, NodeId, NodeOutcome, NodeUpdate, ResumeConfig, ResumeTarget,
+    ResumeValue, RunConfig, RunControl, RunFailure, RunId, ThreadId,
 };
 
-/// The outcome of a successful graph invocation.
+/// The completed report produced when a graph reaches an empty frontier.
 #[derive(Clone, Debug)]
 pub struct RunReport<S>
 where
@@ -84,6 +85,8 @@ where
     frontier: Vec<NodeIndex>,
     superstep: usize,
     save_empty_checkpoint: bool,
+    resume_node: Option<NodeIndex>,
+    resume_value: Option<ResumeValue>,
 }
 
 impl<S> CompiledGraph<S>
@@ -125,14 +128,21 @@ where
         event_config: EventConfig,
         control: RunControl,
     ) -> Result<RunReport<S>, GraphRunError> {
-        self.invoke_internal(
-            initial_state,
-            config,
-            event_config,
-            control,
-            DisabledCheckpoint,
-        )
-        .await
+        let outcome = self
+            .invoke_internal(
+                initial_state,
+                config,
+                event_config,
+                control,
+                DisabledCheckpoint,
+            )
+            .await?;
+        match outcome {
+            ExecutionOutcome::Completed(report) => Ok(report),
+            ExecutionOutcome::Interrupted(_) => {
+                unreachable!("checkpoint-disabled invocation cannot return an interrupt outcome")
+            }
+        }
     }
 
     async fn invoke_internal<C>(
@@ -142,7 +152,7 @@ where
         event_config: EventConfig,
         control: RunControl,
         checkpoints: C,
-    ) -> Result<RunReport<S>, GraphRunError>
+    ) -> Result<ExecutionOutcome<S>, GraphRunError>
     where
         C: RuntimeCheckpoint<S>,
     {
@@ -180,6 +190,8 @@ where
                 frontier,
                 superstep: 0,
                 save_empty_checkpoint: true,
+                resume_node: None,
+                resume_value: None,
             },
             config,
             control,
@@ -194,7 +206,7 @@ where
         config: RunConfig,
         control: ActiveControl,
         mut checkpoints: C,
-    ) -> Result<RunReport<S>, GraphRunError>
+    ) -> Result<ExecutionOutcome<S>, GraphRunError>
     where
         C: RuntimeCheckpoint<S>,
     {
@@ -207,6 +219,8 @@ where
             mut frontier,
             mut superstep,
             save_empty_checkpoint,
+            mut resume_node,
+            mut resume_value,
         } = execution;
         let mut next_frontier = Vec::new();
         let absolute_step_limit = steps.saturating_add(config.max_steps);
@@ -216,7 +230,11 @@ where
                 &control,
                 run_id,
                 steps,
-                checkpoints.save(run_id, superstep, steps, &state, Vec::new(), true),
+                checkpoints.save(
+                    run_id,
+                    &state,
+                    CheckpointBoundary::new(superstep, steps, Vec::new(), true, None),
+                ),
             )
             .await;
             let saved = match save_result {
@@ -285,6 +303,9 @@ where
                     compiled_node.id.clone(),
                     control.cancellation_token.clone(),
                     control.run_deadline,
+                    (resume_node == Some(frontier[0]))
+                        .then(|| resume_value.clone())
+                        .flatten(),
                 );
                 events.emit(|| GraphEvent::NodeStarted {
                     run_id,
@@ -302,8 +323,7 @@ where
                 ) {
                     return events.fail(error);
                 }
-                steps = step;
-                let update = match execute_node(
+                let outcome = match execute_node(
                     &control,
                     run_id,
                     compiled_node,
@@ -313,8 +333,90 @@ where
                 )
                 .await
                 {
-                    Ok(update) => update,
+                    Ok(outcome) => outcome,
                     Err(error) => return events.fail(error),
+                };
+                let update = match outcome {
+                    NodeOutcome::Update(update) => update,
+                    NodeOutcome::Interrupt(request) => {
+                        let interrupt = request.into_checkpoint(compiled_node.id.clone());
+                        events.emit(|| GraphEvent::NodeInterrupted {
+                            run_id,
+                            interrupt_id: interrupt.id(),
+                            node_id: compiled_node.id.clone(),
+                            step,
+                        });
+                        if !checkpoints.is_enabled() {
+                            return events.fail(GraphRunError::InterruptRequiresCheckpoint {
+                                interrupt_id: interrupt.id(),
+                                node_id: compiled_node.id.clone(),
+                                step,
+                            });
+                        }
+
+                        let committed_superstep = superstep - 1;
+                        let save_result = await_run_boundary(
+                            &control,
+                            run_id,
+                            step_base,
+                            checkpoints.save(
+                                run_id,
+                                &state,
+                                CheckpointBoundary::new(
+                                    committed_superstep,
+                                    step_base,
+                                    vec![compiled_node.id.clone()],
+                                    false,
+                                    Some(interrupt.clone()),
+                                ),
+                            ),
+                        )
+                        .await;
+                        let saved = match save_result {
+                            Ok(saved) => saved,
+                            Err(error) => return events.fail(error),
+                        };
+                        events.emit(|| GraphEvent::CheckpointSaved {
+                            run_id,
+                            checkpoint_id: saved.id,
+                            thread_id: saved.thread_id.clone(),
+                            superstep: committed_superstep,
+                            step: step_base,
+                            completed: false,
+                        });
+                        if let Some(error) =
+                            control.check(run_id, None, step_base, control.deadline(None))
+                        {
+                            return events.fail(error);
+                        }
+                        events.emit(|| GraphEvent::RunInterrupted {
+                            run_id,
+                            interrupt_id: interrupt.id(),
+                            checkpoint_id: saved.id,
+                            thread_id: saved.thread_id.clone(),
+                            node_id: compiled_node.id.clone(),
+                            superstep: committed_superstep,
+                            step: step_base,
+                        });
+                        debug!(
+                            %run_id,
+                            node_id = %compiled_node.id,
+                            interrupt_id = %interrupt.id(),
+                            step = step_base,
+                            "graph run interrupted"
+                        );
+                        return Ok(ExecutionOutcome::Interrupted(InterruptReport {
+                            run_id,
+                            state,
+                            steps: step_base,
+                            superstep: committed_superstep,
+                            visited_nodes,
+                            events: events.into_retained(),
+                            checkpoint_id: saved.id,
+                            thread_id: saved.thread_id,
+                            interrupt,
+                        }));
+                    }
                 };
                 events.emit(|| GraphEvent::NodeCompleted {
                     run_id,
@@ -335,6 +437,7 @@ where
                 {
                     return events.fail(error);
                 }
+                steps = step;
                 if let Err(source) = state.apply(update) {
                     return events.fail(GraphRunError::StateUpdateFailed {
                         node_id: first_node.clone(),
@@ -342,6 +445,8 @@ where
                         source,
                     });
                 }
+                resume_node = None;
+                resume_value = None;
             } else {
                 let mut contexts = Vec::with_capacity(frontier.len());
                 let mut node_deadlines = Vec::with_capacity(frontier.len());
@@ -363,6 +468,9 @@ where
                         compiled_node.id.clone(),
                         control.cancellation_token.clone(),
                         control.run_deadline,
+                        (resume_node == Some(index))
+                            .then(|| resume_value.clone())
+                            .flatten(),
                     );
                     events.emit(|| GraphEvent::NodeStarted {
                         run_id,
@@ -414,9 +522,26 @@ where
                 while let Some((offset, result)) = pending_nodes.next().await {
                     let compiled_node = self.node_at(frontier[offset]);
                     let step = step_base + offset + 1;
-                    let update = match result {
-                        Ok(update) => update,
+                    let outcome = match result {
+                        Ok(outcome) => outcome,
                         Err(error) => return events.fail(error),
+                    };
+                    let update = match outcome {
+                        NodeOutcome::Update(update) => update,
+                        NodeOutcome::Interrupt(request) => {
+                            let interrupt = request.into_checkpoint(compiled_node.id.clone());
+                            events.emit(|| GraphEvent::NodeInterrupted {
+                                run_id,
+                                interrupt_id: interrupt.id(),
+                                node_id: compiled_node.id.clone(),
+                                step,
+                            });
+                            return events.fail(GraphRunError::UnsupportedParallelInterrupt {
+                                interrupt_id: interrupt.id(),
+                                node_id: compiled_node.id.clone(),
+                                step,
+                            });
+                        }
                     };
                     events.emit(|| GraphEvent::NodeCompleted {
                         run_id,
@@ -462,6 +587,8 @@ where
                         source,
                     });
                 }
+                resume_node = None;
+                resume_value = None;
             }
 
             for (offset, index) in frontier.iter().copied().enumerate() {
@@ -554,7 +681,11 @@ where
                     &control,
                     run_id,
                     steps,
-                    checkpoints.save(run_id, superstep, steps, &state, next_node_ids, completed),
+                    checkpoints.save(
+                        run_id,
+                        &state,
+                        CheckpointBoundary::new(superstep, steps, next_node_ids, completed, None),
+                    ),
                 )
                 .await;
                 let saved = match save_result {
@@ -591,13 +722,13 @@ where
         events.emit(|| GraphEvent::RunCompleted { run_id, steps });
         debug!(%run_id, steps, "graph run completed");
 
-        Ok(RunReport {
+        Ok(ExecutionOutcome::Completed(RunReport {
             run_id,
             final_state: state,
             steps,
             visited_nodes,
             events: events.into_retained(),
-        })
+        }))
     }
 }
 
@@ -605,21 +736,22 @@ impl<S> CompiledGraph<S>
 where
     S: CheckpointState,
 {
-    /// Restores a checkpoint and continues its latest state lineage.
+    /// Restores a checkpoint and either completes or saves another interrupt.
     pub async fn resume(
         &self,
         resume_config: ResumeConfig<S::Snapshot>,
-    ) -> Result<RunReport<S>, GraphRunError> {
+    ) -> Result<ExecutionOutcome<S>, GraphRunError> {
         let invocation_started = Instant::now();
-        let (
+        let ResumeParts {
             thread_id,
             checkpointer,
             target,
             checkpoint_policy,
             run_config,
             event_config,
-            run_control,
-        ) = resume_config.into_parts();
+            control: run_control,
+            resume_value,
+        } = resume_config.into_parts();
         let run_id = RunId::next();
         let control = ActiveControl::new(run_control, invocation_started);
         let mut events = EventEmitter::new(run_id, &event_config);
@@ -713,6 +845,28 @@ where
                 });
             }
         };
+        let (resume_node, resume_value) = match (checkpoint.interrupt(), resume_value) {
+            (Some(_), Some(value)) => (frontier.first().copied(), Some(value)),
+            (Some(interrupt), None) => {
+                return events.fail(GraphRunError::MissingResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: checkpoint.id(),
+                    interrupt_id: interrupt.id(),
+                    node_id: interrupt.node_id().clone(),
+                    step: checkpoint_step,
+                });
+            }
+            (None, Some(_)) => {
+                return events.fail(GraphRunError::UnexpectedResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: checkpoint.id(),
+                    step: checkpoint_step,
+                });
+            }
+            (None, None) => (None, None),
+        };
 
         if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
             return events.fail(error);
@@ -754,6 +908,8 @@ where
                 frontier,
                 superstep: checkpoint.superstep(),
                 save_empty_checkpoint: false,
+                resume_node,
+                resume_value,
             },
             run_config,
             control,
@@ -762,7 +918,7 @@ where
         .await
     }
 
-    /// Invokes the graph with explicit execution and checkpoint configuration.
+    /// Invokes with checkpointing and returns completion or saved suspension.
     pub async fn invoke_with_checkpoint(
         &self,
         initial_state: S,
@@ -770,7 +926,7 @@ where
         event_config: EventConfig,
         control: RunControl,
         checkpoint_config: CheckpointConfig<S::Snapshot>,
-    ) -> Result<RunReport<S>, GraphRunError> {
+    ) -> Result<ExecutionOutcome<S>, GraphRunError> {
         self.invoke_internal(
             initial_state,
             config,
@@ -804,6 +960,18 @@ where
         if !checkpoint.completed() && checkpoint.next_frontier().is_empty() {
             return Err(CheckpointIncompatibility::IncompleteWithoutFrontier);
         }
+        if checkpoint.completed() && checkpoint.interrupted() {
+            return Err(CheckpointIncompatibility::CompletedInterrupt);
+        }
+        if let Some(interrupt) = checkpoint.interrupt() {
+            let frontier = checkpoint.next_frontier();
+            if frontier.len() != 1 || frontier.first() != Some(interrupt.node_id()) {
+                return Err(CheckpointIncompatibility::InvalidInterruptFrontier {
+                    interrupt_node: interrupt.node_id().clone(),
+                    frontier: frontier.to_vec(),
+                });
+            }
+        }
         checkpoint
             .next_frontier()
             .iter()
@@ -829,21 +997,46 @@ struct SavedCheckpoint {
     thread_id: ThreadId,
 }
 
+struct CheckpointBoundary {
+    superstep: usize,
+    step: usize,
+    next_frontier: Vec<NodeId>,
+    completed: bool,
+    interrupt: Option<CheckpointInterrupt>,
+}
+
+impl CheckpointBoundary {
+    fn new(
+        superstep: usize,
+        step: usize,
+        next_frontier: Vec<NodeId>,
+        completed: bool,
+        interrupt: Option<CheckpointInterrupt>,
+    ) -> Self {
+        Self {
+            superstep,
+            step,
+            next_frontier,
+            completed,
+            interrupt,
+        }
+    }
+}
+
 #[async_trait]
 trait RuntimeCheckpoint<S>: Send
 where
     S: GraphState,
 {
+    fn is_enabled(&self) -> bool;
+
     fn should_save(&self, completed: bool) -> bool;
 
     async fn save(
         &mut self,
         run_id: RunId,
-        superstep: usize,
-        step: usize,
         state: &S,
-        next_frontier: Vec<NodeId>,
-        completed: bool,
+        boundary: CheckpointBoundary,
     ) -> Result<SavedCheckpoint, GraphRunError>;
 }
 
@@ -854,6 +1047,10 @@ impl<S> RuntimeCheckpoint<S> for DisabledCheckpoint
 where
     S: GraphState,
 {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
     fn should_save(&self, _completed: bool) -> bool {
         false
     }
@@ -861,11 +1058,8 @@ where
     async fn save(
         &mut self,
         _run_id: RunId,
-        _superstep: usize,
-        _step: usize,
         _state: &S,
-        _next_frontier: Vec<NodeId>,
-        _completed: bool,
+        _boundary: CheckpointBoundary,
     ) -> Result<SavedCheckpoint, GraphRunError> {
         unreachable!("disabled checkpointing never enters the storage path")
     }
@@ -902,6 +1096,10 @@ impl<S> RuntimeCheckpoint<S> for EnabledCheckpoint<S>
 where
     S: CheckpointState,
 {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     fn should_save(&self, completed: bool) -> bool {
         self.config.policy() == CheckpointPolicy::EverySuperstep || completed
     }
@@ -909,12 +1107,16 @@ where
     async fn save(
         &mut self,
         run_id: RunId,
-        superstep: usize,
-        step: usize,
         state: &S,
-        next_frontier: Vec<NodeId>,
-        completed: bool,
+        boundary: CheckpointBoundary,
     ) -> Result<SavedCheckpoint, GraphRunError> {
+        let CheckpointBoundary {
+            superstep,
+            step,
+            next_frontier,
+            completed,
+            interrupt,
+        } = boundary;
         let thread_id = self.config.thread_id().clone();
         let snapshot =
             state
@@ -940,6 +1142,7 @@ where
             snapshot,
             next_frontier,
             completed,
+            interrupt,
         );
         let checkpoint = self
             .config
@@ -990,7 +1193,7 @@ async fn execute_node<S>(
     state: &S,
     context: &NodeContext,
     node_deadline: Option<Instant>,
-) -> Result<S::Update, GraphRunError>
+) -> Result<NodeOutcome<S::Update>, GraphRunError>
 where
     S: GraphState,
 {
@@ -1387,6 +1590,48 @@ impl From<&GraphRunError> for RunFailure {
                 superstep: *superstep,
                 step: *step,
             },
+            GraphRunError::InterruptRequiresCheckpoint {
+                interrupt_id,
+                node_id,
+                step,
+            } => Self::InterruptRequiresCheckpoint {
+                interrupt_id: *interrupt_id,
+                node_id: node_id.clone(),
+                step: *step,
+            },
+            GraphRunError::UnsupportedParallelInterrupt {
+                interrupt_id,
+                node_id,
+                step,
+            } => Self::UnsupportedParallelInterrupt {
+                interrupt_id: *interrupt_id,
+                node_id: node_id.clone(),
+                step: *step,
+            },
+            GraphRunError::MissingResumeValue {
+                thread_id,
+                checkpoint_id,
+                interrupt_id,
+                node_id,
+                step,
+                ..
+            } => Self::MissingResumeValue {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+                interrupt_id: *interrupt_id,
+                node_id: node_id.clone(),
+                step: *step,
+            },
+            GraphRunError::UnexpectedResumeValue {
+                thread_id,
+                checkpoint_id,
+                step,
+                ..
+            } => Self::UnexpectedResumeValue {
+                thread_id: thread_id.clone(),
+                checkpoint_id: *checkpoint_id,
+                step: *step,
+            },
             GraphRunError::RouteFailed { node_id, step, .. } => Self::RouteFailed {
                 node_id: node_id.clone(),
                 step: *step,
@@ -1531,6 +1776,7 @@ mod resume_validation_tests {
             }),
             frontier,
             completed,
+            None,
         );
         (Arc::new(request.into_checkpoint()), restore_calls)
     }

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{CheckpointId, GraphVersion, NodeId, RunId, ThreadId};
+use crate::{CheckpointId, GraphVersion, InterruptId, NodeId, RunId, ThreadId};
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 
@@ -201,6 +201,18 @@ pub enum CheckpointIncompatibility {
     /// An incomplete checkpoint has no node from which to continue.
     #[error("incomplete checkpoint has an empty frontier")]
     IncompleteWithoutFrontier,
+    /// An interrupted checkpoint was also marked completed.
+    #[error("interrupted checkpoint cannot be completed")]
+    CompletedInterrupt,
+    /// An interrupted checkpoint did not retain exactly its suspended node.
+    #[error(
+        "interrupted checkpoint frontier must contain only node `{interrupt_node}`, found \
+         {frontier:?}"
+    )]
+    InvalidInterruptFrontier {
+        interrupt_node: NodeId,
+        frontier: Vec<NodeId>,
+    },
 }
 
 /// An error raised during graph execution.
@@ -364,6 +376,49 @@ pub enum GraphRunError {
         step: usize,
         #[source]
         source: SnapshotError,
+    },
+    /// A node attempted to interrupt without checkpoint storage.
+    #[error(
+        "node `{node_id}` requested interrupt `{interrupt_id}` at step {step}, but checkpointing \
+         is disabled"
+    )]
+    InterruptRequiresCheckpoint {
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// A node interrupted while other nodes shared the active frontier.
+    #[error(
+        "node `{node_id}` requested interrupt `{interrupt_id}` at step {step} in a parallel \
+         frontier; parallel interrupt is unsupported"
+    )]
+    UnsupportedParallelInterrupt {
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// An interrupted checkpoint was resumed without a value.
+    #[error(
+        "interrupted checkpoint `{checkpoint_id}` for thread `{thread_id}` requires a resume value"
+    )]
+    MissingResumeValue {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// A resume value was supplied for a checkpoint that was not interrupted.
+    #[error(
+        "checkpoint `{checkpoint_id}` for thread `{thread_id}` is not interrupted and cannot \
+         consume a resume value"
+    )]
+    UnexpectedResumeValue {
+        run_id: RunId,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        step: usize,
     },
     /// A conditional router failed.
     #[error("conditional router for node `{node_id}` failed at step {step}: {source}")]

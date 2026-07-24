@@ -22,6 +22,8 @@ The current core supports immutable compiled state graphs with:
   thread;
 - latest-only resume from specified or latest versioned checkpoints;
 - restoration of state, frontier, cumulative steps, and super-step position;
+- typed node interrupts, interrupted checkpoints, and typed resume values;
+- completed-or-interrupted execution outcomes for checkpoint-enabled runs;
 - synchronous conditional edges with declared target whitelists;
 - explicit conditional loops guarded by `max_steps`;
 - local success-only run reports with optional event retention;
@@ -38,6 +40,9 @@ The current core supports immutable compiled state graphs with:
 - A state defines one strongly typed `Update`.
 - A `Node` receives only `&S` and `&NodeContext`.
 - A `Node` returns `S::Update`; it never receives shared writable state.
+- An `InterruptibleNode` explicitly returns `NodeOutcome::Update` or
+  `NodeOutcome::Interrupt`; ordinary update-only nodes keep the simpler `Node`
+  API.
 - Only the Runtime calls `GraphState::apply`.
 - Single-node super-steps call `GraphState::apply`. Multi-node super-steps call
   `GraphState::apply_batch` with source-tagged updates in stable node order.
@@ -50,6 +55,8 @@ The current core supports immutable compiled state graphs with:
   `tokio::spawn`.
 - Cancellation state belongs to `RunControl` and `NodeContext`, never
   `GraphState`.
+- Resume values belong to `NodeContext`, never `GraphState`, and are visible
+  only while re-executing the node retained by an interrupted checkpoint.
 - `GraphState` must not gain `Clone` or Serde bounds for checkpointing.
   Checkpoint-enabled state implements the separate `CheckpointState` capability.
 
@@ -115,6 +122,9 @@ The current core supports immutable compiled state graphs with:
 - In a parallel super-step, node errors, cancellation, and timeouts drop all
   remaining futures and discard every uncommitted update from that super-step.
   The first failure observed by Runtime wins.
+- Stage 8 interrupt is supported only for singleton frontiers. An observed
+  parallel interrupt drops pending siblings, commits no update from that
+  super-step, and returns `UnsupportedParallelInterrupt`.
 - `GraphState::apply`, `GraphState::apply_batch`, routers, and sink callbacks are
   synchronous and cannot be preempted. Runtime observes control after they
   return.
@@ -198,6 +208,12 @@ The current core supports immutable compiled state graphs with:
   effects, or external node side effects.
 - `latest`, `get`, and `history` return shared checkpoint `Arc` values. `get`
   is scoped by both ThreadId and CheckpointId.
+- An interrupted checkpoint is neither completed nor a successful super-step
+  commit. It retains an InterruptId, node identifier, shared typed payload,
+  unchanged state snapshot, committed step/super-step counters, and a
+  singleton frontier containing the interrupted node.
+- Interrupt checkpoints are mandatory regardless of `CheckpointPolicy`. A
+  node interrupt without checkpointing is `InterruptRequiresCheckpoint`.
 
 ## Resume boundaries
 
@@ -228,11 +244,39 @@ The current core supports immutable compiled state graphs with:
   continue from each prior successful save.
 - Resuming a completed checkpoint restores State, executes no node, saves no
   duplicate checkpoint, and emits `RunStarted -> RunResumed -> RunCompleted`.
+- An interrupted checkpoint requires a Resume value. A normal or completed
+  checkpoint rejects an unexpected Resume value.
+- Resume re-executes the interrupted node with the value exposed through
+  `NodeContext`. The value is cleared after that node successfully returns an
+  update and is never passed to successor nodes.
 - Cancellation and run timeout start at resume entry and remain active during
   checkpoint loading and subsequent execution. Resume failure saves no new
   checkpoint.
-- Stage 7 provides no replay, fork, time travel, human interrupt, database
-  persistence, or serialization.
+- Stage 8 provides no replay, fork, time travel, parallel interrupt, database
+  persistence, or payload/snapshot serialization.
+
+## Suspension boundaries
+
+- `InterruptRequest` and `ResumeValue` use safe type erasure and shared `Arc`
+  storage. They require neither GraphState nor payload types to implement
+  Clone or Serde.
+- A singleton node interrupt applies no update and performs no normal routing.
+  Runtime emits `NodeInterrupted`, snapshots unchanged committed state, and
+  saves a checkpoint whose frontier is that same node.
+- Only a confirmed save produces `CheckpointSaved`, `RunInterrupted`, and
+  `ExecutionOutcome::Interrupted`. It never produces `RunCompleted`.
+- Save failure, CAS conflict, cancellation, or run timeout remains a
+  `GraphRunError`, emits one `RunFailed`, and does not return an interrupted
+  outcome. Run timeout and cancellation remain active during the save future.
+- Repeated interrupts allocate new InterruptId and CheckpointId values and
+  continue lineage from the prior interrupted checkpoint. Latest-only and CAS
+  rules remain unchanged.
+- The node is re-executed on resume. Runtime neither rolls back nor deduplicates
+  external effects performed before suspension. Pre-interrupt work must be
+  idempotent, and irreversible effects should be deferred until after the node
+  has validated its Resume value.
+- Interrupt payloads and Resume values are process-local typed values in this
+  stage; no durable serialization format is provided.
 
 ## Performance principles
 
@@ -254,6 +298,8 @@ The current core supports immutable compiled state graphs with:
 - `EventRetention::None` without a sink should avoid constructing events.
 - Disabled checkpointing must avoid snapshot creation, storage calls, and lock
   acquisition. Enabled frontier metadata must inspect only produced successors.
+- Ordinary update nodes allocate no interrupt payload and enter no snapshot
+  path unless checkpointing is explicitly enabled.
 - `InMemoryCheckpointer` may lock only briefly while saving or cloning query
   results; never execute user Snapshot code while holding its mutex.
 - Performance conclusions require repeatable benchmarks. Do not make comparative
@@ -261,7 +307,7 @@ The current core supports immutable compiled state graphs with:
 
 ## Out of scope
 
-Do not add replay, fork, time travel, human interrupts, SQLite, PostgreSQL,
+Do not add replay, fork, time travel, parallel interrupts, SQLite, PostgreSQL,
 SQLx, forced Serde bounds, conditional or dynamic fan-out, built-in
 Tokio channels or streams, LLM providers, tool calling, MCP, RAG, token
 streaming, standalone reducer registration, subgraphs, Tower middleware, Axum,
@@ -294,6 +340,7 @@ cargo run -p group-agent-core --example conditional
 cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
 cargo run -p group-agent-core --example resume
+cargo run -p group-agent-core --example interrupt
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```

@@ -7,9 +7,9 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use group_agent_core::{
     Checkpoint, CheckpointConfig, CheckpointId, CheckpointPolicy, CheckpointRequest,
     CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError, CompiledGraph, END,
-    EventConfig, EventRetention, GraphState, InMemoryCheckpointer, Node, NodeContext, NodeError,
-    NodeId, NodeUpdate, ResumeConfig, RunConfig, RunControl, START, SnapshotError, StateError,
-    StateGraph, ThreadId,
+    EventConfig, EventRetention, GraphState, InMemoryCheckpointer, InterruptibleNode, Node,
+    NodeContext, NodeError, NodeId, NodeOutcome, NodeUpdate, ResumeConfig, RunConfig, RunControl,
+    START, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,23 @@ impl Node<BenchState> for DelayedNode {
     ) -> Result<StepUpdate, NodeError> {
         tokio::time::sleep(Duration::from_micros(100)).await;
         Ok(StepUpdate)
+    }
+}
+
+struct InterruptBenchmarkNode;
+
+#[async_trait]
+impl InterruptibleNode<BenchState> for InterruptBenchmarkNode {
+    async fn run(
+        &self,
+        _state: &BenchState,
+        context: &NodeContext,
+    ) -> Result<NodeOutcome<StepUpdate>, NodeError> {
+        if context.resume_value::<()>().is_some() {
+            Ok(NodeOutcome::update(StepUpdate))
+        } else {
+            Ok(NodeOutcome::interrupt(()))
+        }
     }
 }
 
@@ -195,6 +212,16 @@ fn parallel_graph(branch_count: usize, delayed: bool) -> CompiledGraph<BenchStat
     graph.compile().expect("parallel graph should compile")
 }
 
+fn interrupt_graph() -> CompiledGraph<BenchState> {
+    let mut graph = StateGraph::new();
+    graph.set_version("interrupt-benchmark-v1");
+    graph
+        .add_interruptible_node("approval", InterruptBenchmarkNode)
+        .expect("interrupt benchmark node should register");
+    graph.add_edge(START, "approval").add_edge("approval", END);
+    graph.compile().expect("interrupt graph should compile")
+}
+
 fn runtime_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("Tokio benchmark runtime should start");
     let fixed_10 = fixed_graph(10);
@@ -206,6 +233,7 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     let parallel_32 = parallel_graph(32, false);
     let parallel_delayed_8 = parallel_graph(8, true);
     let conditional_1_000 = conditional_loop_graph();
+    let interrupt_graph = interrupt_graph();
     let compile_100 = fixed_graph_builder(100);
     let compile_1_000 = fixed_graph_builder(1_000);
     let uncancelled_token = CancellationToken::new();
@@ -251,6 +279,27 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .expect("completed checkpoint should exist");
     let completed_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
         checkpoint: completed_checkpoint,
+    });
+    let interrupted_store = Arc::new(InMemoryCheckpointer::new());
+    runtime
+        .block_on(interrupt_graph.invoke_with_checkpoint(
+            BenchState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "interrupt-resume-benchmark",
+                Arc::clone(&interrupted_store) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        ))
+        .expect("interrupt setup should succeed");
+    let interrupted_checkpoint = runtime
+        .block_on(interrupted_store.latest(&ThreadId::from("interrupt-resume-benchmark")))
+        .expect("interrupted checkpoint query should succeed")
+        .expect("interrupted checkpoint should exist");
+    let interrupt_resume_store: Arc<dyn Checkpointer<usize>> = Arc::new(ResumeBenchCheckpointer {
+        checkpoint: interrupted_checkpoint,
     });
 
     criterion.bench_function("compile_fixed_linear_100_nodes", |bencher| {
@@ -328,6 +377,59 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    criterion.bench_function("interrupt_save_single_node", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                let store: Arc<dyn Checkpointer<usize>> = Arc::new(InMemoryCheckpointer::new());
+                (
+                    BenchState::default(),
+                    CheckpointConfig::new(
+                        "interrupt-benchmark",
+                        store,
+                        CheckpointPolicy::EverySuperstep,
+                    ),
+                )
+            },
+            |(initial_state, checkpoint_config)| async {
+                let outcome = interrupt_graph
+                    .invoke_with_checkpoint(
+                        initial_state,
+                        RunConfig::default(),
+                        EventConfig::default(),
+                        RunControl::default(),
+                        checkpoint_config,
+                    )
+                    .await
+                    .expect("interrupt benchmark should succeed");
+                black_box(outcome.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    criterion.bench_function(
+        "interrupt_resume_restore_one_node_and_final_save",
+        |bencher| {
+            bencher.to_async(&runtime).iter_batched(
+                || {
+                    ResumeConfig::new(
+                        "interrupt-resume-benchmark",
+                        Arc::clone(&interrupt_resume_store),
+                    )
+                    .with_resume_value(())
+                },
+                |config| async {
+                    let outcome = interrupt_graph
+                        .resume(config)
+                        .await
+                        .expect("interrupt resume benchmark should succeed");
+                    black_box(outcome.steps());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
 
     criterion.bench_function(
         "invoke_checkpoint_enabled_every_superstep_10_nodes",

@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::NodeId;
+use crate::{NodeId, ResumeValue};
 
 /// Per-node execution context.
 #[derive(Clone, Debug)]
@@ -12,6 +12,7 @@ pub struct NodeContext {
     node_id: NodeId,
     cancellation_token: CancellationToken,
     run_deadline: Option<Instant>,
+    resume_value: Option<ResumeValue>,
 }
 
 impl PartialEq for NodeContext {
@@ -29,12 +30,14 @@ impl NodeContext {
         node_id: NodeId,
         cancellation_token: CancellationToken,
         run_deadline: Option<Instant>,
+        resume_value: Option<ResumeValue>,
     ) -> Self {
         Self {
             step,
             node_id,
             cancellation_token,
             run_deadline,
+            resume_value,
         }
     }
 
@@ -75,6 +78,24 @@ impl NodeContext {
     pub fn remaining_run_time(&self) -> Option<Duration> {
         self.run_deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Returns whether this node is re-executing with a resume value.
+    #[must_use]
+    pub const fn has_resume_value(&self) -> bool {
+        self.resume_value.is_some()
+    }
+
+    /// Returns the resume value when its concrete type is `T`.
+    ///
+    /// A value is exposed only to the node named by an interrupted checkpoint
+    /// and is cleared after that node successfully returns an update.
+    #[must_use]
+    pub fn resume_value<T>(&self) -> Option<&T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.resume_value.as_ref()?.downcast_ref()
     }
 }
 

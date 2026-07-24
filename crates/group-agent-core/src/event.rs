@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{CheckpointId, CheckpointIncompatibility, NodeId, ThreadId};
+use crate::{CheckpointId, CheckpointIncompatibility, InterruptId, NodeId, ThreadId};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -208,6 +208,32 @@ pub enum RunFailure {
         superstep: usize,
         step: usize,
     },
+    /// A node requested suspension without checkpoint storage.
+    InterruptRequiresCheckpoint {
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// A node requested suspension from a parallel frontier.
+    UnsupportedParallelInterrupt {
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// An interrupted checkpoint was resumed without a value.
+    MissingResumeValue {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
+    /// A non-interrupted checkpoint received a resume value.
+    UnexpectedResumeValue {
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
+        step: usize,
+    },
     /// A conditional router returned an error.
     RouteFailed { node_id: NodeId, step: usize },
     /// A router selected a target outside its declared whitelist.
@@ -246,6 +272,13 @@ pub enum GraphEvent {
         node_id: NodeId,
         step: usize,
     },
+    /// A node requested suspension without producing an update.
+    NodeInterrupted {
+        run_id: RunId,
+        interrupt_id: InterruptId,
+        node_id: NodeId,
+        step: usize,
+    },
     /// A node returned an update successfully.
     NodeCompleted {
         run_id: RunId,
@@ -276,6 +309,16 @@ pub enum GraphEvent {
         step: usize,
         completed: bool,
     },
+    /// The invocation suspended after its interrupted checkpoint was saved.
+    RunInterrupted {
+        run_id: RunId,
+        interrupt_id: InterruptId,
+        checkpoint_id: CheckpointId,
+        thread_id: ThreadId,
+        node_id: NodeId,
+        superstep: usize,
+        step: usize,
+    },
     /// The invocation reached `END`.
     RunCompleted { run_id: RunId, steps: usize },
     /// The invocation failed and will not produce a run report.
@@ -291,11 +334,13 @@ impl GraphEvent {
             | Self::RunResumed { run_id, .. }
             | Self::SuperstepStarted { run_id, .. }
             | Self::NodeStarted { run_id, .. }
+            | Self::NodeInterrupted { run_id, .. }
             | Self::NodeCompleted { run_id, .. }
             | Self::StateUpdated { run_id, .. }
             | Self::RouteSelected { run_id, .. }
             | Self::SuperstepCompleted { run_id, .. }
             | Self::CheckpointSaved { run_id, .. }
+            | Self::RunInterrupted { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. } => *run_id,
         }

@@ -7,12 +7,13 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 7 adds latest-only resume from versioned checkpoints while preserving
-explicit checkpoint lineage:
+Stage 8 adds typed suspension and human-provided resume values while preserving
+latest-only checkpoint lineage:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
                   successful boundary -> Checkpoint
+                  node interrupt -> Interrupted Checkpoint -> Resume value
 ```
 
 Every node in one parallel frontier inspects the same immutable state snapshot.
@@ -37,6 +38,8 @@ The current core includes:
 - latest and ordered history queries with CAS-protected checkpoint lineage;
 - restoration of state, frontier, cumulative step, and super-step position;
 - explicit graph-version compatibility and latest-only resume checks;
+- typed interrupt payloads and resume values without Serde bounds;
+- interrupted checkpoints and completed-or-interrupted execution outcomes;
 - explicit loops protected by a per-run `max_steps`;
 - immutable, reusable, concurrently shareable compiled graphs;
 - immediate lifecycle delivery through a thread-safe `EventSink`;
@@ -194,7 +197,8 @@ let config = CheckpointConfig::new(
 `FinalOnly` creates only the final completed checkpoint. Each immutable
 `Checkpoint` records its `CheckpointId`, `ThreadId`, `RunId`, parent, graph
 version, super-step, cumulative step count, shared `Arc<Snapshot>`, stable next
-frontier, and completed flag. `Checkpointer::latest`, `get`, and `history`
+frontier, completed flag, and optional interrupt metadata.
+`Checkpointer::latest`, `get`, and `history`
 return shared `Arc<Checkpoint<_>>` values, so queries do not deep-copy
 snapshots. `get` is scoped by both `ThreadId` and `CheckpointId`; it never
 returns a checkpoint owned by another thread. History is ordered oldest to
@@ -300,6 +304,88 @@ uninterruptible. Any load, compatibility, latest, restore, cancellation, or
 timeout failure saves nothing new and emits exactly one `RunFailed`. See
 [`examples/resume.rs`](crates/group-agent-core/examples/resume.rs).
 
+## Suspension and human interrupt
+
+Ordinary update-only nodes continue implementing `Node` with no signature
+change. A node that may suspend implements `InterruptibleNode` and is registered
+through `add_interruptible_node`:
+
+```rust
+#[async_trait]
+impl InterruptibleNode<AgentState> for ApprovalNode {
+    async fn run(
+        &self,
+        _state: &AgentState,
+        context: &NodeContext,
+    ) -> Result<NodeOutcome<AgentUpdate>, NodeError> {
+        if let Some(decision) = context.resume_value::<ApprovalDecision>() {
+            return Ok(NodeOutcome::update(AgentUpdate::Approved(
+                decision.clone(),
+            )));
+        }
+
+        Ok(NodeOutcome::interrupt(ApprovalPrompt {
+            summary: "Publish this draft?",
+        }))
+    }
+}
+```
+
+`InterruptRequest` assigns a fresh `InterruptId`. Its typed payload is held
+behind `Arc` and accessed with safe `downcast_ref`; neither State, Snapshot,
+payload, nor Resume value requires Serde. Ordinary `Node` execution creates no
+interrupt payload allocation.
+
+Checkpoint-enabled invocation and Resume now return
+`ExecutionOutcome::{Completed, Interrupted}`. A singleton node interrupt:
+
+1. applies no state update and performs no successor routing;
+2. emits `NodeInterrupted`;
+3. snapshots the unchanged committed state;
+4. saves an incomplete interrupted checkpoint whose singleton frontier is the
+   current node;
+5. emits `CheckpointSaved` followed by `RunInterrupted`;
+6. returns `ExecutionOutcome::Interrupted`, never `RunCompleted`.
+
+The interrupted report exposes the shared payload, InterruptId, checkpoint and
+thread identifiers, last committed State, cumulative committed step and
+super-step counters, visited attempts, and retained events. Interrupt is a
+successful suspension, not a `GraphRunError`. If checkpointing is disabled,
+Runtime returns `InterruptRequiresCheckpoint`. A save failure, lineage
+conflict, cancellation, or run timeout remains a failure: it emits one
+`RunFailed` and returns no interrupted outcome.
+
+Resume an interrupted checkpoint by supplying a typed value:
+
+```rust
+let outcome = graph
+    .resume(
+        ResumeConfig::new("conversation-42", store)
+            .with_resume_value(ApprovalDecision::Approve),
+    )
+    .await?;
+```
+
+The checkpoint must be latest and graph-compatible as before. An interrupted
+checkpoint without a value returns `MissingResumeValue`; a normal or completed
+checkpoint rejects an unexpected value. Runtime restores State, re-executes the
+interrupted node, and exposes the value only through that node's `NodeContext`.
+After the node returns an Update, the value is cleared before successor
+execution. The next save uses the interrupted checkpoint as expected parent.
+Repeated interrupts create fresh InterruptId and CheckpointId values along one
+continuous lineage.
+
+Re-execution can repeat code and external side effects that ran before the
+interrupt. Runtime does not roll those effects back or deduplicate them.
+Pre-interrupt work must therefore be idempotent, and irreversible effects
+should normally occur only after the node validates its Resume value.
+
+Stage 8 supports interrupts only from singleton frontiers. An interrupt observed
+in a parallel frontier drops remaining futures, commits none of that
+super-step's updates, and returns `UnsupportedParallelInterrupt`. Payloads are
+process-local and have no persistent serialization format. See
+[`examples/interrupt.rs`](crates/group-agent-core/examples/interrupt.rs).
+
 ## Event observation
 
 `EventSink` is a small synchronous, infallible callback trait and does not
@@ -363,6 +449,11 @@ failures emit the corresponding typed `RunFailed`; they do not emit
 Resume emits `RunResumed` only after loading, latest/version/frontier
 validation, and successful state restoration. It precedes every continued node
 event.
+
+Successful suspension emits `NodeInterrupted -> CheckpointSaved ->
+RunInterrupted` after `NodeStarted`. It emits neither `NodeCompleted`,
+`StateUpdated`, nor `RunCompleted` for the interrupted attempt. Checkpoint save
+or control failure replaces the final suspension event with one `RunFailed`.
 
 `RunReport` remains a success-only result. On a node, state-apply, batch-apply,
 router, undeclared-target, step-limit, snapshot, or checkpoint-storage failure,
@@ -521,7 +612,8 @@ explicitly as a 32-total-node linear chain and a 32-branch/33-total-node
 fan-out, so they are not presented as equivalent topologies. Stage 6 adds
 checkpoint-disabled and in-memory checkpoint-enabled invocation baselines.
 Stage 7 adds load-plus-restore-plus-one-immediate-node and completed-checkpoint
-no-op resume baselines. These are regression baselines without performance
+no-op resume baselines. Stage 8 adds singleton interrupt-save and
+interrupt-resume-plus-final-save baselines. These are regression baselines without performance
 thresholds or cross-framework claims.
 
 ## Workspace
@@ -541,6 +633,7 @@ thresholds or cross-framework claims.
         ├── examples
         │   ├── checkpoint.rs
         │   ├── conditional.rs
+        │   ├── interrupt.rs
         │   ├── linear.rs
         │   ├── parallel.rs
         │   └── resume.rs
@@ -560,6 +653,7 @@ thresholds or cross-framework claims.
             ├── checkpointing.rs
             ├── conditional_routing.rs
             ├── execution_control.rs
+            ├── interrupt.rs
             ├── linear_execution.rs
             ├── observability.rs
             ├── parallel_execution.rs
@@ -576,13 +670,14 @@ cargo run -p group-agent-core --example conditional
 cargo run -p group-agent-core --example parallel
 cargo run -p group-agent-core --example checkpoint
 cargo run -p group-agent-core --example resume
+cargo run -p group-agent-core --example interrupt
 cargo bench --workspace --no-run
 ```
 
 ## Current exclusions
 
-This stage does not support Replay, Fork, Time Travel, human interrupts, SQLite,
-PostgreSQL, SQLx, snapshot serialization, conditional or dynamic
+This stage does not support parallel interrupts, Replay, Fork, Time Travel,
+SQLite, PostgreSQL, SQLx, snapshot or payload serialization, conditional or dynamic
 fan-out, built-in Tokio channels or streams, standalone reducer registration,
 LLM or tool APIs, MCP, RAG, token streaming, subgraphs, Tower middleware, Axum,
 HTTP services, distributed workers, macro DSLs, or visualization. The event
