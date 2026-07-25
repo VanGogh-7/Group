@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    CheckpointId, CheckpointIncompatibility, GraphPath, InterruptId, NodePath, RunId, ThreadId,
+    BranchId, CheckpointId, CheckpointIncompatibility, GraphPath, InterruptId, NodePath, RunId,
+    ThreadId,
 };
 
 /// Controls whether emitted events are retained in a successful run report.
@@ -180,6 +181,28 @@ pub enum RunFailure {
         latest_checkpoint_id: Option<CheckpointId>,
         step: usize,
     },
+    /// A selected branch does not exist.
+    BranchNotFound {
+        thread_id: ThreadId,
+        branch_id: BranchId,
+        step: usize,
+    },
+    /// Creating an explicit branch failed.
+    BranchCreationFailed {
+        thread_id: ThreadId,
+        branch_id: BranchId,
+        source_checkpoint_id: CheckpointId,
+        step: usize,
+    },
+    /// A branch checkpoint write observed a different branch head.
+    BranchCheckpointConflict {
+        thread_id: ThreadId,
+        branch_id: BranchId,
+        superstep: usize,
+        step: usize,
+        expected_parent: Option<CheckpointId>,
+        actual_parent: Option<CheckpointId>,
+    },
     /// The checkpoint cannot be used by this compiled graph.
     CheckpointIncompatible {
         thread_id: ThreadId,
@@ -262,11 +285,29 @@ pub enum GraphEvent {
         step: usize,
         superstep: usize,
     },
+    /// A resume invocation selected an explicit branch head.
+    BranchResumed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        branch_id: BranchId,
+        checkpoint_id: CheckpointId,
+        step: usize,
+        superstep: usize,
+    },
     /// A read-only replay restored one exact historical checkpoint.
     ReplayStarted {
         run_id: RunId,
         source_thread_id: ThreadId,
         source_checkpoint_id: CheckpointId,
+        step: usize,
+        superstep: usize,
+    },
+    /// An explicit writable branch was created from one exact checkpoint.
+    ForkStarted {
+        run_id: RunId,
+        source_thread_id: ThreadId,
+        source_checkpoint_id: CheckpointId,
+        branch_id: BranchId,
         step: usize,
         superstep: usize,
     },
@@ -359,7 +400,9 @@ impl GraphEvent {
         match self {
             Self::RunStarted { run_id, .. }
             | Self::RunResumed { run_id, .. }
+            | Self::BranchResumed { run_id, .. }
             | Self::ReplayStarted { run_id, .. }
+            | Self::ForkStarted { run_id, .. }
             | Self::SuperstepStarted { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeInterrupted { run_id, .. }

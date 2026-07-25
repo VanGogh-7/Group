@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use group_agent_core::{
     Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy,
     CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer, CheckpointerError,
-    CodecDescriptor, END, EncodedValue, EventConfig, EventRetention, GraphEvent, GraphState,
-    InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError,
-    NodeOutcome, RouteError, RunConfig, RunControl, RunFailure, RunId, START, SnapshotError,
-    StateError, StateGraph, ThreadId,
+    CodecDescriptor, END, EncodedValue, EventConfig, EventRetention, ForkConfig, GraphEvent,
+    GraphState, InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node, NodeContext,
+    NodeError, NodeOutcome, ReplayConfig, ResumeConfig, RouteError, RunConfig, RunControl,
+    RunFailure, RunId, START, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use group_agent_observability_tokio::{
     EventBroadcast, EventBroadcastConfigError, EventStream, EventStreamError,
@@ -159,6 +159,202 @@ async fn receive(stream: &mut EventStream, count: usize) -> Vec<GraphEvent> {
         );
     }
     events
+}
+
+#[tokio::test]
+async fn replay_started_and_replay_failure_are_delivered_through_the_stream() {
+    let mut builder = StateGraph::new();
+    builder.set_version("stream-replay-v1");
+    builder.add_node("one", Add).expect("one");
+    builder.add_node("two", Add).expect("two");
+    builder
+        .add_edge(START, "one")
+        .add_edge("one", "two")
+        .add_edge("two", END);
+    let graph = builder.compile().expect("graph");
+    let checkpointer = Arc::new(InMemoryCheckpointer::new(Codec));
+    graph
+        .invoke_with_checkpoint(
+            State::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "stream-replay",
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect_err("seed stops after one node");
+    let source = checkpointer
+        .latest(&ThreadId::from("stream-replay"))
+        .await
+        .expect("latest")
+        .expect("checkpoint")
+        .id();
+
+    let broadcast = EventBroadcast::new(16).expect("broadcast");
+    let mut success_stream = broadcast.subscribe();
+    let report = graph
+        .replay(
+            ReplayConfig::new(
+                "stream-replay",
+                source,
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_event_config(event_config(&broadcast, EventRetention::None))
+            .with_run_config(RunConfig::new(1)),
+        )
+        .await
+        .expect("replay");
+    let events = receive(&mut success_stream, 6).await;
+    assert_eq!(
+        events.iter().map(GraphEvent::run_id).collect::<Vec<_>>(),
+        vec![report.run_id(); 6]
+    );
+    assert!(matches!(events[1], GraphEvent::ReplayStarted { .. }));
+    assert!(matches!(events[5], GraphEvent::RunCompleted { .. }));
+
+    let mut failure_stream = broadcast.subscribe();
+    let _error = graph
+        .replay(
+            ReplayConfig::new(
+                "stream-replay",
+                source,
+                checkpointer as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_event_config(event_config(&broadcast, EventRetention::None))
+            .with_run_config(RunConfig::new(0)),
+        )
+        .await
+        .expect_err("zero replay budget");
+    let events = receive(&mut failure_stream, 3).await;
+    let failed_run_id = events[0].run_id();
+    assert_eq!(
+        events.iter().map(GraphEvent::run_id).collect::<Vec<_>>(),
+        vec![failed_run_id; 3]
+    );
+    assert!(matches!(events[1], GraphEvent::ReplayStarted { .. }));
+    assert!(matches!(
+        events[2],
+        GraphEvent::RunFailed {
+            failure: RunFailure::MaxStepsExceeded { .. },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn fork_branch_resume_and_fork_failure_are_delivered_through_the_stream() {
+    let mut builder = StateGraph::new();
+    builder.set_version("stream-fork-v1");
+    builder.add_node("one", Add).expect("one");
+    builder.add_node("two", Add).expect("two");
+    builder
+        .add_edge(START, "one")
+        .add_edge("one", "two")
+        .add_edge("two", END);
+    let graph = builder.compile().expect("graph");
+    let checkpointer = Arc::new(InMemoryCheckpointer::new(Codec));
+    graph
+        .invoke_with_checkpoint(
+            State::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "stream-fork",
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect_err("seed stops after one node");
+    let source = checkpointer
+        .latest(&ThreadId::from("stream-fork"))
+        .await
+        .expect("latest")
+        .expect("source")
+        .id();
+
+    let broadcast = EventBroadcast::new(32).expect("broadcast");
+    let mut success_stream = broadcast.subscribe();
+    let fork = graph
+        .fork(
+            ForkConfig::new(
+                "stream-fork",
+                source,
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_event_config(event_config(&broadcast, EventRetention::None))
+            .with_run_config(RunConfig::new(1)),
+        )
+        .await
+        .expect("fork");
+    let fork_events = receive(&mut success_stream, 7).await;
+    assert!(matches!(
+        fork_events[1],
+        GraphEvent::ForkStarted {
+            branch_id,
+            ..
+        } if branch_id == fork.branch_id()
+    ));
+    assert!(matches!(
+        fork_events.last(),
+        Some(GraphEvent::RunCompleted { .. })
+    ));
+
+    let mut resume_stream = broadcast.subscribe();
+    let resumed = graph
+        .resume(
+            ResumeConfig::new(
+                "stream-fork",
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_branch_id(fork.branch_id())
+            .with_event_config(event_config(&broadcast, EventRetention::None)),
+        )
+        .await
+        .expect("completed branch resume");
+    let resume_events = receive(&mut resume_stream, 4).await;
+    assert_eq!(
+        resume_events
+            .iter()
+            .map(GraphEvent::run_id)
+            .collect::<Vec<_>>(),
+        vec![resumed.run_id(); 4]
+    );
+    assert!(matches!(
+        resume_events[2],
+        GraphEvent::BranchResumed {
+            branch_id,
+            ..
+        } if branch_id == fork.branch_id()
+    ));
+
+    let mut failure_stream = broadcast.subscribe();
+    let _error = graph
+        .fork(
+            ForkConfig::new(
+                "stream-fork",
+                source,
+                checkpointer as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_event_config(event_config(&broadcast, EventRetention::None))
+            .with_run_config(RunConfig::new(0)),
+        )
+        .await
+        .expect_err("zero-budget fork");
+    let failure_events = receive(&mut failure_stream, 3).await;
+    assert!(matches!(failure_events[1], GraphEvent::ForkStarted { .. }));
+    assert!(matches!(
+        failure_events[2],
+        GraphEvent::RunFailed {
+            failure: RunFailure::MaxStepsExceeded { .. },
+            ..
+        }
+    ));
 }
 
 fn kinds(events: &[GraphEvent]) -> Vec<&'static str> {

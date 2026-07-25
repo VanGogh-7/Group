@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    CheckpointCodec, CheckpointEncodingError, CheckpointFormatVersion, CheckpointId,
+    BranchId, CheckpointCodec, CheckpointEncodingError, CheckpointFormatVersion, CheckpointId,
     CheckpointInterrupt, CheckpointReconstructionError, CheckpointRecord,
     CheckpointRecordInterrupt, CheckpointRecordParts, CheckpointStore, CheckpointerError,
     EncodedValue, EventConfig, GraphState, InMemoryCheckpointStore, NodePath, ResumeValue,
@@ -561,6 +561,21 @@ pub enum CheckpointWriteError {
     /// An idempotency key was reused for different request metadata.
     #[error("checkpoint idempotency key `{checkpoint_id}` was reused with different metadata")]
     IdempotencyConflict { checkpoint_id: CheckpointId },
+    /// A requested branch identifier already exists.
+    #[error("checkpoint branch `{branch_id}` already exists")]
+    BranchAlreadyExists { branch_id: BranchId },
+    /// A requested checkpoint branch does not exist for the logical thread.
+    #[error("checkpoint branch `{branch_id}` was not found")]
+    BranchNotFound { branch_id: BranchId },
+    /// The selected source checkpoint does not exist for branch creation.
+    #[error("source checkpoint `{checkpoint_id}` was not found for branch `{branch_id}`")]
+    BranchSourceNotFound {
+        branch_id: BranchId,
+        checkpoint_id: CheckpointId,
+    },
+    /// The checkpointer does not implement the additive branch capability.
+    #[error("checkpoint branch operations are not supported")]
+    BranchUnsupported,
     /// Typed checkpoint data could not be encoded for storage.
     #[error(transparent)]
     Encoding(#[from] CheckpointEncodingError),
@@ -613,6 +628,102 @@ where
         &self,
         thread_id: &ThreadId,
     ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError>;
+
+    /// Creates a writable branch whose initial head is `source_checkpoint_id`.
+    ///
+    /// A duplicate identifier returns
+    /// [`CheckpointWriteError::BranchAlreadyExists`], even for an exact repeat.
+    async fn create_branch(
+        &self,
+        _thread_id: &ThreadId,
+        _branch_id: BranchId,
+        _source_checkpoint_id: CheckpointId,
+    ) -> Result<BranchHead, CheckpointWriteError> {
+        Err(CheckpointWriteError::BranchUnsupported)
+    }
+
+    /// Saves one checkpoint using the branch's independent head CAS.
+    async fn save_branch(
+        &self,
+        _branch_id: BranchId,
+        _request: CheckpointRequest<T>,
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
+        Err(CheckpointWriteError::BranchUnsupported)
+    }
+
+    /// Returns a branch's current head checkpoint.
+    ///
+    /// An absent branch or a branch owned by another thread returns `None`.
+    async fn branch_head(
+        &self,
+        _thread_id: &ThreadId,
+        _branch_id: BranchId,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        Err(CheckpointerError::message(
+            "checkpoint branch operations are not supported",
+        ))
+    }
+
+    /// Returns the source checkpoint followed by branch descendants.
+    ///
+    /// An absent branch or a branch owned by another thread returns an empty
+    /// collection.
+    async fn branch_history(
+        &self,
+        _thread_id: &ThreadId,
+        _branch_id: BranchId,
+    ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
+        Err(CheckpointerError::message(
+            "checkpoint branch operations are not supported",
+        ))
+    }
+}
+
+/// Stable metadata for one explicit branch head.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchHead {
+    branch_id: BranchId,
+    thread_id: ThreadId,
+    source_checkpoint_id: CheckpointId,
+    checkpoint_id: CheckpointId,
+}
+
+impl BranchHead {
+    /// Constructs branch metadata returned by storage adapters.
+    #[must_use]
+    pub const fn new(
+        branch_id: BranchId,
+        thread_id: ThreadId,
+        source_checkpoint_id: CheckpointId,
+        checkpoint_id: CheckpointId,
+    ) -> Self {
+        Self {
+            branch_id,
+            thread_id,
+            source_checkpoint_id,
+            checkpoint_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn branch_id(&self) -> BranchId {
+        self.branch_id
+    }
+
+    #[must_use]
+    pub const fn thread_id(&self) -> &ThreadId {
+        &self.thread_id
+    }
+
+    #[must_use]
+    pub const fn source_checkpoint_id(&self) -> CheckpointId {
+        self.source_checkpoint_id
+    }
+
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> CheckpointId {
+        self.checkpoint_id
+    }
 }
 
 /// Selects the checkpoint loaded by a resume invocation.
@@ -640,6 +751,7 @@ where
     event_config: EventConfig,
     control: RunControl,
     resume_value: Option<ResumeValue>,
+    branch_id: Option<BranchId>,
 }
 
 pub(crate) struct ResumeParts<T>
@@ -654,6 +766,7 @@ where
     pub(crate) event_config: EventConfig,
     pub(crate) control: RunControl,
     pub(crate) resume_value: Option<ResumeValue>,
+    pub(crate) branch_id: Option<BranchId>,
 }
 
 impl<T> ResumeConfig<T>
@@ -672,6 +785,7 @@ where
             event_config: EventConfig::default(),
             control: RunControl::default(),
             resume_value: None,
+            branch_id: None,
         }
     }
 
@@ -680,6 +794,19 @@ where
     pub const fn with_checkpoint_id(mut self, checkpoint_id: CheckpointId) -> Self {
         self.target = ResumeTarget::Checkpoint(checkpoint_id);
         self
+    }
+
+    /// Selects an explicit branch whose own latest head must be resumed.
+    #[must_use]
+    pub const fn with_branch_id(mut self, branch_id: BranchId) -> Self {
+        self.branch_id = Some(branch_id);
+        self
+    }
+
+    /// Returns the selected branch, or `None` for the default thread head.
+    #[must_use]
+    pub const fn branch_id(&self) -> Option<BranchId> {
+        self.branch_id
     }
 
     /// Sets the policy for checkpoints created after resuming.
@@ -755,6 +882,7 @@ where
             event_config: self.event_config,
             control: self.control,
             resume_value: self.resume_value,
+            branch_id: self.branch_id,
         }
     }
 }
@@ -773,6 +901,7 @@ where
             .field("event_config", &self.event_config)
             .field("control", &self.control)
             .field("has_resume_value", &self.resume_value.is_some())
+            .field("branch_id", &self.branch_id)
             .finish_non_exhaustive()
     }
 }
@@ -794,6 +923,157 @@ where
     event_config: EventConfig,
     control: RunControl,
     resume_value: Option<ResumeValue>,
+}
+
+/// Configuration for explicitly forking one exact historical checkpoint.
+#[derive(Clone)]
+pub struct ForkConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    thread_id: ThreadId,
+    checkpoint_id: CheckpointId,
+    branch_id: BranchId,
+    checkpointer: Arc<dyn Checkpointer<T>>,
+    checkpoint_policy: CheckpointPolicy,
+    run_config: RunConfig,
+    event_config: EventConfig,
+    control: RunControl,
+    resume_value: Option<ResumeValue>,
+}
+
+pub(crate) struct ForkParts<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub(crate) thread_id: ThreadId,
+    pub(crate) checkpoint_id: CheckpointId,
+    pub(crate) branch_id: BranchId,
+    pub(crate) checkpointer: Arc<dyn Checkpointer<T>>,
+    pub(crate) checkpoint_policy: CheckpointPolicy,
+    pub(crate) run_config: RunConfig,
+    pub(crate) event_config: EventConfig,
+    pub(crate) control: RunControl,
+    pub(crate) resume_value: Option<ResumeValue>,
+}
+
+impl<T> ForkConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    /// Creates a fork configuration with a newly generated branch identifier.
+    #[must_use]
+    pub fn new(
+        thread_id: impl Into<ThreadId>,
+        checkpoint_id: CheckpointId,
+        checkpointer: Arc<dyn Checkpointer<T>>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            checkpoint_id,
+            branch_id: BranchId::next(),
+            checkpointer,
+            checkpoint_policy: CheckpointPolicy::EverySuperstep,
+            run_config: RunConfig::default(),
+            event_config: EventConfig::default(),
+            control: RunControl::default(),
+            resume_value: None,
+        }
+    }
+
+    /// Uses an application-selected branch identifier.
+    #[must_use]
+    pub const fn with_branch_id(mut self, branch_id: BranchId) -> Self {
+        self.branch_id = branch_id;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+        self.checkpoint_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_run_config(mut self, config: RunConfig) -> Self {
+        self.run_config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_config(mut self, config: EventConfig) -> Self {
+        self.event_config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_control(mut self, control: RunControl) -> Self {
+        self.control = control;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resume_value<TValue>(mut self, value: TValue) -> Self
+    where
+        TValue: Send + Sync + 'static,
+    {
+        self.resume_value = Some(ResumeValue::new(value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_resume_value(mut self, value: ResumeValue) -> Self {
+        self.resume_value = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub const fn thread_id(&self) -> &ThreadId {
+        &self.thread_id
+    }
+
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> CheckpointId {
+        self.checkpoint_id
+    }
+
+    #[must_use]
+    pub const fn branch_id(&self) -> BranchId {
+        self.branch_id
+    }
+
+    pub(crate) fn into_parts(self) -> ForkParts<T> {
+        ForkParts {
+            thread_id: self.thread_id,
+            checkpoint_id: self.checkpoint_id,
+            branch_id: self.branch_id,
+            checkpointer: self.checkpointer,
+            checkpoint_policy: self.checkpoint_policy,
+            run_config: self.run_config,
+            event_config: self.event_config,
+            control: self.control,
+            resume_value: self.resume_value,
+        }
+    }
+}
+
+impl<T> fmt::Debug for ForkConfig<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForkConfig")
+            .field("thread_id", &self.thread_id)
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("branch_id", &self.branch_id)
+            .field("checkpoint_policy", &self.checkpoint_policy)
+            .field("run_config", &self.run_config)
+            .field("event_config", &self.event_config)
+            .field("control", &self.control)
+            .field("has_resume_value", &self.resume_value.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct ReplayParts<T>
@@ -927,6 +1207,7 @@ where
     checkpointer: Arc<dyn Checkpointer<T>>,
     policy: CheckpointPolicy,
     expected_parent: Option<CheckpointId>,
+    branch_id: Option<BranchId>,
 }
 
 impl<T> CheckpointConfig<T>
@@ -948,6 +1229,7 @@ where
             checkpointer,
             policy,
             expected_parent: None,
+            branch_id: None,
         }
     }
 
@@ -955,6 +1237,16 @@ where
     #[must_use]
     pub fn with_expected_parent(mut self, expected_parent: Option<CheckpointId>) -> Self {
         self.expected_parent = expected_parent;
+        self
+    }
+
+    /// Routes writes through an explicit branch head rather than the default head.
+    ///
+    /// The caller must also provide the current branch head through
+    /// [`Self::with_expected_parent`]; selecting a branch does not infer it.
+    #[must_use]
+    pub const fn with_branch_id(mut self, branch_id: BranchId) -> Self {
+        self.branch_id = Some(branch_id);
         self
     }
 
@@ -976,6 +1268,11 @@ where
         self.expected_parent
     }
 
+    #[must_use]
+    pub const fn branch_id(&self) -> Option<BranchId> {
+        self.branch_id
+    }
+
     pub(crate) fn checkpointer(&self) -> &dyn Checkpointer<T> {
         self.checkpointer.as_ref()
     }
@@ -991,6 +1288,7 @@ where
             .field("thread_id", &self.thread_id)
             .field("policy", &self.policy)
             .field("expected_parent", &self.expected_parent)
+            .field("branch_id", &self.branch_id)
             .finish_non_exhaustive()
     }
 }
@@ -1156,6 +1454,61 @@ where
             .map(|record| self.decode(record))
             .collect()
     }
+
+    async fn create_branch(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+        source_checkpoint_id: CheckpointId,
+    ) -> Result<BranchHead, CheckpointWriteError> {
+        self.store
+            .create_branch(thread_id, branch_id, source_checkpoint_id)
+            .await
+    }
+
+    async fn save_branch(
+        &self,
+        branch_id: BranchId,
+        request: CheckpointRequest<T>,
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
+        let record = request.to_record(self.codec.as_ref())?;
+        let stored = self.store.save_branch(branch_id, record.clone()).await?;
+        if stored.as_ref() != &record {
+            return Err(CheckpointWriteError::Failed(CheckpointerError::message(
+                "checkpoint store returned content different from the submitted branch record",
+            )));
+        }
+        if let Some(checkpoint) = self.cached(&record).map_err(CheckpointWriteError::Failed)? {
+            return Ok(checkpoint);
+        }
+        self.cache(record, Arc::new(request.into_checkpoint()))
+            .map_err(CheckpointWriteError::Failed)
+    }
+
+    async fn branch_head(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.store
+            .branch_head(thread_id, branch_id)
+            .await?
+            .map(|record| self.decode(&record))
+            .transpose()
+    }
+
+    async fn branch_history(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+    ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.store
+            .branch_history(thread_id, branch_id)
+            .await?
+            .iter()
+            .map(|record| self.decode(record))
+            .collect()
+    }
 }
 
 /// Typed in-memory checkpointer backed by storage-neutral records.
@@ -1241,6 +1594,41 @@ where
         thread_id: &ThreadId,
     ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
         self.adapter.history(thread_id).await
+    }
+
+    async fn create_branch(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+        source_checkpoint_id: CheckpointId,
+    ) -> Result<BranchHead, CheckpointWriteError> {
+        self.adapter
+            .create_branch(thread_id, branch_id, source_checkpoint_id)
+            .await
+    }
+
+    async fn save_branch(
+        &self,
+        branch_id: BranchId,
+        request: CheckpointRequest<T>,
+    ) -> Result<Arc<Checkpoint<T>>, CheckpointWriteError> {
+        self.adapter.save_branch(branch_id, request).await
+    }
+
+    async fn branch_head(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+    ) -> Result<Option<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.adapter.branch_head(thread_id, branch_id).await
+    }
+
+    async fn branch_history(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: BranchId,
+    ) -> Result<Vec<Arc<Checkpoint<T>>>, CheckpointerError> {
+        self.adapter.branch_history(thread_id, branch_id).await
     }
 }
 

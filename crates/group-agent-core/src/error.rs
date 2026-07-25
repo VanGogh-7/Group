@@ -4,8 +4,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::{
-    CheckpointEncodingError, CheckpointId, GraphVersion, InterruptId, NodeId, NodePath, RunId,
-    ThreadId,
+    CheckpointEncodingError, CheckpointId, CheckpointWriteError, GraphVersion, InterruptId, NodeId,
+    NodePath, RunId, ThreadId,
 };
 
 type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
@@ -230,6 +230,12 @@ pub enum CheckpointIncompatibility {
     /// A custom store returned a checkpoint from another thread.
     #[error("checkpoint belongs to thread `{actual_thread}`")]
     ThreadMismatch { actual_thread: ThreadId },
+    /// A custom checkpointer returned a different checkpoint than requested.
+    #[error("checkpoint id `{actual}` does not match requested id `{requested}`")]
+    CheckpointIdMismatch {
+        requested: CheckpointId,
+        actual: CheckpointId,
+    },
     /// The restored frontier names an unknown executable node.
     #[error("checkpoint frontier contains unknown node `{node_id}`")]
     UnknownFrontierNode { node_id: NodePath },
@@ -430,6 +436,43 @@ pub enum GraphRunError {
         checkpoint_id: CheckpointId,
         latest_checkpoint_id: Option<CheckpointId>,
         step: usize,
+    },
+    /// A selected branch does not exist for the logical thread.
+    #[error("checkpoint branch `{branch_id}` was not found for thread `{thread_id}`")]
+    BranchNotFound {
+        run_id: RunId,
+        thread_id: ThreadId,
+        branch_id: crate::BranchId,
+        step: usize,
+    },
+    /// Creating the explicit branch failed.
+    #[error(
+        "creating checkpoint branch `{branch_id}` from `{source_checkpoint_id}` for thread \
+         `{thread_id}` failed: {source}"
+    )]
+    BranchCreationFailed {
+        run_id: RunId,
+        thread_id: ThreadId,
+        branch_id: crate::BranchId,
+        source_checkpoint_id: CheckpointId,
+        step: usize,
+        #[source]
+        source: CheckpointWriteError,
+    },
+    /// A branch head advanced beyond this invocation's expected parent.
+    #[error(
+        "checkpoint conflict for branch `{branch_id}` in thread `{thread_id}` after super-step \
+         {superstep} at step {step}: expected parent {expected_parent:?}, current branch head is \
+         {actual_parent:?}"
+    )]
+    BranchCheckpointConflict {
+        run_id: RunId,
+        thread_id: ThreadId,
+        branch_id: crate::BranchId,
+        superstep: usize,
+        step: usize,
+        expected_parent: Option<CheckpointId>,
+        actual_parent: Option<CheckpointId>,
     },
     /// The selected checkpoint is incompatible with the compiled graph.
     #[error("checkpoint `{checkpoint_id}` for thread `{thread_id}` is incompatible: {reason}")]

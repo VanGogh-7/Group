@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use group_agent_checkpoint_sqlite::SqliteCheckpointStore;
 use group_agent_core::{
     CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointPolicy, CheckpointState,
-    CheckpointStore, Checkpointer, CodecDescriptor, END, EncodedValue, EventConfig, GraphState,
-    InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError, NodeId, NodeOutcome,
-    NodePath, NodeUpdate, RecordCheckpointer, ReplayConfig, ResumeConfig, RunConfig, RunControl,
-    START, SnapshotError, StateError, StateGraph, ThreadId,
+    CheckpointStore, Checkpointer, CodecDescriptor, END, EncodedValue, EventConfig, ForkConfig,
+    GraphRunError, GraphState, InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError,
+    NodeId, NodeOutcome, NodePath, NodeUpdate, RecordCheckpointer, ReplayConfig, ResumeConfig,
+    RunConfig, RunControl, START, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tempfile::TempDir;
 
@@ -410,6 +410,259 @@ async fn historical_checkpoint_replays_after_file_restart_without_changing_linea
         before_shape
     );
     assert_eq!(after.last().expect("latest").id(), latest_id);
+}
+
+#[tokio::test]
+async fn branch_head_and_history_survive_file_restart_and_leave_default_head_unchanged() {
+    let (_directory, database_url) = database();
+    let graph = linear_graph();
+    let store_a = raw_store(&database_url).await;
+    let typed_a = typed_store(Arc::clone(&store_a));
+    graph
+        .invoke_with_checkpoint(
+            DurableState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "sqlite-fork",
+                typed_a.clone() as Arc<dyn Checkpointer<Snapshot>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect("seed");
+    let default_history = store_a
+        .history(&ThreadId::from("sqlite-fork"))
+        .await
+        .expect("history");
+    let source_id = default_history[0].id();
+    let default_latest = default_history[1].id();
+    drop(default_history);
+    drop(typed_a);
+    drop(store_a);
+
+    let store_b = raw_store(&database_url).await;
+    let typed_b = typed_store(Arc::clone(&store_b));
+    let config = ForkConfig::new(
+        "sqlite-fork",
+        source_id,
+        typed_b.clone() as Arc<dyn Checkpointer<Snapshot>>,
+    )
+    .with_run_config(RunConfig::new(0));
+    let branch_id = config.branch_id();
+    assert!(matches!(
+        graph.fork(config).await.expect_err("zero budget"),
+        GraphRunError::MaxStepsExceeded { .. }
+    ));
+    let other_config = ForkConfig::new(
+        "sqlite-fork",
+        source_id,
+        typed_b.clone() as Arc<dyn Checkpointer<Snapshot>>,
+    )
+    .with_run_config(RunConfig::new(0));
+    let other_branch_id = other_config.branch_id();
+    assert!(matches!(
+        graph
+            .fork(other_config)
+            .await
+            .expect_err("other zero budget"),
+        GraphRunError::MaxStepsExceeded { .. }
+    ));
+    assert_eq!(
+        store_b
+            .branch_head(&ThreadId::from("sqlite-fork"), branch_id)
+            .await
+            .expect("branch head")
+            .expect("branch")
+            .id(),
+        source_id
+    );
+    assert!(
+        store_b
+            .branch_head(&ThreadId::from("wrong-thread"), branch_id)
+            .await
+            .expect("wrong-thread head")
+            .is_none()
+    );
+    assert!(
+        store_b
+            .branch_history(&ThreadId::from("wrong-thread"), branch_id)
+            .await
+            .expect("wrong-thread history")
+            .is_empty()
+    );
+    drop(typed_b);
+    drop(store_b);
+
+    let store_c = raw_store(&database_url).await;
+    let typed_c = typed_store(Arc::clone(&store_c));
+    let outcome = graph
+        .resume(
+            ResumeConfig::new(
+                "sqlite-fork",
+                typed_c.clone() as Arc<dyn Checkpointer<Snapshot>>,
+            )
+            .with_branch_id(branch_id)
+            .with_run_config(RunConfig::new(1)),
+        )
+        .await
+        .expect("branch resume after restart");
+    assert_eq!(outcome.final_state().value, 3);
+    let other_outcome = graph
+        .resume(
+            ResumeConfig::new("sqlite-fork", typed_c as Arc<dyn Checkpointer<Snapshot>>)
+                .with_branch_id(other_branch_id)
+                .with_run_config(RunConfig::new(1)),
+        )
+        .await
+        .expect("other branch resume after restart");
+    assert_eq!(other_outcome.final_state().value, 3);
+
+    let branch = store_c
+        .branch_history(&ThreadId::from("sqlite-fork"), branch_id)
+        .await
+        .expect("branch history");
+    assert_eq!(branch.len(), 2);
+    assert_eq!(branch[0].id(), source_id);
+    assert_eq!(branch[1].parent_id(), Some(source_id));
+    assert!(branch[1].completed());
+    let other_branch = store_c
+        .branch_history(&ThreadId::from("sqlite-fork"), other_branch_id)
+        .await
+        .expect("other branch history");
+    assert_eq!(other_branch.len(), 2);
+    assert_eq!(other_branch[0].id(), source_id);
+    assert_eq!(other_branch[1].parent_id(), Some(source_id));
+    assert_ne!(branch[1].id(), other_branch[1].id());
+    assert!(other_branch[1].completed());
+    let default_history = store_c
+        .history(&ThreadId::from("sqlite-fork"))
+        .await
+        .expect("default history");
+    assert_eq!(default_history.len(), 2);
+    assert_eq!(default_history.last().expect("latest").id(), default_latest);
+}
+
+#[tokio::test]
+async fn fan_out_subgraph_and_interrupt_replay_after_file_restart_remain_read_only() {
+    let scenarios = [
+        ("sqlite-replay-fan-out", fan_out_graph(), 3usize),
+        ("sqlite-replay-subgraph", nested_graph(), 1usize),
+    ];
+    for (thread, graph, replay_budget) in scenarios {
+        let (_directory, database_url) = database();
+        let store_a = raw_store(&database_url).await;
+        let typed_a = typed_store(Arc::clone(&store_a));
+        graph
+            .invoke_with_checkpoint(
+                DurableState::default(),
+                RunConfig::new(1),
+                EventConfig::default(),
+                RunControl::default(),
+                CheckpointConfig::new(
+                    thread,
+                    typed_a.clone() as Arc<dyn Checkpointer<Snapshot>>,
+                    CheckpointPolicy::EverySuperstep,
+                ),
+            )
+            .await
+            .expect_err("seed should stop after one node");
+        let source = store_a
+            .latest(&ThreadId::from(thread))
+            .await
+            .expect("latest")
+            .expect("source");
+        let source_id = source.id();
+        let source_parent = source.parent_id();
+        drop(source);
+        drop(typed_a);
+        drop(store_a);
+
+        let store_b = raw_store(&database_url).await;
+        let typed_b = typed_store(Arc::clone(&store_b));
+        let before = store_b
+            .history(&ThreadId::from(thread))
+            .await
+            .expect("before");
+        let replay = graph
+            .replay(
+                ReplayConfig::new(
+                    thread,
+                    source_id,
+                    typed_b as Arc<dyn Checkpointer<Snapshot>>,
+                )
+                .with_run_config(RunConfig::new(replay_budget)),
+            )
+            .await
+            .expect("replay");
+        if thread.contains("fan-out") {
+            assert_eq!(replay.final_state().value, 1);
+            assert_eq!(
+                replay.final_state().observations,
+                [("alpha", 1), ("beta", 1)]
+            );
+            assert_eq!(replay.final_state().applied, ["alpha", "beta", "join"]);
+        } else {
+            assert_eq!(replay.final_state().value, 3);
+        }
+        let after = store_b
+            .history(&ThreadId::from(thread))
+            .await
+            .expect("after");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].id(), source_id);
+        assert_eq!(after[0].parent_id(), source_parent);
+    }
+
+    let (_directory, database_url) = database();
+    let graph = interrupt_graph();
+    let store_a = raw_store(&database_url).await;
+    let typed_a = typed_store(Arc::clone(&store_a));
+    graph
+        .invoke_with_checkpoint(
+            DurableState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                "sqlite-replay-interrupt",
+                typed_a.clone() as Arc<dyn Checkpointer<Snapshot>>,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect("interrupt");
+    let source_id = store_a
+        .latest(&ThreadId::from("sqlite-replay-interrupt"))
+        .await
+        .expect("latest")
+        .expect("source")
+        .id();
+    drop(typed_a);
+    drop(store_a);
+
+    let store_b = raw_store(&database_url).await;
+    let typed_b = typed_store(Arc::clone(&store_b));
+    let replay = graph
+        .replay(
+            ReplayConfig::new(
+                "sqlite-replay-interrupt",
+                source_id,
+                typed_b as Arc<dyn Checkpointer<Snapshot>>,
+            )
+            .with_resume_value(7_u64),
+        )
+        .await
+        .expect("durable interrupt replay");
+    assert_eq!(replay.final_state().value, 7);
+    let after = store_b
+        .history(&ThreadId::from("sqlite-replay-interrupt"))
+        .await
+        .expect("history");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id(), source_id);
+    assert!(after[0].interrupt().is_some());
 }
 
 #[tokio::test]

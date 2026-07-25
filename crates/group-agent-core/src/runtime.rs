@@ -10,16 +10,17 @@ use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::checkpoint::{CheckpointLineage, ReplayParts, ResumeParts};
+use crate::checkpoint::{CheckpointLineage, ForkParts, ReplayParts, ResumeParts};
 use crate::graph::{CompiledItem, CompiledNode};
 use crate::node::NodeKind;
 use crate::transition::{CompiledTransition, RouteDecision, TransitionError};
 use crate::{
-    Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility, CheckpointInterrupt,
-    CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, CompiledGraph,
-    EventConfig, EventRetention, ExecutionOutcome, GraphEvent, GraphRunError, GraphState,
-    InterruptReport, NodeContext, NodeOutcome, NodePath, NodeUpdate, ReplayConfig, ResumeConfig,
-    ResumeTarget, ResumeValue, RunConfig, RunControl, RunFailure, RunId, ThreadId,
+    BranchId, Checkpoint, CheckpointConfig, CheckpointId, CheckpointIncompatibility,
+    CheckpointInterrupt, CheckpointPolicy, CheckpointRequest, CheckpointState,
+    CheckpointWriteError, CompiledGraph, EventConfig, EventRetention, ExecutionOutcome, ForkConfig,
+    GraphEvent, GraphRunError, GraphState, InterruptReport, NodeContext, NodeOutcome, NodePath,
+    NodeUpdate, ReplayConfig, ResumeConfig, ResumeTarget, ResumeValue, RunConfig, RunControl,
+    RunFailure, RunId, ThreadId,
 };
 
 /// The completed report produced when a graph reaches an empty frontier.
@@ -163,6 +164,56 @@ where
     #[must_use]
     pub fn into_run_report(self) -> RunReport<S> {
         self.run
+    }
+}
+
+/// The result of an explicit writable fork.
+#[derive(Clone, Debug)]
+pub struct ForkReport<S>
+where
+    S: GraphState,
+{
+    branch_id: BranchId,
+    source_thread_id: ThreadId,
+    source_checkpoint_id: CheckpointId,
+    outcome: ExecutionOutcome<S>,
+}
+
+impl<S> ForkReport<S>
+where
+    S: GraphState,
+{
+    #[must_use]
+    pub const fn branch_id(&self) -> BranchId {
+        self.branch_id
+    }
+
+    #[must_use]
+    pub const fn source_thread_id(&self) -> &ThreadId {
+        &self.source_thread_id
+    }
+
+    #[must_use]
+    pub const fn source_checkpoint_id(&self) -> CheckpointId {
+        self.source_checkpoint_id
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> RunId {
+        match &self.outcome {
+            ExecutionOutcome::Completed(report) => report.run_id(),
+            ExecutionOutcome::Interrupted(report) => report.run_id(),
+        }
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &ExecutionOutcome<S> {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub fn into_outcome(self) -> ExecutionOutcome<S> {
+        self.outcome
     }
 }
 
@@ -1000,6 +1051,7 @@ where
             event_config,
             control: run_control,
             resume_value,
+            branch_id,
         } = resume_config.into_parts();
         let run_id = RunId::next();
         let control = ActiveControl::new(run_control, invocation_started);
@@ -1020,7 +1072,10 @@ where
         };
         let load = async {
             let checkpoint = match target {
-                ResumeTarget::Latest => checkpointer.latest(&thread_id).await,
+                ResumeTarget::Latest => match branch_id {
+                    Some(branch_id) => checkpointer.branch_head(&thread_id, branch_id).await,
+                    None => checkpointer.latest(&thread_id).await,
+                },
                 ResumeTarget::Checkpoint(checkpoint_id) => {
                     checkpointer.get(&thread_id, checkpoint_id).await
                 }
@@ -1031,10 +1086,20 @@ where
                 checkpoint_id: requested_id,
                 source,
             })?;
-            checkpoint.ok_or_else(|| GraphRunError::CheckpointNotFound {
-                run_id,
-                thread_id: thread_id.clone(),
-                checkpoint_id: requested_id,
+            checkpoint.ok_or_else(|| match branch_id {
+                Some(branch_id) if matches!(target, ResumeTarget::Latest) => {
+                    GraphRunError::BranchNotFound {
+                        run_id,
+                        thread_id: thread_id.clone(),
+                        branch_id,
+                        step: 0,
+                    }
+                }
+                _ => GraphRunError::CheckpointNotFound {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: requested_id,
+                },
             })
         };
         let checkpoint = match await_run_boundary(&control, run_id, 0, load).await {
@@ -1042,6 +1107,21 @@ where
             Err(error) => return events.fail(error),
         };
         let checkpoint_step = checkpoint.step();
+
+        if let Some(requested) = requested_id {
+            if checkpoint.id() != requested {
+                return events.fail(GraphRunError::CheckpointIncompatible {
+                    run_id,
+                    thread_id,
+                    checkpoint_id: requested,
+                    step: checkpoint_step,
+                    reason: CheckpointIncompatibility::CheckpointIdMismatch {
+                        requested,
+                        actual: checkpoint.id(),
+                    },
+                });
+            }
+        }
 
         if checkpoint.thread_id() != &thread_id {
             return events.fail(GraphRunError::CheckpointIncompatible {
@@ -1057,19 +1137,31 @@ where
 
         if matches!(target, ResumeTarget::Checkpoint(_)) {
             let latest = async {
-                checkpointer.latest(&thread_id).await.map_err(|source| {
-                    GraphRunError::CheckpointLoadFailed {
-                        run_id,
-                        thread_id: thread_id.clone(),
-                        checkpoint_id: Some(checkpoint.id()),
-                        source,
-                    }
+                let result = match branch_id {
+                    Some(branch_id) => checkpointer.branch_head(&thread_id, branch_id).await,
+                    None => checkpointer.latest(&thread_id).await,
+                };
+                result.map_err(|source| GraphRunError::CheckpointLoadFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: Some(checkpoint.id()),
+                    source,
                 })
             };
             let latest = match await_run_boundary(&control, run_id, checkpoint_step, latest).await {
                 Ok(latest) => latest,
                 Err(error) => return events.fail(error),
             };
+            if latest.is_none() {
+                if let Some(branch_id) = branch_id {
+                    return events.fail(GraphRunError::BranchNotFound {
+                        run_id,
+                        thread_id,
+                        branch_id,
+                        step: checkpoint_step,
+                    });
+                }
+            }
             let latest_checkpoint_id = latest.as_ref().map(|checkpoint| checkpoint.id());
             if latest_checkpoint_id != Some(checkpoint.id()) {
                 return events.fail(GraphRunError::ResumeConflict {
@@ -1144,6 +1236,16 @@ where
             step: checkpoint_step,
             superstep: checkpoint.superstep(),
         });
+        if let Some(branch_id) = branch_id {
+            events.emit(|| GraphEvent::BranchResumed {
+                run_id,
+                thread_id: thread_id.clone(),
+                branch_id,
+                checkpoint_id: checkpoint.id(),
+                step: checkpoint_step,
+                superstep: checkpoint.superstep(),
+            });
+        }
         if let Some(first) = frontier.first() {
             let graph_path = &self.node_at(*first).graph_path;
             for graph_path in graph_path.prefixes() {
@@ -1153,6 +1255,10 @@ where
 
         let checkpoint_config = CheckpointConfig::new(thread_id, checkpointer, checkpoint_policy)
             .with_expected_parent(Some(checkpoint.id()));
+        let checkpoint_config = match branch_id {
+            Some(branch_id) => checkpoint_config.with_branch_id(branch_id),
+            None => checkpoint_config,
+        };
         self.execute_internal(
             Execution {
                 run_id,
@@ -1233,6 +1339,19 @@ where
         };
         let checkpoint_step = checkpoint.step();
         let checkpoint_superstep = checkpoint.superstep();
+
+        if checkpoint.id() != checkpoint_id {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id,
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::CheckpointIdMismatch {
+                    requested: checkpoint_id,
+                    actual: checkpoint.id(),
+                },
+            });
+        }
 
         if checkpoint.thread_id() != &thread_id {
             return events.fail(GraphRunError::CheckpointIncompatible {
@@ -1349,6 +1468,203 @@ where
                 unreachable!("read-only replay rejects every node interrupt")
             }
         }
+    }
+
+    /// Creates an explicit branch from one exact historical checkpoint and runs it.
+    ///
+    /// The source thread head and history are read-only. All checkpoints
+    /// produced by this invocation use the new branch's independent CAS head.
+    pub async fn fork(
+        &self,
+        fork_config: ForkConfig<S::Snapshot>,
+    ) -> Result<ForkReport<S>, GraphRunError> {
+        let invocation_started = Instant::now();
+        let ForkParts {
+            thread_id,
+            checkpoint_id,
+            branch_id,
+            checkpointer,
+            checkpoint_policy,
+            run_config,
+            event_config,
+            control: run_control,
+            resume_value,
+        } = fork_config.into_parts();
+        let run_id = RunId::next();
+        let control = ActiveControl::new(run_control, invocation_started);
+        let mut events = EventEmitter::new(run_id, &event_config);
+        events.emit(|| GraphEvent::RunStarted {
+            run_id,
+            max_steps: run_config.max_steps,
+        });
+
+        if let Some(error) = control.check(run_id, None, 0, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        let load = async {
+            checkpointer
+                .get(&thread_id, checkpoint_id)
+                .await
+                .map_err(|source| GraphRunError::CheckpointLoadFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: Some(checkpoint_id),
+                    source,
+                })?
+                .ok_or_else(|| GraphRunError::CheckpointNotFound {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    checkpoint_id: Some(checkpoint_id),
+                })
+        };
+        let checkpoint = match await_run_boundary(&control, run_id, 0, load).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return events.fail(error),
+        };
+        let checkpoint_step = checkpoint.step();
+        let checkpoint_superstep = checkpoint.superstep();
+
+        if checkpoint.id() != checkpoint_id {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id,
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::CheckpointIdMismatch {
+                    requested: checkpoint_id,
+                    actual: checkpoint.id(),
+                },
+            });
+        }
+        if checkpoint.thread_id() != &thread_id {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id,
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::ThreadMismatch {
+                    actual_thread: checkpoint.thread_id().clone(),
+                },
+            });
+        }
+
+        let frontier = match self.validate_and_resolve_checkpoint_frontier(&checkpoint) {
+            Ok(frontier) => frontier,
+            Err(reason) => {
+                return events.fail(GraphRunError::CheckpointIncompatible {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    step: checkpoint_step,
+                    reason,
+                });
+            }
+        };
+        let (resume_node, resume_value) = match (checkpoint.interrupt(), resume_value) {
+            (Some(_), Some(value)) => (frontier.first().copied(), Some(value)),
+            (Some(interrupt), None) => {
+                return events.fail(GraphRunError::MissingResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    interrupt_id: interrupt.id(),
+                    node_id: interrupt.node_path().clone(),
+                    step: checkpoint_step,
+                });
+            }
+            (None, Some(_)) => {
+                return events.fail(GraphRunError::UnexpectedResumeValue {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    step: checkpoint_step,
+                });
+            }
+            (None, None) => (None, None),
+        };
+
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+        let state = match S::restore(checkpoint.snapshot()) {
+            Ok(state) => state,
+            Err(source) => {
+                return events.fail(GraphRunError::RestoreFailed {
+                    run_id,
+                    thread_id,
+                    checkpoint_id,
+                    superstep: checkpoint_superstep,
+                    step: checkpoint_step,
+                    source,
+                });
+            }
+        };
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        let create = async {
+            checkpointer
+                .create_branch(&thread_id, branch_id, checkpoint_id)
+                .await
+                .map_err(|source| GraphRunError::BranchCreationFailed {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    branch_id,
+                    source_checkpoint_id: checkpoint_id,
+                    step: checkpoint_step,
+                    source,
+                })
+        };
+        if let Err(error) = await_run_boundary(&control, run_id, checkpoint_step, create).await {
+            return events.fail(error);
+        }
+
+        events.emit(|| GraphEvent::ForkStarted {
+            run_id,
+            source_thread_id: thread_id.clone(),
+            source_checkpoint_id: checkpoint_id,
+            branch_id,
+            step: checkpoint_step,
+            superstep: checkpoint_superstep,
+        });
+        if let Some(first) = frontier.first() {
+            let graph_path = &self.node_at(*first).graph_path;
+            for graph_path in graph_path.prefixes() {
+                events.emit(|| GraphEvent::SubgraphStarted { run_id, graph_path });
+            }
+        }
+
+        let checkpoint_config =
+            CheckpointConfig::new(thread_id.clone(), checkpointer, checkpoint_policy)
+                .with_expected_parent(Some(checkpoint_id))
+                .with_branch_id(branch_id);
+        let outcome = self
+            .execute_internal(
+                Execution {
+                    run_id,
+                    state,
+                    steps: checkpoint_step,
+                    visited_nodes: Vec::new(),
+                    events,
+                    frontier,
+                    superstep: checkpoint_superstep,
+                    save_empty_checkpoint: false,
+                    resume_node,
+                    resume_value,
+                },
+                run_config,
+                control,
+                EnabledCheckpoint::new(checkpoint_config, self.version.clone()),
+            )
+            .await?;
+        Ok(ForkReport {
+            branch_id,
+            source_thread_id: thread_id,
+            source_checkpoint_id: checkpoint_id,
+            outcome,
+        })
     }
 
     /// Invokes with checkpointing and returns completion or saved suspension.
@@ -1690,16 +2006,26 @@ where
             completed,
             interrupt,
         );
-        let checkpoint = self
-            .config
-            .checkpointer()
-            .save(request)
-            .await
-            .map_err(|source| match source {
-                CheckpointWriteError::Conflict {
+        let branch_id = self.config.branch_id();
+        let save = match branch_id {
+            Some(branch_id) => self.config.checkpointer().save_branch(branch_id, request),
+            None => self.config.checkpointer().save(request),
+        };
+        let checkpoint = save.await.map_err(|source| match source {
+            CheckpointWriteError::Conflict {
+                expected_parent,
+                actual_parent,
+            } => match branch_id {
+                Some(branch_id) => GraphRunError::BranchCheckpointConflict {
+                    run_id,
+                    thread_id: thread_id.clone(),
+                    branch_id,
+                    superstep,
+                    step,
                     expected_parent,
                     actual_parent,
-                } => GraphRunError::CheckpointConflict {
+                },
+                None => GraphRunError::CheckpointConflict {
                     run_id,
                     thread_id: thread_id.clone(),
                     superstep,
@@ -1707,30 +2033,44 @@ where
                     expected_parent,
                     actual_parent,
                 },
-                CheckpointWriteError::Failed(source) => GraphRunError::CheckpointSaveFailed {
+            },
+            CheckpointWriteError::Failed(source) => GraphRunError::CheckpointSaveFailed {
+                run_id,
+                thread_id: thread_id.clone(),
+                superstep,
+                step,
+                source,
+            },
+            CheckpointWriteError::IdempotencyConflict { checkpoint_id } => {
+                GraphRunError::CheckpointIdConflict {
                     run_id,
                     thread_id: thread_id.clone(),
+                    checkpoint_id,
                     superstep,
                     step,
-                    source,
-                },
-                CheckpointWriteError::IdempotencyConflict { checkpoint_id } => {
-                    GraphRunError::CheckpointIdConflict {
-                        run_id,
-                        thread_id: thread_id.clone(),
-                        checkpoint_id,
-                        superstep,
-                        step,
-                    }
                 }
-                CheckpointWriteError::Encoding(source) => GraphRunError::CheckpointEncodeFailed {
-                    run_id,
-                    thread_id: thread_id.clone(),
-                    superstep,
-                    step,
+            }
+            CheckpointWriteError::Encoding(source) => GraphRunError::CheckpointEncodeFailed {
+                run_id,
+                thread_id: thread_id.clone(),
+                superstep,
+                step,
+                source,
+            },
+            source @ (CheckpointWriteError::BranchAlreadyExists { .. }
+            | CheckpointWriteError::BranchNotFound { .. }
+            | CheckpointWriteError::BranchSourceNotFound { .. }
+            | CheckpointWriteError::BranchUnsupported) => GraphRunError::CheckpointSaveFailed {
+                run_id,
+                thread_id: thread_id.clone(),
+                superstep,
+                step,
+                source: crate::CheckpointerError::with_source(
+                    "checkpoint branch save failed",
                     source,
-                },
-            })?;
+                ),
+            },
+        })?;
         self.expected_parent = Some(checkpoint.id());
         Ok(SavedCheckpoint {
             id: checkpoint.id(),
@@ -2137,6 +2477,44 @@ impl From<&GraphRunError> for RunFailure {
                 latest_checkpoint_id: *latest_checkpoint_id,
                 step: *step,
             },
+            GraphRunError::BranchNotFound {
+                thread_id,
+                branch_id,
+                step,
+                ..
+            } => Self::BranchNotFound {
+                thread_id: thread_id.clone(),
+                branch_id: *branch_id,
+                step: *step,
+            },
+            GraphRunError::BranchCreationFailed {
+                thread_id,
+                branch_id,
+                source_checkpoint_id,
+                step,
+                ..
+            } => Self::BranchCreationFailed {
+                thread_id: thread_id.clone(),
+                branch_id: *branch_id,
+                source_checkpoint_id: *source_checkpoint_id,
+                step: *step,
+            },
+            GraphRunError::BranchCheckpointConflict {
+                thread_id,
+                branch_id,
+                superstep,
+                step,
+                expected_parent,
+                actual_parent,
+                ..
+            } => Self::BranchCheckpointConflict {
+                thread_id: thread_id.clone(),
+                branch_id: *branch_id,
+                superstep: *superstep,
+                step: *step,
+                expected_parent: *expected_parent,
+                actual_parent: *actual_parent,
+            },
             GraphRunError::CheckpointIncompatible {
                 thread_id,
                 checkpoint_id,
@@ -2343,6 +2721,42 @@ mod resume_validation_tests {
         }
     }
 
+    struct WrongIdCheckpointer {
+        checkpoint: Arc<Checkpoint<ValidationSnapshot>>,
+    }
+
+    #[async_trait]
+    impl Checkpointer<ValidationSnapshot> for WrongIdCheckpointer {
+        async fn save(
+            &self,
+            request: CheckpointRequest<ValidationSnapshot>,
+        ) -> Result<Arc<Checkpoint<ValidationSnapshot>>, CheckpointWriteError> {
+            Ok(Arc::new(request.into_checkpoint()))
+        }
+
+        async fn latest(
+            &self,
+            _thread_id: &ThreadId,
+        ) -> Result<Option<Arc<Checkpoint<ValidationSnapshot>>>, CheckpointerError> {
+            Ok(Some(Arc::clone(&self.checkpoint)))
+        }
+
+        async fn get(
+            &self,
+            _thread_id: &ThreadId,
+            _checkpoint_id: CheckpointId,
+        ) -> Result<Option<Arc<Checkpoint<ValidationSnapshot>>>, CheckpointerError> {
+            Ok(Some(Arc::clone(&self.checkpoint)))
+        }
+
+        async fn history(
+            &self,
+            _thread_id: &ThreadId,
+        ) -> Result<Vec<Arc<Checkpoint<ValidationSnapshot>>>, CheckpointerError> {
+            Ok(vec![Arc::clone(&self.checkpoint)])
+        }
+    }
+
     fn validation_graph() -> CompiledGraph<ValidationState> {
         let mut graph = StateGraph::new();
         graph.set_version("validation-v1");
@@ -2460,17 +2874,42 @@ mod resume_validation_tests {
         expected: CheckpointIncompatibility,
     ) {
         let (checkpoint, restore_calls) = forged_checkpoint(frontier, completed);
+        let checkpoint_id = checkpoint.id();
         let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
             Arc::new(StaticCheckpointer { checkpoint });
         let error = graph
-            .resume(ResumeConfig::new("validation-thread", store))
+            .resume(ResumeConfig::new("validation-thread", Arc::clone(&store)))
             .await
             .expect_err("forged checkpoint should be incompatible");
         match error {
             GraphRunError::CheckpointIncompatible { reason, .. } => {
-                assert_eq!(reason, expected);
+                assert_eq!(reason, expected.clone());
             }
             other => panic!("unexpected resume error: {other}"),
+        }
+        let error = graph
+            .replay(ReplayConfig::new(
+                "validation-thread",
+                checkpoint_id,
+                Arc::clone(&store),
+            ))
+            .await
+            .expect_err("forged replay checkpoint should be incompatible");
+        match error {
+            GraphRunError::CheckpointIncompatible { reason, .. } => {
+                assert_eq!(reason, expected.clone());
+            }
+            other => panic!("unexpected replay error: {other}"),
+        }
+        let error = graph
+            .fork(ForkConfig::new("validation-thread", checkpoint_id, store))
+            .await
+            .expect_err("forged fork checkpoint should be incompatible");
+        match error {
+            GraphRunError::CheckpointIncompatible { reason, .. } => {
+                assert_eq!(reason, expected);
+            }
+            other => panic!("unexpected fork error: {other}"),
         }
         assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
     }
@@ -2483,6 +2922,54 @@ mod resume_validation_tests {
             CheckpointIncompatibility::StartInFrontier,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn exact_load_rejects_a_checkpointer_that_returns_the_wrong_id() {
+        let graph = validation_graph();
+        let (checkpoint, restore_calls) = forged_checkpoint(vec![NodePath::from("valid")], false);
+        let actual = checkpoint.id();
+        let requested = CheckpointId::new();
+        let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
+            Arc::new(WrongIdCheckpointer { checkpoint });
+
+        for error in [
+            graph
+                .resume(
+                    ResumeConfig::new("validation-thread", Arc::clone(&store))
+                        .with_checkpoint_id(requested),
+                )
+                .await
+                .expect_err("resume must reject wrong id"),
+            graph
+                .replay(ReplayConfig::new(
+                    "validation-thread",
+                    requested,
+                    Arc::clone(&store),
+                ))
+                .await
+                .expect_err("replay must reject wrong id"),
+            graph
+                .fork(ForkConfig::new(
+                    "validation-thread",
+                    requested,
+                    Arc::clone(&store),
+                ))
+                .await
+                .expect_err("fork must reject wrong id"),
+        ] {
+            assert!(matches!(
+                error,
+                GraphRunError::CheckpointIncompatible {
+                    reason: CheckpointIncompatibility::CheckpointIdMismatch {
+                        requested: found_requested,
+                        actual: found_actual,
+                    },
+                    ..
+                } if found_requested == requested && found_actual == actual
+            ));
+        }
+        assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2562,19 +3049,27 @@ mod resume_validation_tests {
             .into_checkpoint(NodePath::new(&GraphPath::new(["child"]), "valid"));
         let (checkpoint, restore_calls) =
             forged_checkpoint_with_interrupt(vec![NodePath::from("valid")], false, Some(interrupt));
+        let checkpoint_id = checkpoint.id();
         let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
             Arc::new(StaticCheckpointer { checkpoint });
-        let error = validation_graph()
-            .resume(ResumeConfig::new("validation-thread", store))
-            .await
-            .expect_err("mismatched interrupt metadata should be incompatible");
-        assert!(matches!(
-            error,
-            GraphRunError::CheckpointIncompatible {
-                reason: CheckpointIncompatibility::InvalidInterruptFrontier { .. },
-                ..
-            }
-        ));
+        for error in [
+            validation_graph()
+                .resume(ResumeConfig::new("validation-thread", Arc::clone(&store)))
+                .await
+                .expect_err("mismatched resume interrupt metadata"),
+            validation_graph()
+                .replay(ReplayConfig::new("validation-thread", checkpoint_id, store))
+                .await
+                .expect_err("mismatched replay interrupt metadata"),
+        ] {
+            assert!(matches!(
+                error,
+                GraphRunError::CheckpointIncompatible {
+                    reason: CheckpointIncompatibility::InvalidInterruptFrontier { .. },
+                    ..
+                }
+            ));
+        }
         assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2611,23 +3106,32 @@ mod resume_validation_tests {
             .into_checkpoint(invalid_interrupt_path.clone());
         let (checkpoint, restore_calls) =
             forged_checkpoint_with_interrupt(vec![valid.clone()], false, Some(interrupt));
+        let checkpoint_id = checkpoint.id();
         let store: Arc<dyn Checkpointer<ValidationSnapshot>> =
             Arc::new(StaticCheckpointer { checkpoint });
-        let error = nested_validation_graph()
-            .resume(ResumeConfig::new("validation-thread", store))
-            .await
-            .expect_err("nested interrupt metadata should be incompatible");
-        assert!(matches!(
-            error,
-            GraphRunError::CheckpointIncompatible {
-                reason:
-                    CheckpointIncompatibility::InvalidInterruptFrontier {
-                        interrupt_node,
-                        frontier,
-                    },
-                ..
-            } if interrupt_node == invalid_interrupt_path && frontier == vec![valid]
-        ));
+        for error in [
+            nested_validation_graph()
+                .resume(ResumeConfig::new("validation-thread", Arc::clone(&store)))
+                .await
+                .expect_err("nested resume interrupt metadata"),
+            nested_validation_graph()
+                .replay(ReplayConfig::new("validation-thread", checkpoint_id, store))
+                .await
+                .expect_err("nested replay interrupt metadata"),
+        ] {
+            assert!(matches!(
+                error,
+                GraphRunError::CheckpointIncompatible {
+                    reason:
+                        CheckpointIncompatibility::InvalidInterruptFrontier {
+                            ref interrupt_node,
+                            ref frontier,
+                        },
+                    ..
+                } if interrupt_node == &invalid_interrupt_path
+                    && frontier.as_slice() == std::slice::from_ref(&valid)
+            ));
+        }
         assert_eq!(restore_calls.load(Ordering::SeqCst), 0);
     }
 }

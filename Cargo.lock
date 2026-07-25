@@ -530,6 +530,7 @@ name = "group-agent-checkpoint-sqlite"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "criterion",
  "group-agent-core",
  "serde",
  "serde_json",

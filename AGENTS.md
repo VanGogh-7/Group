@@ -25,6 +25,8 @@ The current workspace provides an immutable compiled state-graph core with:
 - latest-only resume from specified or latest versioned checkpoints;
 - read-only replay from an explicitly selected historical checkpoint without
   changing thread head, history, or lineage;
+- explicit writable forks from historical checkpoints with `BranchId`,
+  isolated branch heads/history, and independent CAS;
 - restoration of state, frontier, cumulative steps, and super-step position;
 - typed node interrupts, interrupted checkpoints, and typed resume values;
 - completed-or-interrupted execution outcomes for checkpoint-enabled runs;
@@ -81,7 +83,7 @@ The current workspace provides an immutable compiled state-graph core with:
   work once.
 - `CompiledGraph` is immutable and reusable. It stores pre-resolved internal
   indices and must not expose `petgraph` or other internal cursor types.
-- Graphs intended for resume or replay use an explicit `GraphVersion`.
+- Graphs intended for resume, replay, or fork use an explicit `GraphVersion`.
   Checkpoints from unversioned graphs are saveable but cannot be resumed or
   replayed.
 - The root `GraphVersion` covers the complete composed graph. Any incompatible
@@ -368,9 +370,13 @@ The current workspace provides an immutable compiled state-graph core with:
 - Cancellation and run timeout start at resume entry and remain active during
   checkpoint loading and subsequent execution. Resume failure saves no new
   checkpoint.
-- There is no fork, branch head, time travel, parallel interrupt, or PostgreSQL
-  persistence. SQLite is provided by an independent Store adapter. Encoding is
-  user-defined through codecs; no built-in Serde format is imposed.
+- A default Resume remains latest-only on the default thread head. A Resume
+  configured with `BranchId` is latest-only on that branch head and emits
+  `BranchResumed` after `RunResumed`.
+- There is no implicit fork, State patch, branch merge/deletion, time travel,
+  parallel interrupt, or PostgreSQL persistence. SQLite is provided by an
+  independent Store adapter. Encoding is user-defined through codecs; no
+  built-in Serde format is imposed.
 
 ## Replay boundaries
 
@@ -410,8 +416,60 @@ The current workspace provides an immutable compiled state-graph core with:
 - Replay re-executes user nodes and can duplicate external database, network,
   tool, or other side effects. Runtime provides no rollback, sandbox, or
   automatic deduplication.
-- Replay is not Fork. `BranchId`, branch heads, and writable descendants from a
-  historical checkpoint are deferred to Stage 15.
+- Replay is not Fork and cannot select or advance a branch head.
+
+## Fork and branch boundaries
+
+- `ForkConfig` requires an exact `ThreadId` and `CheckpointId`, allocates a new
+  `BranchId` by default, and may accept an explicit collision-checked ID.
+- Fork loads through exact `get`, defensively verifies the returned checkpoint
+  ID, validates and resolves the saved frontier before restore, restores
+  outside Store locks, then creates a branch whose initial head is the exact
+  source checkpoint.
+- The source need not be latest. Fork never changes the default thread head,
+  default history, another branch, or any historical Record.
+- `CheckpointRecord`, Codec identity, and content-idempotency semantics remain
+  frozen. Branch ownership, source, head, and Record membership are additive
+  Store metadata rather than Record fields.
+- `Checkpointer` and `CheckpointStore` expose additive `create_branch`,
+  `save_branch`, `branch_head`, and `branch_history` methods. Implementations
+  without branch capability fail explicitly; the in-memory and SQLite adapters
+  implement the capability.
+- Every `BranchId` has exactly one owning `ThreadId`. Its source, head, and
+  membership Records must all belong to that same thread.
+- Duplicate `create_branch` returns `BranchAlreadyExists`, including an exact
+  repeat with the same thread and source; creation is not idempotent success.
+- Failed branch creation creates no Branch. Once creation succeeds, later Fork
+  execution failure preserves the Branch at its last confirmed head. A failure
+  before the first descendant save therefore leaves the source as the head and
+  allows a later explicit branch Resume.
+- An absent branch or a branch queried with the wrong thread makes
+  `branch_head` return `None` and `branch_history` return an empty collection.
+- Branch history begins with the shared source Record and continues through
+  branch-only descendants. Each descendant's ordinary `parent_id` must match
+  the prior branch head.
+- Branch save performs ID/content idempotency before an independent branch-head
+  CAS. Concurrent writers from one branch parent allow only one successful
+  successor and cannot form another implicit fork.
+- Fork assigns a new `RunId` and emits `RunStarted -> ForkStarted -> continued
+  events`. `ForkStarted` carries source thread/checkpoint, branch ID, and
+  historical step/super-step. A completed source is a no-op execution with a
+  newly created branch head.
+- Fork reuses the existing execution/checkpoint kernel. Conditional fan-out,
+  nested subgraphs, Interrupt, cumulative counters, failure reuse, and
+  additional `max_steps` retain their existing semantics. An Interrupt writes
+  to the branch and can later be resumed with an explicit branch Resume value.
+- `CheckpointConfig::with_branch_id` selects branch CAS but does not infer
+  lineage; `expected_parent` must be the current head of that exact branch.
+- Resume remains latest-only continuation, Replay remains exact historical
+  read-only execution, and Fork remains the only branch-creation operation.
+- Fork starts from the exact historical State. State patches, branch merge,
+  branch deletion, and implicit branch selection are out of scope.
+- SQLite migrations `0002_branch_heads.sql` and
+  `0003_branch_ownership.sql` persist branch metadata and enforce composite
+  ThreadId ownership for source, head, and membership. Branch Record insertion,
+  membership insertion, and branch-head update occur in one short
+  `BEGIN IMMEDIATE` transaction and roll back together.
 
 ## Suspension boundaries
 
@@ -458,6 +516,9 @@ The current workspace provides an immutable compiled state-graph core with:
 - Replay traverses only its exact saved frontier, performs one exact
   `Checkpointer::get`, and reuses the same execution kernel with storage writes
   disabled. It must not add ordinary invoke or Resume hot-path work.
+- Fork traverses only its exact source frontier and adds no work to ordinary
+  invoke, default Resume, or Replay. Branch metadata is touched only when
+  explicitly requested.
 - Frontier deduplication must operate on produced successors and must not scan
   every compiled graph node.
 - Do not clone complete state values per step.
@@ -489,18 +550,18 @@ The current workspace provides an immutable compiled state-graph core with:
 
 ## Out of scope
 
-Do not add parent/child State mapping, parent-frontier parallel subgraphs, Fork,
-`BranchId`, branch heads, Replay writes, historical State modification, time
-travel, parallel interrupts, PostgreSQL, forced Serde bounds or built-in Serde
-codecs, arbitrary Node Command or Send APIs, conditional fan-out into subgraph
-mounts, custom asynchronous event backpressure, disk event queues,
-OpenTelemetry or metrics exporters, WebSocket or SSE servers, network event
-proxies, LLM providers, tool calling, MCP, RAG, token streaming, standalone
-reducer registration, Tower middleware, Axum, distributed workers, macro DSLs,
-or a visual interface unless a later stage explicitly authorizes them. SQLite
-is the sole reference database backend and Tokio broadcast is the sole stream
-adapter in this stage. Fork and branch heads are deferred to Stage 15. Do not
-create placeholder crates for future capabilities.
+Do not add State patches, branch merge, branch deletion, parent/child State
+mapping, parent-frontier parallel subgraphs, Replay writes, historical State
+modification, time travel, parallel interrupts, PostgreSQL, forced Serde bounds
+or built-in Serde codecs, arbitrary Node Command or Send APIs, conditional
+fan-out into subgraph mounts, custom asynchronous event backpressure, disk
+event queues, OpenTelemetry or metrics exporters, WebSocket or SSE servers,
+network event proxies, LLM providers, tool calling, MCP, RAG, token streaming,
+standalone reducer registration, Tower middleware, Axum, distributed workers,
+macro DSLs, or a visual interface unless a later stage explicitly authorizes
+them. SQLite is the sole reference database backend and Tokio broadcast is the
+sole stream adapter in this stage. Do not create placeholder crates for future
+capabilities.
 
 ## Rust and code standards
 
@@ -522,6 +583,7 @@ Run these commands after implementation changes:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+cargo run -p group-agent-core --example fork
 cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
@@ -536,8 +598,7 @@ cargo +1.85.0 check --workspace --all-targets --all-features
 cargo +1.85.0 test --workspace
 ```
 
-Inspect the resolved dependency direction and finally check the working-tree
-diff:
+Finally inspect dependencies and check the working-tree diff:
 
 ```bash
 cargo tree --workspace
@@ -571,4 +632,5 @@ repository architecture review before starting the next feature stage.
 Corrective stages such as Stage 5.1 do not count toward this cadence.
 Stage 9.1 Review has passed. Stage 10.1 supplied the durable-checkpoint contract
 correction identified by the Stage 10 architecture review. Stages 11 through
-14 preserve that reviewed Record/Codec/Store boundary.
+15 preserve that reviewed Record/Codec/content-idempotency boundary; branch
+metadata is additive Store capability.

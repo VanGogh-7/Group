@@ -15,8 +15,13 @@ sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile = "3.23.0"
 tokio.workspace = true
+
+[[bench]]
+name = "branch_restart"
+harness = false
 
 [lints]
 workspace = true

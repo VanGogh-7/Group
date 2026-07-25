@@ -8,11 +8,11 @@ use group_agent_core::{
     Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointId,
     CheckpointPolicy, CheckpointRecord, CheckpointRecordParts, CheckpointRequest, CheckpointState,
     CheckpointStore, CheckpointWriteError, Checkpointer, CheckpointerError, CodecDescriptor,
-    CompiledGraph, END, EncodedValue, EventConfig, EventRetention, GraphState, GraphVersion,
-    InMemoryCheckpointStore, InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node,
-    NodeContext, NodeError, NodeId, NodeOutcome, NodePath, NodeUpdate, RecordCheckpointer,
-    ReplayConfig, ResumeConfig, RunConfig, RunControl, RunId, START, SnapshotError, StateError,
-    StateGraph, ThreadId,
+    CompiledGraph, END, EncodedValue, EventConfig, EventRetention, ForkConfig, GraphState,
+    GraphVersion, InMemoryCheckpointStore, InMemoryCheckpointer, InterruptPayload,
+    InterruptibleNode, Node, NodeContext, NodeError, NodeId, NodeOutcome, NodePath, NodeUpdate,
+    RecordCheckpointer, ReplayConfig, ResumeConfig, RunConfig, RunControl, RunId, START,
+    SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -178,6 +178,69 @@ impl Checkpointer<usize> for ResumeBenchCheckpointer {
         } else {
             Vec::new()
         })
+    }
+}
+
+struct BranchResumeBenchCheckpointer {
+    checkpoint: Arc<Checkpoint<usize>>,
+    branch_id: group_agent_core::BranchId,
+}
+
+#[async_trait]
+impl Checkpointer<usize> for BranchResumeBenchCheckpointer {
+    async fn save(
+        &self,
+        request: CheckpointRequest<usize>,
+    ) -> Result<Arc<Checkpoint<usize>>, CheckpointWriteError> {
+        Ok(Arc::new(request.into_checkpoint()))
+    }
+
+    async fn latest(
+        &self,
+        _thread_id: &ThreadId,
+    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(None)
+    }
+
+    async fn history(
+        &self,
+        _thread_id: &ThreadId,
+    ) -> Result<Vec<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(Vec::new())
+    }
+
+    async fn save_branch(
+        &self,
+        branch_id: group_agent_core::BranchId,
+        request: CheckpointRequest<usize>,
+    ) -> Result<Arc<Checkpoint<usize>>, CheckpointWriteError> {
+        assert_eq!(branch_id, self.branch_id);
+        Ok(Arc::new(request.into_checkpoint()))
+    }
+
+    async fn branch_head(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: group_agent_core::BranchId,
+    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(
+            (branch_id == self.branch_id && self.checkpoint.thread_id() == thread_id)
+                .then(|| Arc::clone(&self.checkpoint)),
+        )
+    }
+
+    async fn branch_history(
+        &self,
+        thread_id: &ThreadId,
+        branch_id: group_agent_core::BranchId,
+    ) -> Result<Vec<Arc<Checkpoint<usize>>>, CheckpointerError> {
+        Ok(
+            if branch_id == self.branch_id && self.checkpoint.thread_id() == thread_id {
+                vec![Arc::clone(&self.checkpoint)]
+            } else {
+                Vec::new()
+            },
+        )
     }
 }
 
@@ -386,6 +449,12 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .expect("middle checkpoint query should succeed")
         .expect("middle checkpoint should exist");
     let middle_checkpoint_id = middle_checkpoint.id();
+    let branch_resume_id = group_agent_core::BranchId::new();
+    let branch_resume_store: Arc<dyn Checkpointer<usize>> =
+        Arc::new(BranchResumeBenchCheckpointer {
+            checkpoint: Arc::clone(&middle_checkpoint),
+            branch_id: branch_resume_id,
+        });
     let middle_record = runtime
         .block_on(
             middle_store
@@ -773,6 +842,45 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         );
     });
 
+    criterion.bench_function("fork_middle_checkpoint_one_immediate_node", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ForkConfig::new(
+                    "resume-middle-benchmark",
+                    middle_checkpoint_id,
+                    Arc::clone(&middle_store) as Arc<dyn Checkpointer<usize>>,
+                )
+                .with_run_config(RunConfig::new(1))
+            },
+            |config| async {
+                let report = fixed_2
+                    .fork(config)
+                    .await
+                    .expect("middle fork benchmark should succeed");
+                black_box(report.outcome().steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    criterion.bench_function("branch_resume_one_immediate_node", |bencher| {
+        bencher.to_async(&runtime).iter_batched(
+            || {
+                ResumeConfig::new("resume-middle-benchmark", Arc::clone(&branch_resume_store))
+                    .with_branch_id(branch_resume_id)
+                    .with_run_config(RunConfig::new(1))
+            },
+            |config| async {
+                let report = fixed_2
+                    .resume(config)
+                    .await
+                    .expect("branch resume benchmark should succeed");
+                black_box(report.steps());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     criterion.bench_function("replay_completed_checkpoint_noop", |bencher| {
         bencher.to_async(&runtime).iter_batched(
             || {
@@ -1074,5 +1182,13 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, runtime_benchmarks);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(100)
+        .warm_up_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(5))
+        .noise_threshold(0.03);
+    targets = runtime_benchmarks
+}
 criterion_main!(benches);

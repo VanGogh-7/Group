@@ -10,10 +10,10 @@ use group_agent_core::{
     Checkpoint, CheckpointCodec, CheckpointCodecError, CheckpointConfig, CheckpointId,
     CheckpointPolicy, CheckpointRequest, CheckpointState, CheckpointWriteError, Checkpointer,
     CheckpointerError, CodecDescriptor, CompiledGraph, END, EncodedValue, EventConfig,
-    EventRetention, EventSink, GraphEvent, GraphRunError, GraphState, InMemoryCheckpointer,
-    InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError, NodeId, NodeOutcome,
-    NodePath, NodeUpdate, ReplayConfig, RunConfig, RunControl, RunFailure, START, SnapshotError,
-    StateError, StateGraph, ThreadId,
+    EventRetention, EventSink, ForkConfig, GraphEvent, GraphRunError, GraphState,
+    InMemoryCheckpointer, InterruptPayload, InterruptibleNode, Node, NodeContext, NodeError,
+    NodeId, NodeOutcome, NodePath, NodeUpdate, ReplayConfig, RunConfig, RunControl, RunFailure,
+    START, SnapshotError, StateError, StateGraph, ThreadId,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -362,6 +362,92 @@ async fn non_latest_replay_succeeds_and_leaves_latest_history_and_lineage_unchan
     );
 }
 
+#[tokio::test]
+async fn replaying_a_branch_descendant_changes_no_default_or_branch_lineage() {
+    let graph = linear_graph();
+    let store = store();
+    let default = complete_history(&graph, "branch-replay", &store).await;
+    let source_id = default[0].id();
+    let left = ForkConfig::new(
+        "branch-replay",
+        source_id,
+        Arc::clone(&store) as Arc<dyn Checkpointer<ReplaySnapshot>>,
+    )
+    .with_run_config(RunConfig::new(1));
+    let left_id = left.branch_id();
+    graph
+        .fork(left)
+        .await
+        .expect_err("left stops after one node");
+    let right = ForkConfig::new(
+        "branch-replay",
+        source_id,
+        Arc::clone(&store) as Arc<dyn Checkpointer<ReplaySnapshot>>,
+    )
+    .with_run_config(RunConfig::new(1));
+    let right_id = right.branch_id();
+    graph
+        .fork(right)
+        .await
+        .expect_err("right stops after one node");
+
+    let default_before = history_shape(
+        &store
+            .history(&ThreadId::from("branch-replay"))
+            .await
+            .expect("default"),
+    );
+    let left_before = history_shape(
+        &store
+            .branch_history(&ThreadId::from("branch-replay"), left_id)
+            .await
+            .expect("left"),
+    );
+    let right_before = history_shape(
+        &store
+            .branch_history(&ThreadId::from("branch-replay"), right_id)
+            .await
+            .expect("right"),
+    );
+    let descendant = left_before.last().expect("left descendant").0;
+
+    let replay = graph
+        .replay(
+            replay_config("branch-replay", descendant, &store).with_run_config(RunConfig::new(1)),
+        )
+        .await
+        .expect("branch descendant replay");
+    assert_eq!(replay.final_state().value, 6);
+
+    assert_eq!(
+        history_shape(
+            &store
+                .history(&ThreadId::from("branch-replay"))
+                .await
+                .expect("default after")
+        ),
+        default_before
+    );
+    assert_eq!(
+        history_shape(
+            &store
+                .branch_history(&ThreadId::from("branch-replay"), left_id)
+                .await
+                .expect("left after")
+        ),
+        left_before
+    );
+    assert_eq!(
+        history_shape(
+            &store
+                .branch_history(&ThreadId::from("branch-replay"), right_id)
+                .await
+                .expect("right after")
+        ),
+        right_before
+    );
+}
+
 struct BlockingAdd {
     amount: usize,
     block_once: Arc<AtomicBool>,
@@ -543,6 +629,96 @@ async fn replay_uses_cumulative_positions_and_an_additional_step_budget() {
         ),
         before
     );
+}
+
+#[tokio::test]
+async fn replay_zero_and_parallel_budgets_and_completed_controls_match_resume_boundaries() {
+    let graph = linear_graph();
+    let primary_store = store();
+    let history = complete_history(&graph, "minor-budget", &primary_store).await;
+    let zero = graph
+        .replay(
+            replay_config("minor-budget", history[0].id(), &primary_store)
+                .with_run_config(RunConfig::new(0)),
+        )
+        .await
+        .expect_err("zero additional budget");
+    assert!(
+        matches!(
+            zero,
+            GraphRunError::MaxStepsExceeded {
+                max_steps: 0,
+                step: 2,
+                ..
+            }
+        ),
+        "{zero:?}"
+    );
+
+    let fan_out = fan_out_graph();
+    let fan_store = store();
+    fan_out
+        .invoke_with_checkpoint(
+            ReplayState::default(),
+            RunConfig::new(1),
+            EventConfig::default(),
+            RunControl::default(),
+            checkpoint_config("minor-parallel", &fan_store),
+        )
+        .await
+        .expect_err("seed");
+    let source = fan_store
+        .latest(&ThreadId::from("minor-parallel"))
+        .await
+        .expect("latest")
+        .expect("source");
+    let sink = Arc::new(RecordingSink::default());
+    let parallel = fan_out
+        .replay(
+            replay_config("minor-parallel", source.id(), &fan_store)
+                .with_run_config(RunConfig::new(1))
+                .with_event_config(
+                    EventConfig::new(EventRetention::None)
+                        .with_sink(Arc::clone(&sink) as Arc<dyn EventSink>),
+                ),
+        )
+        .await
+        .expect_err("partial parallel replay is forbidden");
+    assert!(matches!(
+        parallel,
+        GraphRunError::MaxStepsExceeded { max_steps: 1, .. }
+    ));
+    assert!(
+        sink.0
+            .lock()
+            .expect("events")
+            .iter()
+            .all(|event| !matches!(event, GraphEvent::NodeStarted { .. }))
+    );
+
+    let completed = history.last().expect("completed");
+    let token = CancellationToken::new();
+    token.cancel();
+    let cancelled_sink = Arc::new(RecordingSink::default());
+    let cancelled = graph
+        .replay(
+            replay_config("minor-budget", completed.id(), &primary_store)
+                .with_control(RunControl::new().with_cancellation_token(token))
+                .with_event_config(
+                    EventConfig::new(EventRetention::None)
+                        .with_sink(Arc::clone(&cancelled_sink) as Arc<dyn EventSink>),
+                ),
+        )
+        .await
+        .expect_err("completed replay still observes entry cancellation");
+    assert!(matches!(
+        cancelled,
+        GraphRunError::Cancelled { step: 0, .. }
+    ));
+    let events = cancelled_sink.0.lock().expect("events");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], GraphEvent::RunStarted { .. }));
+    assert!(matches!(events[1], GraphEvent::RunFailed { .. }));
 }
 
 #[tokio::test]

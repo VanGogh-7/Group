@@ -7,11 +7,11 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 14 adds read-only historical checkpoint Replay. Replay restores and
-re-executes one explicitly selected checkpoint without changing the source
-thread's head, history, or lineage. It reuses the Stage 11 execution kernel and
-does not change the architecture-reviewed Stage 10.1 Record/Codec/Store
-contract:
+Stage 15.1 hardens explicit writable Forks and independent branch heads. Resume
+continues the latest head of either the default lineage or a selected branch;
+Replay remains strictly read-only; Fork creates a new `BranchId` from one exact
+historical checkpoint. The Stage 10.1 Record/Codec/content-idempotency contract
+remains unchanged:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
@@ -19,6 +19,7 @@ START -> prepare -> [local_search, web_search] -> synthesis -> END
                   successful boundary -> Checkpoint
                   node interrupt -> Interrupted Checkpoint -> Resume value
 historical Checkpoint -> read-only Replay -> no checkpoint writes
+historical Checkpoint -> explicit Fork(BranchId) -> independent branch head
 START -> prepare -> research.{search -> verify} -> answer -> END
 ```
 
@@ -49,6 +50,8 @@ The current workspace includes:
 - explicit graph-version compatibility and latest-only resume checks;
 - read-only replay from an explicit historical checkpoint without lineage
   writes or implicit Fork;
+- explicit forks from historical checkpoints with independent branch
+  head/history queries and CAS-protected branch continuation;
 - typed interrupt payloads and resume values without Serde bounds;
 - interrupted checkpoints and completed-or-interrupted execution outcomes;
 - shared-state `CompiledGraph<S>` mounting through `add_subgraph`;
@@ -465,7 +468,9 @@ let report = compiled
 
 Resume loads a specified checkpoint through `get`, or uses `latest` by
 default. A specified checkpoint must still equal current latest; otherwise
-`ResumeConflict` is returned because Fork is not implemented. The
+`ResumeConflict` is returned; selecting an older checkpoint never implicitly
+creates a Fork. With `with_branch_id`, “latest” and the same explicit-target
+check are scoped to that branch head instead of the default thread head. The
 Runtime validates ThreadId, latest-only status, explicit graph version,
 completed/frontier consistency, and every saved frontier `NodePath`, resolving
 it to compiled internal indices in O(F). `START`, explicit
@@ -543,8 +548,89 @@ Replay is not Fork: it returns an in-memory `ReplayReport` and creates no
 branch head or durable descendant. It also re-executes node code. Database
 writes, network requests, tool calls, and other external side effects may
 therefore occur again. Runtime provides no rollback, sandbox, or automatic
-deduplication. Fork and explicit branch heads are deferred to Stage 15. See
+deduplication. See
 [`examples/replay.rs`](crates/group-agent-core/examples/replay.rs).
+
+## Explicit fork and branch heads
+
+`ForkConfig` requires an exact source `ThreadId` and `CheckpointId`. It assigns
+a new `BranchId` by default (or accepts an application-selected one), validates
+and restores the source checkpoint using the same O(F) frontier rules as
+Resume/Replay, creates the branch head at that source, and then reuses the
+normal execution kernel:
+
+```rust
+let config = ForkConfig::new(
+    thread_id.clone(),
+    historical_checkpoint_id,
+    checkpointer.clone(),
+);
+let branch_id = config.branch_id();
+let fork = compiled.fork(config).await?;
+
+let branch_history = checkpointer
+    .branch_history(&thread_id, branch_id)
+    .await?;
+```
+
+The source checkpoint need not be latest. Creating or advancing a branch never
+changes the default thread head/history or another branch. Branch history
+starts with the shared source checkpoint, followed by records written only to
+that branch. Each descendant retains the ordinary `CheckpointRecord::parent_id`
+chain; branch ownership and the branch head are additive Store metadata rather
+than new Record fields.
+
+Branch Resume is latest-only and explicit:
+
+```rust
+let outcome = compiled
+    .resume(
+        ResumeConfig::new(thread_id, checkpointer)
+            .with_branch_id(branch_id),
+    )
+    .await?;
+```
+
+The Store applies idempotency before an independent branch-head CAS. Concurrent
+writers based on one branch head therefore allow only one successor; they
+cannot create an implicit fork. `CheckpointConfig::with_branch_id` routes
+checkpoint-enabled execution to the same branch CAS and therefore requires an
+`expected_parent` that is the current head of that exact branch.
+`ForkStarted` identifies the new run, source checkpoint, historical counters,
+and branch; branch Resume also emits `BranchResumed`. Interrupts, nested
+subgraphs, conditional fan-out, and completed no-op checkpoints retain their
+existing Runtime semantics.
+
+`CheckpointStore` and `Checkpointer<T>` expose additive `create_branch`,
+`save_branch`, `branch_head`, and `branch_history` capabilities. The in-memory
+and SQLite adapters implement them. A `BranchId` has one owning `ThreadId`.
+Duplicate `create_branch` calls return `BranchAlreadyExists`; they are not
+idempotent success, including when the caller repeats the same source. An
+absent branch, or a branch queried through the wrong thread, makes
+`branch_head` return `None` and `branch_history` return an empty collection.
+
+Branch creation is atomic: a load, validation, restore, cancellation, timeout,
+or `create_branch` failure before successful creation leaves no Branch. Once
+creation succeeds, a later node, control, routing, snapshot, encoding, CAS, or
+storage failure keeps the Branch at its last confirmed head. In particular, a
+Fork that fails before its first successful descendant save retains the source
+checkpoint as its head and can be continued by explicit branch Resume.
+
+SQLite migrations `0002_branch_heads.sql` and `0003_branch_ownership.sql`
+persist branch metadata separately. The latter adds composite ThreadId
+ownership constraints for source, head, and membership. A branch save updates
+its Record, membership row, and head in one `BEGIN IMMEDIATE` transaction, so
+any failure rolls back all three. File-database restart tests reconstruct
+branches without relying on process caches.
+
+Fork starts from the exact historical State and does not accept a State patch.
+There is no branch merge, branch deletion, or implicit branch selection. See
+[`examples/fork.rs`](crates/group-agent-core/examples/fork.rs).
+
+Resume, Replay, and Fork remain separate operations: Resume continues only the
+latest selected lineage, Replay executes one exact historical checkpoint
+without any write, and Fork is the only operation that creates a new writable
+branch.
 
 ## Suspension and human interrupt
 
@@ -1047,6 +1133,12 @@ Stage 13 adds one shared harness for no Sink, broadcast with no subscriber, one
 subscriber, four subscribers, and `EventRetention::None` with one subscriber.
 Stage 14 adds read-only replay from a middle checkpoint through one immediate
 node, completed-checkpoint no-op replay, and replay of a two-node frontier.
+Stage 15 adds a historical fork plus one immediate node in the same harness.
+Stage 15.1 adds a branch Resume baseline and an independent SQLite
+restart-plus-branch-Resume benchmark. Criterion uses explicit warm-up,
+measurement, sample-size, and noise-threshold settings. Results are local
+regression baselines only; short-run variation is not a reason to redesign the
+runtime.
 
 ## Workspace
 
@@ -1061,7 +1153,11 @@ node, completed-checkpoint no-op replay, and replay of a two-node frontier.
     ├── group-agent-checkpoint-sqlite
     │   ├── Cargo.toml
     │   ├── migrations
-    │   │   └── 0001_checkpoint_store.sql
+    │   │   ├── 0001_checkpoint_store.sql
+    │   │   ├── 0002_branch_heads.sql
+    │   │   └── 0003_branch_ownership.sql
+    │   ├── benches
+    │   │   └── branch_restart.rs
     │   ├── src
     │   │   └── lib.rs
     │   └── tests
@@ -1086,6 +1182,7 @@ node, completed-checkpoint no-op replay, and replay of a two-node frontier.
         │   ├── interrupt.rs
         │   ├── linear.rs
         │   ├── parallel.rs
+        │   ├── fork.rs
         │   ├── replay.rs
         │   ├── resume.rs
         │   └── subgraph.rs
@@ -1107,12 +1204,14 @@ node, completed-checkpoint no-op replay, and replay of a two-node frontier.
         │   ├── state.rs
         │   └── transition.rs
         └── tests
+            ├── branch_store.rs
             ├── compile_validation.rs
             ├── checkpointing.rs
             ├── conditional_fan_out.rs
             ├── conditional_routing.rs
             ├── durable_checkpoint.rs
             ├── execution_control.rs
+            ├── fork.rs
             ├── interrupt.rs
             ├── linear_execution.rs
             ├── observability.rs
@@ -1127,31 +1226,26 @@ node, completed-checkpoint no-op replay, and replay of a two-node frontier.
 
 ```bash
 cargo test --workspace
-cargo run -p group-agent-core --example linear
-cargo run -p group-agent-core --example conditional
-cargo run -p group-agent-core --example parallel
-cargo run -p group-agent-core --example conditional_fan_out
-cargo run -p group-agent-core --example checkpoint
+cargo run -p group-agent-core --example fork
 cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
-cargo run -p group-agent-core --example subgraph
 cargo bench --workspace --no-run
 ```
 
 ## Current exclusions
 
-This stage does not support parent/child State mapping, parent-frontier parallel
-subgraphs, parallel interrupts, Fork, `BranchId` or branch heads, Replay writes
-or historical State modification, Time Travel, PostgreSQL, built-in Serde
-codecs, arbitrary Node Command or Send APIs, conditional fan-out into subgraph
-mounts, custom asynchronous backpressure, disk event queues, OpenTelemetry
-exporters, metrics exporters, WebSocket or SSE servers, network event proxies,
-standalone reducer registration, LLM or tool APIs, MCP, RAG, token streaming,
-Tower middleware, Axum, HTTP services, distributed workers, macro DSLs, or
-visualization. SQLite is the only reference database backend; the bounded
-Tokio stream adapter is process-local and intentionally lossy. Fork and branch
-heads are deferred to Stage 15.
+This stage does not support State patches during Fork, branch merge, branch
+deletion, parent/child State mapping, parent-frontier parallel subgraphs,
+parallel interrupts, Replay writes or historical State modification, Time
+Travel, PostgreSQL, built-in Serde codecs, arbitrary Node Command or Send APIs,
+conditional fan-out into subgraph mounts, custom asynchronous backpressure,
+disk event queues, OpenTelemetry exporters, metrics exporters, WebSocket or SSE
+servers, network event proxies, standalone reducer registration, LLM or tool
+APIs, MCP, RAG, token streaming, Tower middleware, Axum, HTTP services,
+distributed workers, macro DSLs, or visualization. SQLite is the only
+reference database backend; the bounded Tokio stream adapter is process-local
+and intentionally lossy.
 
 ## Architecture review cadence
 
@@ -1159,5 +1253,6 @@ After Stage 10, 20, 30, and every later multiple of ten, perform a full
 repository architecture review before continuing feature stages. Corrective
 stages such as Stage 5.1 do not count toward this ten-stage cadence.
 Stage 9.1 Review has passed. Stage 10.1 supplied the durable-checkpoint contract
-correction required by the Stage 10 architecture review. Stages 11 through 14
-preserve that reviewed Record/Codec/Store contract.
+correction required by the Stage 10 architecture review. Stages 11 through 15
+preserve that reviewed Record/Codec/content-idempotency contract; Stage 15 adds
+branch metadata as a Store capability without changing `CheckpointRecord`.

@@ -72,6 +72,10 @@ define_uuid_id!(
     "A cross-process identifier for one checkpoint operation."
 );
 define_uuid_id!(
+    BranchId,
+    "A cross-process identifier for one explicit checkpoint branch."
+);
+define_uuid_id!(
     InterruptId,
     "A cross-process identifier for one node suspension request."
 );

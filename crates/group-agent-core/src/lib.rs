@@ -24,9 +24,9 @@ mod state;
 mod transition;
 
 pub use checkpoint::{
-    Checkpoint, CheckpointConfig, CheckpointPolicy, CheckpointRequest, CheckpointState,
-    CheckpointWriteError, Checkpointer, GraphVersion, InMemoryCheckpointer, RecordCheckpointer,
-    ReplayConfig, ResumeConfig, ResumeTarget, ThreadId,
+    BranchHead, Checkpoint, CheckpointConfig, CheckpointPolicy, CheckpointRequest, CheckpointState,
+    CheckpointWriteError, Checkpointer, ForkConfig, GraphVersion, InMemoryCheckpointer,
+    RecordCheckpointer, ReplayConfig, ResumeConfig, ResumeTarget, ThreadId,
 };
 pub use checkpoint_codec::{
     CheckpointCodec, CheckpointCodecError, CheckpointEncodingError, CheckpointReconstructionError,
@@ -45,12 +45,12 @@ pub use error::{
 };
 pub use event::{EventConfig, EventRetention, EventSink, GraphEvent, RunFailure};
 pub use graph::{CompiledGraph, StateGraph};
-pub use id::{CheckpointId, InterruptId, RunId};
+pub use id::{BranchId, CheckpointId, InterruptId, RunId};
 pub use interrupt::{
     CheckpointInterrupt, ExecutionOutcome, InterruptPayload, InterruptReport, InterruptRequest,
     NodeOutcome, ResumeValue, ResumeValueError,
 };
 pub use node::{InterruptibleNode, Node};
 pub use path::{GraphPath, NodePath};
-pub use runtime::{ReplayReport, RunReport};
+pub use runtime::{ForkReport, ReplayReport, RunReport};
 pub use state::{GraphState, NodeUpdate};
