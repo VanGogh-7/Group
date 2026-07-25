@@ -7,12 +7,18 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 15.2 hardens SQLite reads for explicit writable Forks and independent
-branch heads. Resume
-continues the latest head of either the default lineage or a selected branch;
-Replay remains strictly read-only; Fork creates a new `BranchId` from one exact
-historical checkpoint. The Stage 10.1 Record/Codec/content-idempotency contract
-remains unchanged:
+Stage 16.2 closes the validated adapter and atomic stream-collection boundary
+in the independent `group-agent-model` crate. Applications use the validated
+`ChatModel` facade; raw provider adapters receive only
+`ValidatedChatRequest`, whose construction is private to the facade. Stream
+events commit atomically, the first collection error permanently poisons a
+manual collector, and cumulative token usage merges extensions in place
+without cloning existing JSON values. It performs no network access and has no
+provider SDK, API-key, retry, or tool-execution integration. Stage 15.2 remains
+the current Core checkpoint foundation: Resume continues the latest head of
+either the default lineage or a selected branch; Replay remains strictly
+read-only; Fork creates a new `BranchId` from one exact historical checkpoint.
+The Stage 10.1 Record/Codec/content-idempotency contract remains unchanged:
 
 ```text
 START -> prepare -> [local_search, web_search] -> synthesis -> END
@@ -36,6 +42,14 @@ a super-step has committed and resolved its complete next frontier. Normal
 
 The current workspace includes:
 
+- an independent provider-neutral chat model abstraction with a cheaply cloned
+  validated `ChatModel` facade over one `Arc<dyn ChatModelAdapter>`;
+- a public but externally non-constructible `ValidatedChatRequest` raw-adapter
+  boundary;
+- strongly typed messages, tool definitions/calls/results, generation controls,
+  model capabilities, metadata, token usage, and finish reasons;
+- a provider-neutral stream-event protocol and reusable validating response
+  collector;
 - asynchronous trait-based nodes;
 - fixed edges, static and conditional fan-out, fan-in barriers, and conditional
   target whitelists;
@@ -69,6 +83,176 @@ The current workspace includes:
 - ordered successful run reports and extensible lifecycle events;
 - source-preserving structured errors;
 - topology, edge-shape, whitelist, and reachability validation.
+
+## Provider-neutral model boundary
+
+`group-agent-model` has no dependency on `group-agent-core`, and Core has no
+dependency on the model crate. Applications opt into both:
+
+```text
+application
+├── group-agent-core
+└── group-agent-model
+```
+
+The model crate represents `Message::{System, User, Assistant, Tool}` explicitly
+so a tool result cannot masquerade as user input. `ContentPart` currently
+supports ordered text only; `as_text` returns `Option<&str>` so future non-text
+parts do not need a fake empty string. Empty text is valid and is especially
+useful for tool-only assistant turns. Text helpers concatenate only text parts
+in order. `AssistantMessage` can contain text and zero or more `ToolCall`
+values together. `ToolCallId` provides the stable link to
+`ToolMessage` and `ToolResult`. `ToolDefinition` contains only a name,
+description, and provider-neutral JSON Schema. These tool types are data
+representations: there is no Tool trait, registry, execution, timeout, retry, or
+MCP integration.
+
+`ChatRequest::validate` checks non-empty messages, finite provider-neutral
+generation controls, stop sequences, duplicate tool definitions, named tool
+choices, unique call identifiers, and earlier-call tool-result references.
+`top_p` accepts the inclusive common range `[0, 1]`; temperature accepts finite
+non-negative values without imposing one provider's maximum. Empty stop lists
+and duplicate non-empty stops are allowed, and the common layer sets no
+provider-specific count limit.
+
+Provider-specific values use the ordered, validated `Extensions` container.
+Keys are trimmed, empty and duplicate insertion is rejected, iteration order is
+stable, and `Debug` reveals keys but not values. `AssistantMessage`,
+`ToolCall`, `TokenUsage`, requests, responses, and stream metadata can preserve
+provider-neutral data not otherwise modeled. No provider-specific key or SDK
+type is defined here.
+
+Applications call the cheaply cloned `ChatModel` facade. Provider adapters
+implement the object-safe `Send + Sync` `ChatModelAdapter` raw port and are
+wrapped once:
+
+```rust
+use std::sync::Arc;
+
+use group_agent_model::{
+    ChatModel, ChatModelAdapter, ChatRequest, Message,
+};
+
+async fn complete(
+    adapter: Arc<dyn ChatModelAdapter>,
+) -> Result<String, group_agent_model::ModelError> {
+    let model = ChatModel::new(adapter)?;
+    let response = model
+        .complete(ChatRequest::new(vec![Message::user("Hello")]))
+        .await?;
+    Ok(response.message().text_content())
+}
+```
+
+Facade construction validates and snapshots `ModelMetadata`. Cloning a facade
+shares both the adapter and immutable metadata snapshot through `Arc`; it does
+not rebuild or copy adapter state. In particular, parallel tool calls cannot be
+declared without tool calling. Every public call then follows one
+non-overridable order:
+
+```text
+ChatRequest::validate
+-> ModelMetadata / ModelCapabilities validation
+-> Streaming capability validation for stream()
+-> privately construct ValidatedChatRequest
+-> complete_raw or stream_raw
+```
+
+Tool definitions, tool selection, or tool-call/result history require
+tool-calling support; a true `parallel_tool_calls` request requires both
+tool-calling and parallel-tool-call support; streaming adds the streaming
+capability check. Rejected requests never enter adapter code.
+Structured-output capability is intentionally absent until a provider-neutral
+request field exists.
+
+`ValidatedChatRequest` is public only so an independent Provider crate can use
+it as a `ChatModelAdapter` method parameter. Its fields and constructor are
+private, and there is no public `new`, unchecked constructor, or conversion
+from `ChatRequest`. Adapters use read-only `request`, `messages`, `tools`,
+`tool_choice`, `generation`, and `extensions` accessors, or consume it with
+`into_inner`. Applications continue to call only `ChatModel::complete` and
+`ChatModel::stream`.
+
+Stream initialization can fail asynchronously, and every later stream item is
+also a `Result`. The provider-neutral events are `ResponseStarted`,
+`TextDelta`, `ToolCallDelta`, `Usage`, and `Finished`. Tool-call deltas use a
+stable bounded index plus optional ID/name and append-only argument fragments.
+`ChatStreamCollector` stores sparse indices in a map, preserves text order,
+sorts completed calls by index, parses arguments as JSON only at completion,
+and retains idempotently merged per-call Extensions. `ResponseStarted` appears
+at most once and carries optional response ID, actual model, and response
+extensions; if absent, those response fields remain `None`.
+
+Every `push` validates the complete event before committing any response data.
+ID/name conflicts, argument or text limits, extension limits/conflicts, Usage
+errors, duplicate starts, and invalid Finished events therefore cannot leave a
+partial fragment behind. The first error while Active permanently changes a
+manual collector to Failed; later events and `finish` return
+`CollectorAlreadyFailed`. A successful Finished event first validates complete
+ToolCall identity and JSON, changes the collector to Finished, and causes every
+later event to return `EventAfterFinished`.
+
+`Usage` is a cumulative snapshot, not an increment. Input, output, and total
+tokens are independently optional. A `Some` field updates its prior value,
+`None` does not clear known data, cumulative values cannot decrease, and
+extension conflicts fail the protocol. Input plus output is computed with
+checked addition when both exist. An explicit total may be larger than the
+common sum but cannot be smaller than known accounting. Partial usage is kept
+in the final response. `TokenUsage::merge_snapshot` validates all counters,
+total consistency, and every extension conflict before updating anything. It
+then updates counters and moves only new extension values into the existing
+ordered map; it does not clone the accumulated Extensions.
+
+The collector requires exactly one logical `Finished` and rejects every later
+event. EOF without `Finished`, duplicate start, incomplete tool-call
+identity, repeated or conflicting tool fields, conflicting extensions,
+decreasing usage, excessive sparse indices, and invalid JSON return structured,
+source-preserving errors. `collect_chat_stream` stops polling on the first
+stream-item or collector error. Manual `ChatStreamCollector` use and
+`collect_chat_stream` are alternatives; the helper creates its own collector.
+
+`ModelError` separates invalid requests, unsupported capabilities,
+authentication, permission, rate limit, provider availability, timeout,
+protocol, decode, cancellation, and other failures. It retains concrete source
+errors plus optional provider/model, HTTP status, retry-after, and retryability
+metadata. The crate classifies retryability but implements no retry policy.
+`Debug` and `Display` for `ModelError` do not echo its adapter-supplied message;
+callers can inspect `as_message` only through an explicit access.
+
+All content-bearing public data types use redacted `Debug`: variant names,
+identifiers, counts, byte lengths, numeric usage, and extension keys remain
+visible, while prompts, tool arguments/results, schemas, stream fragments,
+extension values, and raw response content do not.
+
+Cancellation is the caller-owned Future-drop boundary. The model crate does not
+contain `RunControl`, `NodeContext`, a Tokio cancellation token, or a Tokio
+Runtime. When a validated `ChatModel` is held by a normal Group node, Group
+cancellation or node timeout drops the node Future and therefore the in-flight
+raw adapter Future. See
+[`examples/model_node.rs`](crates/group-agent-model/examples/model_node.rs).
+That example uses only an offline mock model and preserves `ModelError` through
+`NodeError::with_source`.
+
+Stage 17 may add a separate genai adapter against this boundary. Stage 16.2 does
+not support real providers, HTTP, API-key loading, provider retries, a tool
+runtime, MCP, embeddings, RAG, memory, ReAct, or prebuilt agents.
+
+### Stage 16.2 migration from Stage 16.1
+
+- Change `ChatModelAdapter::{complete_raw, stream_raw}` parameters from
+  `ChatRequest` to `ValidatedChatRequest`.
+- Provider adapters inspect `request()`, `messages()`, `tools()`,
+  `tool_choice()`, `generation()`, or `extensions()`, or call `into_inner()` to
+  consume the original `ChatRequest` without cloning it. No public reverse
+  construction exists.
+- Application-facing calls remain `ChatModel::complete(ChatRequest)` and
+  `ChatModel::stream(ChatRequest)`.
+- Treat the first manual `ChatStreamCollector::push` error as terminal. Do not
+  attempt to repair the collector; discard it. Failed extension and Usage
+  merges now leave all prior state unchanged.
+- Choose either manual `ChatStreamCollector::{push, finish}` usage or
+  `collect_chat_stream(stream)`. The helper owns its own collector, stops on the
+  first error, and does not require a separately constructed collector.
 
 ## Shared-state subgraphs and execution namespaces
 
@@ -1149,10 +1333,16 @@ Stage 15 adds a historical fork plus one immediate node in the same harness.
 Stage 15.1 adds a branch Resume baseline and an independent SQLite
 restart-plus-branch-Resume benchmark. Stage 15.2 runs the branch Resume
 baseline against a real `InMemoryCheckpointStore` and `RecordCheckpointer`,
-rather than a benchmark-only branch implementation. Criterion uses explicit
-warm-up, measurement, sample-size, and noise-threshold settings. Results are
-local regression baselines only; short-run variation is not a reason to
-redesign the runtime.
+rather than a benchmark-only branch implementation. Stage 16.2 measures
+validation of a preconstructed 100-message request, aggregation of
+preconstructed 100 and 1,000 text-delta streams, eight interleaved fragmented
+tool calls, atomic ToolCall delta merge, extension merge/round-trip, atomic
+extension conflict validation, merging one new Usage extension into 256
+existing entries, and one validated-facade mock completion. Benchmark setup is
+kept outside measured iterations. Criterion
+uses explicit warm-up, measurement, sample-size, and noise-threshold settings.
+Results are local regression baselines only; short-run variation is not a
+reason to redesign the runtime.
 
 ## Workspace
 
@@ -1186,6 +1376,36 @@ redesign the runtime.
     │   │   └── lib.rs
     │   └── tests
     │       └── event_stream.rs
+    ├── group-agent-model
+    │   ├── Cargo.toml
+    │   ├── benches
+    │   │   └── model.rs
+    │   ├── examples
+    │   │   └── model_node.rs
+    │   ├── src
+    │   │   ├── content.rs
+    │   │   ├── error.rs
+    │   │   ├── extensions.rs
+    │   │   ├── lib.rs
+    │   │   ├── message.rs
+    │   │   ├── metadata.rs
+    │   │   ├── model.rs
+    │   │   ├── request.rs
+    │   │   ├── response.rs
+    │   │   ├── stream.rs
+    │   │   └── tool.rs
+    │   └── tests
+    │       ├── errors.rs
+    │       ├── extensions.rs
+    │       ├── messages.rs
+    │       ├── model_integration.rs
+    │       ├── requests.rs
+    │       ├── redaction.rs
+    │       ├── responses.rs
+    │       ├── streaming.rs
+    │       ├── support
+    │       │   └── mod.rs
+    │       └── tools.rs
     └── group-agent-core
         ├── Cargo.toml
         ├── benches
@@ -1245,6 +1465,7 @@ cargo run -p group-agent-core --example fork
 cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
+cargo run -p group-agent-model --example model_node
 cargo bench --workspace --no-run
 ```
 
@@ -1256,11 +1477,14 @@ parallel interrupts, Replay writes or historical State modification, Time
 Travel, PostgreSQL, built-in Serde codecs, arbitrary Node Command or Send APIs,
 conditional fan-out into subgraph mounts, custom asynchronous backpressure,
 disk event queues, OpenTelemetry exporters, metrics exporters, WebSocket or SSE
-servers, network event proxies, standalone reducer registration, LLM or tool
-APIs, MCP, RAG, token streaming, Tower middleware, Axum, HTTP services,
-distributed workers, macro DSLs, or visualization. SQLite is the only
+servers, network event proxies, standalone reducer registration, real LLM
+provider clients, tool execution APIs, MCP, RAG, Tower middleware, Axum, HTTP
+services, distributed workers, macro DSLs, or visualization. SQLite is the only
 reference database backend; the bounded Tokio stream adapter is process-local
-and intentionally lossy.
+and intentionally lossy. `group-agent-model` adds model and tool data
+abstractions but still excludes real LLM providers, genai or other provider
+adapters, HTTP, API keys, retry policies, rate limiters, tool execution and
+registries, MCP, embeddings, RAG, agent memory, ReAct, and prebuilt agents.
 
 ## Architecture review cadence
 
@@ -1271,3 +1495,8 @@ Stage 9.1 Review has passed. Stage 10.1 supplied the durable-checkpoint contract
 correction required by the Stage 10 architecture review. Stages 11 through 15
 preserve that reviewed Record/Codec/content-idempotency contract; Stage 15 adds
 branch metadata as a Store capability without changing `CheckpointRecord`.
+Stage 16 adds an independent application-layer model abstraction without
+changing Core or its durable APIs. Stage 16.1 hardens that boundary with a
+validated facade, partial usage, redacted Debug, and continuation Extensions.
+Stage 16.2 makes raw validation non-bypassable and stream/Usage merging atomic.
+Stage 17 is reserved for a separate genai adapter.

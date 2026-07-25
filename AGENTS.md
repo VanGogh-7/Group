@@ -44,6 +44,13 @@ The current workspace provides an immutable compiled state-graph core with:
 - per-run identifiers and typed failure lifecycle events;
 - structured build, compile, node, state, route, and run errors;
 - reusable and concurrently shareable compiled graphs.
+- an independent provider-neutral `group-agent-model` crate with strongly typed
+  messages, tool data, requests, responses, capabilities, errors, and
+  validated non-streaming/streaming model calls;
+- a reusable validating chat-stream collector with stable text/tool ordering,
+  bounded sparse tool indices, JSON argument completion, partial cumulative
+  usage merging, continuation Extensions, atomic per-event commit, a permanent
+  failed state after the first error, and mandatory logical finish.
 
 ## Mandatory state and execution boundaries
 
@@ -505,6 +512,77 @@ The current workspace provides an immutable compiled state-graph core with:
 - Resume values remain process-local. Interrupt payloads become durable only
   when the configured codec explicitly supports their type/schema.
 
+## Provider-neutral model boundaries
+
+- `group-agent-model` and `group-agent-core` must remain mutually independent.
+  Applications may depend on both; only model examples/tests use Core through a
+  dev-dependency.
+- Message roles are strongly typed as System, User, Assistant, and Tool.
+  Assistant messages may contain text and tool calls together. Tool results
+  retain a stable ToolCallId and cannot be represented as User messages.
+- Empty text is valid and ordered ContentPart values must remain ordered.
+  `ContentPart::as_text` returns `Option<&str>` so future non-text variants do
+  not need a fake text value. Text helpers ignore future non-text content.
+  Display and Debug implementations must not expose potentially sensitive
+  message content.
+- ToolDefinition, ToolCall, ToolResult, and ToolChoice are data only. The model
+  crate must not execute tools or add a registry, Tool trait, retry, MCP, or
+  timeout policy.
+- Provider-specific request, response, assistant, tool-call, and usage metadata
+  belongs in the ordered provider-neutral `Extensions` container. Keys are
+  normalized and validated; duplicate insertion is rejected. Fragment merging
+  accepts the same key/value idempotently and rejects conflicting values.
+  Common types must not expose provider SDK or raw provider request types.
+- Provider adapters implement the object-safe, `Send + Sync`
+  `ChatModelAdapter` raw port. Raw methods accept only
+  `ValidatedChatRequest`, a public type with private fields and crate-private
+  construction. Independent adapter crates may read its accessors or consume
+  it, but applications cannot construct it from `ChatRequest`. Applications
+  hold the cheaply cloneable `ChatModel` facade, which shares one
+  `Arc<dyn ChatModelAdapter>` and one immutable validated metadata snapshot.
+- `ChatModel::complete` and `ChatModel::stream` are non-overridable public
+  facade methods. They always run `ChatRequest::validate`, then common
+  capability validation, then the streaming capability check when applicable,
+  then privately construct `ValidatedChatRequest`, then perform one raw adapter
+  dispatch. Invalid requests and unsupported capabilities must never enter raw
+  adapter code.
+- Facade construction rejects internally contradictory metadata. Parallel tool
+  calls require tool calling. Structured-output capability remains absent until
+  the request model has a provider-neutral field that validation can consume.
+- Stream initialization and later items may fail independently. No model method
+  creates a Tokio Runtime, detached task, channel, or retry loop.
+- Stream aggregation preserves text order, stores tool calls by bounded stable
+  index without sparse Vec growth, appends argument fragments, parses JSON only
+  at completion, merges tool-call Extensions by index, and sorts final calls by
+  index. ResponseStarted is optional and occurs at most once; absent identity
+  fields remain unknown.
+- TokenUsage input, output, and total are independently optional. Usage events
+  are cumulative snapshots: Some updates one field, None never clears known
+  data, known counters cannot decrease, and extension conflicts fail.
+  Snapshot merge validates all counters and Extensions before in-place commit,
+  moves only new extension values, and never clones accumulated Extensions.
+  Checked input-plus-output overflow and inconsistent explicit totals are
+  errors.
+- Finished occurs at most once; every event variant after it is invalid, and
+  transport EOF without it is a protocol error. The first stream item error
+  stops collection without returning a partial success. Every Collector event
+  validates before commit. The first Active-state error permanently poisons a
+  manual Collector; later push/finalization cannot recover a successful
+  response. Manual Collector use and `collect_chat_stream` are alternatives.
+- Content-bearing Debug output exposes only safe structure such as variants,
+  identifiers, counts, byte lengths, numeric usage, and extension keys. It must
+  not print prompts, tool arguments/results, schemas, fragments, extension
+  values, or adapter error messages.
+- ModelError preserves concrete sources and separates validation, capability,
+  authentication, permission, rate limit, availability, timeout, protocol,
+  decode, cancellation, and other classifications. Retryability metadata is not
+  a retry policy.
+- Cancellation and timeout remain caller-owned. Dropping complete/stream or a
+  containing Group Node Future cancels in-flight work. ChatRequest must not
+  contain Group RunControl, NodeContext, or Tokio CancellationToken values.
+- Stage 16.2 performs no network access and supports no real provider. Stage 17
+  may add a separate genai adapter without adding model concepts to Core.
+
 ## Performance principles
 
 - Aggregate fixed edges, fan-out targets, both conditional router forms, source
@@ -532,6 +610,14 @@ The current workspace provides an immutable compiled state-graph core with:
 - Frontier deduplication must operate on produced successors and must not scan
   every compiled graph node.
 - Do not clone complete state values per step.
+- Model facade validation must move one `ChatRequest` into
+  `ValidatedChatRequest` without cloning it. Do not add another async-trait
+  dispatch layer.
+- Model stream event atomicity must use borrowed prevalidation and local
+  deltas, never clone the complete Collector or ToolCall accumulator.
+- TokenUsage merge must inspect accumulated Extensions in place and move only
+  new values after complete validation; never clone the complete accumulated
+  extension map.
 - Do not use a global Mutex or RwLock for execution.
 - Do not spawn nodes; use in-task future concurrency for a super-step.
 - A normal node uses one `Arc<dyn Node<S>>` dispatch and one `async-trait`
@@ -566,12 +652,15 @@ modification, time travel, parallel interrupts, PostgreSQL, forced Serde bounds
 or built-in Serde codecs, arbitrary Node Command or Send APIs, conditional
 fan-out into subgraph mounts, custom asynchronous event backpressure, disk
 event queues, OpenTelemetry or metrics exporters, WebSocket or SSE servers,
-network event proxies, LLM providers, tool calling, MCP, RAG, token streaming,
-standalone reducer registration, Tower middleware, Axum, distributed workers,
-macro DSLs, or a visual interface unless a later stage explicitly authorizes
-them. SQLite is the sole reference database backend and Tokio broadcast is the
-sole stream adapter in this stage. Do not create placeholder crates for future
-capabilities.
+network event proxies, real LLM providers or HTTP clients, provider API keys,
+provider retries or rate limiters, tool execution or registries, MCP, RAG,
+embeddings, agent memory, ReAct, prebuilt agents, standalone reducer
+registration, Tower middleware, Axum, distributed workers, macro DSLs, or a
+visual interface unless a later stage explicitly authorizes them.
+Provider-neutral chat streaming exists only in `group-agent-model`; it does not
+change Core observability. SQLite is the sole reference database backend and
+Tokio broadcast is the sole Core event-stream adapter in this stage. Do not
+create placeholder crates for future capabilities.
 
 ## Rust and code standards
 
@@ -597,6 +686,7 @@ cargo run -p group-agent-core --example fork
 cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
+cargo run -p group-agent-model --example model_node
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
@@ -643,4 +733,9 @@ Corrective stages such as Stage 5.1 do not count toward this cadence.
 Stage 9.1 Review has passed. Stage 10.1 supplied the durable-checkpoint contract
 correction identified by the Stage 10 architecture review. Stages 11 through
 15 preserve that reviewed Record/Codec/content-idempotency boundary; branch
-metadata is additive Store capability.
+metadata is additive Store capability. Stage 16 adds an independent
+provider-neutral model boundary without changing Core or the durable checkpoint
+API. Stage 16.1 hardens the public model facade, partial usage, redacted Debug,
+and continuation Extensions without changing Core. Stage 16.2 makes the raw
+adapter boundary non-bypassable and stream/Usage merging atomic without
+changing Core. Stage 17 may add a separate genai adapter.

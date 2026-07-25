@@ -2,6 +2,7 @@
 members = [
     "crates/group-agent-checkpoint-sqlite",
     "crates/group-agent-core",
+    "crates/group-agent-model",
     "crates/group-agent-observability-tokio",
 ]
 resolver = "3"
@@ -19,6 +20,8 @@ criterion = { version = "0.7.0", default-features = false, features = [
     "cargo_bench_support",
 ] }
 futures-util = "0.3.31"
+futures-core = "0.3.31"
+futures-executor = "0.3.31"
 indexmap = "2.14.0"
 petgraph = "0.8.3"
 serde = { version = "1.0.228", features = ["derive"] }
