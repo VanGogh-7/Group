@@ -269,6 +269,43 @@ async fn invalid_json_arguments_preserve_decode_source_chain() {
 }
 
 #[test]
+fn invalid_json_at_finished_permanently_poisons_manual_collector() {
+    let mut collector = ChatStreamCollector::new();
+    collector
+        .push(ChatStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0)
+                .with_id(id("call-0"))
+                .with_name(name("lookup"))
+                .with_arguments_fragment("{invalid"),
+        ))
+        .expect("partial tool call is accepted before finished");
+
+    let error = collector
+        .push(ChatStreamEvent::Finished(FinishReason::ToolCalls))
+        .expect_err("finished validates JSON");
+    assert!(matches!(
+        protocol_source(&error),
+        StreamProtocolError::InvalidToolArguments { index: 0, .. }
+    ));
+
+    let next = collector
+        .push(ChatStreamEvent::TextDelta("later".to_owned()))
+        .expect_err("failed collector rejects the next push");
+    assert!(matches!(
+        protocol_source(&next),
+        StreamProtocolError::CollectorAlreadyFailed
+    ));
+
+    let finish = collector
+        .finish()
+        .expect_err("failed collector cannot be finalized");
+    assert!(matches!(
+        protocol_source(&finish),
+        StreamProtocolError::CollectorAlreadyFailed
+    ));
+}
+
+#[test]
 fn finished_requires_complete_tool_call_identity() {
     for (delta, missing_id) in [
         (

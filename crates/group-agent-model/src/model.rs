@@ -114,6 +114,17 @@ pub trait ChatModelAdapter: Send + Sync {
 /// }
 /// ```
 ///
+/// The streaming raw method has the same boundary:
+///
+/// ```compile_fail
+/// use group_agent_model::{ChatModelAdapter, ChatRequest, Message};
+///
+/// async fn bypass(adapter: &dyn ChatModelAdapter) {
+///     let request = ChatRequest::new(vec![Message::user("hello")]);
+///     adapter.stream_raw(request).await.unwrap();
+/// }
+/// ```
+///
 /// It also cannot construct the validated wrapper:
 ///
 /// ```compile_fail
@@ -121,6 +132,41 @@ pub trait ChatModelAdapter: Send + Sync {
 ///
 /// let request = ChatRequest::new(vec![Message::user("hello")]);
 /// let validated = ValidatedChatRequest::new(request);
+/// ```
+///
+/// Its private field cannot be populated with a struct literal:
+///
+/// ```compile_fail
+/// use group_agent_model::{ChatRequest, Message, ValidatedChatRequest};
+///
+/// let request = ChatRequest::new(vec![Message::user("hello")]);
+/// let validated = ValidatedChatRequest { request };
+/// ```
+///
+/// No `From<ChatRequest>` conversion bypasses facade validation:
+///
+/// ```compile_fail
+/// use group_agent_model::{ChatRequest, Message, ValidatedChatRequest};
+///
+/// let request = ChatRequest::new(vec![Message::user("hello")]);
+/// let validated: ValidatedChatRequest = request.into();
+/// ```
+///
+/// No `TryFrom<ChatRequest>` conversion exists either:
+///
+/// ```compile_fail
+/// use group_agent_model::{ChatRequest, Message, ValidatedChatRequest};
+///
+/// let request = ChatRequest::new(vec![Message::user("hello")]);
+/// let validated = ValidatedChatRequest::try_from(request).unwrap();
+/// ```
+///
+/// A default value would also bypass validation and is deliberately absent:
+///
+/// ```compile_fail
+/// use group_agent_model::ValidatedChatRequest;
+///
+/// let validated: ValidatedChatRequest = Default::default();
 /// ```
 pub struct ValidatedChatRequest {
     request: ChatRequest,
@@ -284,5 +330,23 @@ impl fmt::Debug for ChatModel {
             .debug_struct("ChatModel")
             .field("metadata", &self.metadata)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ChatRequest, Message};
+
+    use super::ValidatedChatRequest;
+
+    #[test]
+    fn validated_request_debug_redacts_an_independent_request_sentinel() {
+        const SECRET: &str = "VALIDATED_REQUEST_DEBUG_SENTINEL_16_2";
+        let request = ChatRequest::new(vec![Message::user(SECRET)]);
+        let validated = ValidatedChatRequest::from_validated(request);
+
+        let rendered = format!("{validated:?}");
+        assert!(rendered.contains("ValidatedChatRequest"));
+        assert!(!rendered.contains(SECRET));
     }
 }

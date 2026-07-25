@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{AssistantMessage, ExtensionMergeError, Extensions, IdentifierError, ModelId};
 
 /// A stable provider response identifier.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResponseId(Arc<str>);
 
 impl ResponseId {
@@ -28,7 +28,16 @@ impl ResponseId {
 
 impl fmt::Display for ResponseId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        write!(formatter, "ResponseId(bytes={})", self.0.len())
+    }
+}
+
+impl fmt::Debug for ResponseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResponseId")
+            .field("bytes", &self.0.len())
+            .finish()
     }
 }
 

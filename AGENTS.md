@@ -51,6 +51,10 @@ The current workspace provides an immutable compiled state-graph core with:
   bounded sparse tool indices, JSON argument completion, partial cumulative
   usage merging, continuation Extensions, atomic per-event commit, a permanent
   failed state after the first error, and mandatory logical finish.
+- an independent `group-agent-genai` crate fixed to genai 0.6.5 with injected
+  Client/auth/endpoint configuration, request/response/tool mapping, online
+  stream normalization, explicit continuation Extensions, partial Usage,
+  source-preserving error classification, and offline loopback HTTP coverage.
 
 ## Mandatory state and execution boundaries
 
@@ -580,8 +584,93 @@ The current workspace provides an immutable compiled state-graph core with:
 - Cancellation and timeout remain caller-owned. Dropping complete/stream or a
   containing Group Node Future cancels in-flight work. ChatRequest must not
   contain Group RunControl, NodeContext, or Tokio CancellationToken values.
-- Stage 16.2 performs no network access and supports no real provider. Stage 17
-  may add a separate genai adapter without adding model concepts to Core.
+- `group-agent-model` performs no network access and supports no concrete
+  provider. `group-agent-genai` is the separate Stage 17 provider boundary and
+  must not add model concepts to Core or genai types to Model.
+
+## Genai adapter boundaries
+
+- `group-agent-genai` is fixed to `genai = "=0.6.5"` for Stage 17. Do not use
+  0.7 beta, Git dependencies, unpublished commits, or a locally patched genai.
+- The workspace package MSRV default remains Rust 1.85. Core, Model, SQLite,
+  and observability inherit that default. `group-agent-genai` alone declares
+  Rust 1.88 because the published genai 0.6.5 source uses let-chain syntax that
+  became stable in Rust 1.88. This is an effective source-derived requirement;
+  do not claim that genai 0.6.5 declares `rust-version = "1.88"` in its
+  manifest.
+- Applications inject one preconfigured `genai::Client`. The adapter never
+  reads `.env`, resolves organization credential policy, prints secrets, or
+  rebuilds a Client per request.
+- Raw adapter methods continue to accept only `ValidatedChatRequest`.
+  Standalone mapping helpers must validate ordinary `ChatRequest` values before
+  conversion.
+- Capabilities are explicit. genai 0.6.5 has no provider-neutral
+  `parallel_tool_calls` request control, so the adapter rejects that capability
+  and every explicit request value instead of silently ignoring it.
+- Only documented `group.genai.*` request Extensions are accepted. Unknown
+  owned keys fail; foreign namespaces are ignored and never forwarded.
+  Extensions cannot inject headers, Authorization, API keys, or arbitrary
+  `extra_body`.
+- Thought signatures are carried as genai thought content exactly once and
+  return on ToolCall Extensions. Non-streaming requests that may produce
+  ToolCalls require `GenaiChatModelAdapter::new_with_stable_target`, a
+  `ClientConfig` without a dynamic `ServiceTargetResolver`, and one exact
+  `ServiceTarget` shared by validation and dispatch. Dynamic or unknown target
+  resolution fails closed before HTTP for such requests; ordinary text
+  completion remains available.
+- For stable OpenAI Responses non-streaming ToolCalls, genai first reads,
+  parses, and may clone the complete raw response value. Group's configurable
+  8 MiB default is only a post-capture parser admission limit. It is not a
+  network-read, HTTP-body, or peak-memory bound. An early-terminating counting
+  serializer retains no serialized bytes; the raw value is parsed only long
+  enough to correlate encrypted reasoning with the matching normalized
+  function call, then taken and released. Successful Group `ChatResponse`,
+  Extensions, adapter mapping errors, and their default formatting do not
+  expose it.
+- Identical signatures within one function call are deduplicated in first
+  occurrence order. Distinct signatures preserve provider order, and
+  deduplication never crosses function-call boundaries. Empty signatures,
+  checked length overflow, and configured count or byte-limit violations fail.
+  A real two-turn HTTP fixture, not manual signature injection, verifies
+  continuation. Response IDs are stateless: applications must explicitly place
+  one into the next request's previous-response-ID Extension.
+- Binary, Custom, and assistant ToolResponse content are rejected. Reasoning is
+  optional redacted Extension data and never normal assistant text.
+- Stream wrappers directly own genai streams. They create no channel, detached
+  task, or collector, emit an explicit Protocol error for EOF without End, and
+  become terminal after the first item error.
+- Stage 17.2 streaming is fail-closed. `GenaiStreamingPolicy` defaults to
+  Disabled; enabled text streaming requires a Client bound to
+  `AdapterKind::OpenAI`. There is no caller-supplied protocol profile. Group
+  checks the exact resolved `ChatStreamResponse.model_iden` before polling its
+  lazy stream, so custom or changing resolvers cannot redirect an audited call
+  into Responses. Under genai 0.6.5, OpenAI Chat text-only streaming is
+  supported, requests that may produce ToolCalls fail before HTTP dispatch,
+  and all OpenAI Responses streaming is rejected with zero server hits.
+- A `ThoughtSignatureChunk` is not valid on the audited OpenAI Chat text-only
+  stream. Empty and non-empty chunks both cause an immediate terminal Protocol
+  error without retaining content, guessing ownership, or emitting a partial
+  Group event.
+- Streaming ToolCall cumulative arguments are append-only: equal input is
+  idempotent, a prefix extension emits only the suffix, and a non-prefix change
+  is Protocol. Terminal arguments are parsed and compared as complete JSON
+  values; malformed accumulated JSON is Decode.
+- genai errors remain concrete sources. Group's default Debug and Display do
+  not expose prompts, tool arguments/results, reasoning, raw bodies, provider
+  error bodies, headers, or auth data. Explicitly traversing or recording the
+  complete `Error::source()` chain can reach upstream genai errors and may
+  expose upstream data; applications must filter sensitive information before
+  logging a full source chain.
+- `ResponseId` Debug and Display are redacted; `as_str()` is the explicit
+  continuation-value accessor. Group does not trace raw SSE data. The genai
+  0.6.5 Responses streaming path that can trace raw events is never polled or
+  dispatched by the Group adapter. Non-streaming captured raw values are not
+  placed in successful Group responses or adapter mapping errors and are
+  released after signature correlation; their parser admission limit applies
+  only after genai has captured the value.
+- The adapter implements no retry, fallback, rate limiter, circuit breaker,
+  tool execution, MCP, embedding, RAG, memory, ReAct, or prebuilt Agent.
+- Provider tests are loopback-only and must never call the public internet.
 
 ## Performance principles
 
@@ -652,8 +741,8 @@ modification, time travel, parallel interrupts, PostgreSQL, forced Serde bounds
 or built-in Serde codecs, arbitrary Node Command or Send APIs, conditional
 fan-out into subgraph mounts, custom asynchronous event backpressure, disk
 event queues, OpenTelemetry or metrics exporters, WebSocket or SSE servers,
-network event proxies, real LLM providers or HTTP clients, provider API keys,
-provider retries or rate limiters, tool execution or registries, MCP, RAG,
+network event proxies, provider fallback, credential storage, provider retries
+or rate limiters, tool execution or registries, MCP, RAG,
 embeddings, agent memory, ReAct, prebuilt agents, standalone reducer
 registration, Tower middleware, Axum, distributed workers, macro DSLs, or a
 visual interface unless a later stage explicitly authorizes them.
@@ -687,22 +776,48 @@ cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
 cargo run -p group-agent-model --example model_node
+cargo run -p group-agent-genai --example genai_model
+cargo check -p group-agent-genai --example genai_node
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
 
-Also validate the declared MSRV:
+Validate the layered MSRV. Rust 1.85 covers every workspace crate except the
+optional genai provider adapter:
 
 ```bash
-cargo +1.85.0 check --workspace --all-targets --all-features
-cargo +1.85.0 test --workspace
+cargo +1.85.0 check \
+  --workspace \
+  --exclude group-agent-genai \
+  --all-targets \
+  --all-features
+cargo +1.85.0 test \
+  --workspace \
+  --exclude group-agent-genai
+```
+
+Rust 1.88 covers all genai adapter targets, features, examples, benchmarks,
+tests, and documentation:
+
+```bash
+cargo +1.88.0 check \
+  -p group-agent-genai \
+  --all-targets \
+  --all-features
+cargo +1.88.0 test -p group-agent-genai
+cargo +1.88.0 test -p group-agent-genai --doc
 ```
 
 Finally inspect dependencies and check the working-tree diff:
 
 ```bash
 cargo tree --workspace
+cargo tree -p group-agent-core -e normal
+cargo tree -p group-agent-model -e normal
+cargo tree -p group-agent-genai -e normal
+cargo metadata --no-deps --format-version 1
 git diff --check
+git diff -- crates/group-agent-core
 ```
 
 Run benchmarks for measurements with:
@@ -738,4 +853,8 @@ provider-neutral model boundary without changing Core or the durable checkpoint
 API. Stage 16.1 hardens the public model facade, partial usage, redacted Debug,
 and continuation Extensions without changing Core. Stage 16.2 makes the raw
 adapter boundary non-bypassable and stream/Usage merging atomic without
-changing Core. Stage 17 may add a separate genai adapter.
+changing Core. Stage 17 adds the separate genai 0.6.5 adapter with injected
+Client ownership, offline HTTP coverage, and no Core changes. The Stage 17 MSRV
+resolution retains Rust 1.85 for Runtime, Model, SQLite, and observability while
+declaring Rust 1.88 only for the optional genai adapter; the stable full
+workspace gate remains mandatory.

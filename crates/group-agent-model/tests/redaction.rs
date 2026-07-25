@@ -2,10 +2,10 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use group_agent_model::{
-    AssistantMessage, ChatRequest, ChatResponse, ChatStreamEvent, ContentPart, Extensions,
-    FinishReason, GenerationConfig, Message, ModelCapabilities, ModelError, ModelErrorKind,
-    ModelId, ModelMetadata, ProviderId, SystemMessage, TokenUsage, ToolCall, ToolCallDelta,
-    ToolCallId, ToolDefinition, ToolName, ToolResult, UserMessage,
+    AssistantMessage, ChatRequest, ChatResponse, ChatStreamCollector, ChatStreamEvent, ContentPart,
+    Extensions, FinishReason, GenerationConfig, Message, ModelCapabilities, ModelError,
+    ModelErrorKind, ModelId, ModelMetadata, ProviderId, ResponseId, SystemMessage, TokenUsage,
+    ToolCall, ToolCallDelta, ToolCallId, ToolDefinition, ToolName, ToolResult, UserMessage,
 };
 use serde_json::json;
 
@@ -14,11 +14,13 @@ const ASSISTANT_SECRET: &str = "ASSISTANT_SECRET_SENTINEL_16_2";
 const TOOL_ARGUMENTS_SECRET: &str = "TOOL_ARGUMENTS_SECRET_SENTINEL_16_2";
 const TOOL_RESULT_SECRET: &str = "TOOL_RESULT_SECRET_SENTINEL_16_2";
 const SCHEMA_SECRET: &str = "SCHEMA_SECRET_SENTINEL_16_2";
+const TOOL_DESCRIPTION_SECRET: &str = "TOOL_DESCRIPTION_SECRET_SENTINEL_16_2";
 const EXTENSION_SECRET: &str = "EXTENSION_SECRET_SENTINEL_16_2";
 const STREAM_TEXT_SECRET: &str = "STREAM_TEXT_SECRET_SENTINEL_16_2";
 const STREAM_ARGUMENT_SECRET: &str = "STREAM_ARGUMENT_SECRET_SENTINEL_16_2";
 const PROVIDER_MESSAGE_SECRET: &str = "PROVIDER_MESSAGE_SECRET_SENTINEL_16_2";
 const PROVIDER_SOURCE_SECRET: &str = "PROVIDER_SOURCE_SECRET_SENTINEL_16_2";
+const RESPONSE_ID_SECRET: &str = "RESPONSE_ID_SECRET_SENTINEL_17_1";
 
 fn extensions() -> Extensions {
     Extensions::new()
@@ -61,7 +63,7 @@ fn message_and_tool_debug_redact_independent_payload_categories() {
     );
     let definition = ToolDefinition::new(
         ToolName::new("safe-tool").expect("valid tool name"),
-        "safe description",
+        TOOL_DESCRIPTION_SECRET,
         json!({"description": SCHEMA_SECRET}),
     );
 
@@ -77,10 +79,49 @@ fn message_and_tool_debug_redact_independent_payload_categories() {
     assert_debug_redacted(&result, TOOL_RESULT_SECRET, "ToolResult");
     assert_debug_redacted(&tool_message, TOOL_RESULT_SECRET, "Tool");
     assert_debug_redacted(&definition, SCHEMA_SECRET, "safe-tool");
+    assert_debug_redacted(&definition, TOOL_DESCRIPTION_SECRET, "description_bytes");
 
     let display = Message::user(PROMPT_SECRET).to_string();
     assert!(!display.contains(PROMPT_SECRET), "message Display leaked");
     assert!(display.contains("User"), "message Display lost safe role");
+}
+
+#[test]
+fn collector_limit_and_failed_state_errors_do_not_leak_prior_payloads() {
+    fn assert_error_redacted(error: &ModelError, secret: &str) {
+        for rendered in [format!("{error:?}"), error.to_string()] {
+            assert!(
+                !rendered.contains(secret),
+                "collector error leaked: {rendered}"
+            );
+        }
+    }
+
+    let mut failed = ChatStreamCollector::new().with_max_text_bytes(0);
+    let initial = failed
+        .push(ChatStreamEvent::TextDelta(STREAM_TEXT_SECRET.to_owned()))
+        .expect_err("text is over the configured limit");
+    assert_error_redacted(&initial, STREAM_TEXT_SECRET);
+    let already_failed = failed
+        .push(ChatStreamEvent::TextDelta(PROMPT_SECRET.to_owned()))
+        .expect_err("collector remains failed");
+    assert_error_redacted(&already_failed, PROMPT_SECRET);
+
+    let mut extension_collector = ChatStreamCollector::new().with_max_tool_call_extensions(0);
+    let extension_error = extension_collector
+        .push(ChatStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0).with_extensions(extensions()),
+        ))
+        .expect_err("extension limit is enforced");
+    assert_error_redacted(&extension_error, EXTENSION_SECRET);
+
+    let mut arguments = ChatStreamCollector::new().with_max_tool_argument_bytes(0);
+    let arguments_error = arguments
+        .push(ChatStreamEvent::ToolCallDelta(
+            ToolCallDelta::new(0).with_arguments_fragment(STREAM_ARGUMENT_SECRET),
+        ))
+        .expect_err("argument limit is enforced");
+    assert_error_redacted(&arguments_error, STREAM_ARGUMENT_SECRET);
 }
 
 #[test]
@@ -103,6 +144,7 @@ fn request_response_usage_and_metadata_debug_redact_independent_categories() {
         FinishReason::Other(ASSISTANT_SECRET.to_owned()),
     )
     .with_usage(usage.clone())
+    .with_response_id(ResponseId::new(RESPONSE_ID_SECRET).expect("response id"))
     .with_extensions(extensions());
     let metadata = ModelMetadata::new(
         ProviderId::new("safe-provider").expect("valid provider"),
@@ -120,7 +162,28 @@ fn request_response_usage_and_metadata_debug_redact_independent_categories() {
     assert_debug_redacted(&response, ASSISTANT_SECRET, "ChatResponse");
     assert_debug_redacted(&response, TOOL_ARGUMENTS_SECRET, "call-safe-id");
     assert_debug_redacted(&response, EXTENSION_SECRET, "safe.extension.key");
+    assert_debug_redacted(&response, RESPONSE_ID_SECRET, "ResponseId");
     assert_debug_redacted(&metadata, EXTENSION_SECRET, "safe-provider");
+}
+
+#[test]
+fn response_id_debug_display_and_nested_stream_event_are_redacted() {
+    let response_id = ResponseId::new(RESPONSE_ID_SECRET).expect("response id");
+    assert_eq!(response_id.as_str(), RESPONSE_ID_SECRET);
+    for rendered in [format!("{response_id:?}"), response_id.to_string()] {
+        assert!(!rendered.contains(RESPONSE_ID_SECRET));
+        assert!(rendered.contains("ResponseId"));
+        assert!(rendered.contains("bytes"));
+    }
+
+    let event = ChatStreamEvent::ResponseStarted {
+        response_id: Some(response_id),
+        model: None,
+        extensions: Extensions::new(),
+    };
+    let debug = format!("{event:?}");
+    assert!(!debug.contains(RESPONSE_ID_SECRET));
+    assert!(debug.contains("ResponseId"));
 }
 
 #[test]

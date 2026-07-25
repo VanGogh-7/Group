@@ -1,0 +1,30 @@
+[package]
+name = "group-agent-genai"
+description = "genai 0.6.5 chat model adapter for Group applications"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+genai.workspace = true
+group-agent-model = { path = "../group-agent-model" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+futures-executor.workspace = true
+group-agent-core = { path = "../group-agent-core" }
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
+tokio-util.workspace = true
+
+[[bench]]
+name = "adapter"
+harness = false
+
+[lints]
+workspace = true

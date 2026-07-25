@@ -7,14 +7,16 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 16.2 closes the validated adapter and atomic stream-collection boundary
-in the independent `group-agent-model` crate. Applications use the validated
-`ChatModel` facade; raw provider adapters receive only
-`ValidatedChatRequest`, whose construction is private to the facade. Stream
-events commit atomically, the first collection error permanently poisons a
-manual collector, and cumulative token usage merges extensions in place
-without cloning existing JSON values. It performs no network access and has no
-provider SDK, API-key, retry, or tool-execution integration. Stage 15.2 remains
+Stage 17 adds the independent `group-agent-genai` crate, fixed to `genai`
+0.6.5. It maps the Stage 16.2 validated model boundary to an
+application-injected `genai::Client`, including messages, tools, generation
+controls, non-streaming responses, online stream normalization, partial usage,
+thought-signature and response-ID continuation, and source-preserving errors.
+Stage 17.1 keeps audited OpenAI Chat text-only streaming available while
+rejecting OpenAI Chat tool streaming and all OpenAI Responses streaming before
+network dispatch under genai 0.6.5.
+The adapter reads no environment or credentials, creates no runtime, channel,
+forwarding task, retry loop, or hidden session state. Stage 15.2 remains
 the current Core checkpoint foundation: Resume continues the latest head of
 either the default lineage or a selected branch; Replay remains strictly
 read-only; Fork creates a new `BranchId` from one exact historical checkpoint.
@@ -50,6 +52,10 @@ The current workspace includes:
   model capabilities, metadata, token usage, and finish reasons;
 - a provider-neutral stream-event protocol and reusable validating response
   collector;
+- a separate `genai` 0.6.5 chat adapter with injected authentication and
+  endpoint configuration;
+- offline loopback HTTP coverage for non-streaming, SSE, continuation, Group
+  Node integration, timeout, cancellation, and Future-drop ownership;
 - asynchronous trait-based nodes;
 - fixed edges, static and conditional fan-out, fan-in barriers, and conditional
   target whitelists;
@@ -92,7 +98,10 @@ dependency on the model crate. Applications opt into both:
 ```text
 application
 ├── group-agent-core
-└── group-agent-model
+├── group-agent-model
+└── group-agent-genai
+    ├── group-agent-model
+    └── genai = 0.6.5
 ```
 
 The model crate represents `Message::{System, User, Assistant, Tool}` explicitly
@@ -135,7 +144,7 @@ use group_agent_model::{
 
 async fn complete(
     adapter: Arc<dyn ChatModelAdapter>,
-) -> Result<String, group_agent_model::ModelError> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let model = ChatModel::new(adapter)?;
     let response = model
         .complete(ChatRequest::new(vec![Message::user("Hello")]))
@@ -233,9 +242,11 @@ raw adapter Future. See
 That example uses only an offline mock model and preserves `ModelError` through
 `NodeError::with_source`.
 
-Stage 17 may add a separate genai adapter against this boundary. Stage 16.2 does
-not support real providers, HTTP, API-key loading, provider retries, a tool
-runtime, MCP, embeddings, RAG, memory, ReAct, or prebuilt agents.
+`group-agent-model` itself still has no provider SDK or HTTP dependency.
+Stage 17 adds the separate
+[`group-agent-genai`](crates/group-agent-genai) adapter without changing that
+crate or Core. It provides no API-key loading, retry, fallback, tool runtime,
+MCP, embeddings, RAG, memory, ReAct, or prebuilt agent.
 
 ### Stage 16.2 migration from Stage 16.1
 
@@ -253,6 +264,117 @@ runtime, MCP, embeddings, RAG, memory, ReAct, or prebuilt agents.
 - Choose either manual `ChatStreamCollector::{push, finish}` usage or
   `collect_chat_stream(stream)`. The helper owns its own collector, stops on the
   first error, and does not require a separately constructed collector.
+
+### Stage 17 genai adapter
+
+Applications construct and configure one `genai::Client`, then inject it:
+
+```rust
+use genai::{Client, adapter::AdapterKind};
+use group_agent_genai::{
+    GenaiAdapterConfig, GenaiChatModelAdapter, GenaiModelConfig,
+    GenaiStreamingPolicy,
+};
+use group_agent_model::{
+    ChatModel, ModelCapabilities, ModelId, ProviderId,
+};
+
+fn build_model() -> Result<ChatModel, Box<dyn std::error::Error>> {
+    let client = Client::builder()
+        .with_adapter_kind(AdapterKind::OpenAI)
+        .build();
+    let target = GenaiModelConfig::new(
+        "gpt-4o-mini",
+        ProviderId::new("openai")?,
+        ModelId::new("gpt-4o-mini")?,
+        ModelCapabilities::new()
+            .with_streaming(true)
+            .with_tool_calling(true)
+            .with_usage_reporting(true),
+    )?;
+    let adapter = GenaiChatModelAdapter::new(
+        client,
+        GenaiAdapterConfig::new(target)
+            .with_streaming_policy(GenaiStreamingPolicy::AuditedTextOnly),
+    )?;
+    Ok(ChatModel::from_adapter(adapter)?)
+}
+```
+
+Capabilities are explicit and conservative. `parallel_tool_calls` is rejected
+because genai 0.6.5 has no provider-neutral request control for it. Binary and
+Custom response parts are rejected. Reasoning may be retained only in redacted
+`group.genai.reasoning_content` Extensions and is never answer text. Request
+Extensions accept only documented adapter-owned keys; unknown
+`group.genai.*` keys fail, other namespaces are ignored, and arbitrary headers
+or `extra_body` are never exposed.
+
+The adapter uses genai's actual `ChatRequest`, `ChatOptions`, response, usage,
+and stream types. Streaming defaults to Disabled. Enabling it requires a
+Client explicitly bound to `AdapterKind::OpenAI`; there is no caller-supplied
+protocol claim. Each returned stream's actual resolved `model_iden` is checked
+before its lazy HTTP stream is polled, so a custom or changing resolver cannot
+redirect an audited call into Responses. Audited OpenAI Chat text-only
+streaming is supported; requests with tools and all OpenAI Responses streaming
+fail before HTTP dispatch because genai 0.6.5 can lose a second ToolCall in one
+SSE event and its Responses streamer can skip malformed data, trace raw events,
+and synthesize End at EOF.
+
+Non-streaming requests that may produce ToolCalls require
+`GenaiChatModelAdapter::new_with_stable_target`: it accepts a `ClientConfig`
+without a `ServiceTargetResolver` and dispatches the same exact
+`ServiceTarget` that was validated. Dynamic or otherwise unverifiable
+resolvers fail closed before network dispatch for these requests; ordinary
+non-streaming text remains supported. For OpenAI Responses tool calls, genai
+first reads, parses, and may clone the complete raw response value. Group then
+applies an 8 MiB-by-default post-capture parser admission limit and extracts
+only ordered reasoning signatures and matching function-call identity. This
+limit does not bound network reads, the HTTP body, or peak memory. Its
+early-terminating counting serializer retains no serialized bytes. The raw
+value in a successful response is taken, parsed, and released after mapping.
+It is not placed in Group `ChatResponse`, Extensions, adapter mapping errors,
+or their default Debug/Display output.
+
+If genai itself fails while parsing a Provider response, Group retains the
+concrete `genai::Error` through `Error::source()`. Default `ModelError`, Node,
+and Graph Debug/Display remain redacted, but an application that explicitly
+walks or records the complete source chain may encounter upstream error data
+and must apply its own sensitive-data filtering.
+
+Within each function call, identical signatures are deduplicated in first
+occurrence order and distinct signatures preserve provider order. No
+deduplication crosses function-call boundaries; empty signatures, checked
+length overflow, and configured count or byte-limit violations fail. A real
+two-turn local HTTP test verifies Provider-to-Group-to-Provider continuation
+without injecting a signature in application code. A returned Group stream
+directly owns the genai stream. Normal EOF without genai `End` on an allowed
+path is an explicit Protocol error, and dropping the Future or stream releases
+that ownership without a detached task. `ResponseId` Debug and Display are
+redacted; `as_str()` is the deliberate raw-value accessor. See
+[`docs/stage-17-genai.md`](docs/stage-17-genai.md) for the mapping table,
+continuation example, extension contract, current limits, and the discovered
+split compiler-support policy required by genai 0.6.5.
+
+### Compiler support policy
+
+Group uses a layered minimum supported Rust version (MSRV):
+
+| Crate / layer | MSRV |
+| --- | --- |
+| `group-agent-core` | Rust 1.85 |
+| `group-agent-model` | Rust 1.85 |
+| SQLite and observability adapters | Rust 1.85 |
+| `group-agent-genai` | Rust 1.88 |
+| Full workspace | Rust 1.88+ |
+
+The workspace package default remains Rust 1.85. Only
+`group-agent-genai` overrides that default because the published crates.io
+source for genai 0.6.5 uses let-chain syntax, which became stable in Rust 1.88.
+This is an effective MSRV inferred from the release's actual source, not an
+explicit `rust-version = "1.88"` declaration by genai. Group's Runtime and
+provider-neutral Model crates have not raised their MSRV. Applications that do
+not select the optional provider adapter can continue to use those layers with
+Rust 1.85; building the complete workspace requires Rust 1.88 or newer.
 
 ## Shared-state subgraphs and execution namespaces
 
@@ -1351,6 +1473,8 @@ reason to redesign the runtime.
 ├── AGENTS.md
 ├── Cargo.toml
 ├── README.md
+├── docs
+│   └── stage-17-genai.md
 ├── rust-toolchain.toml
 ├── rustfmt.toml
 └── crates
@@ -1376,6 +1500,34 @@ reason to redesign the runtime.
     │   │   └── lib.rs
     │   └── tests
     │       └── event_stream.rs
+    ├── group-agent-genai
+    │   ├── Cargo.toml
+    │   ├── benches
+    │   │   └── adapter.rs
+    │   ├── examples
+    │   │   ├── genai_model.rs
+    │   │   └── genai_node.rs
+    │   ├── src
+    │   │   ├── adapter.rs
+    │   │   ├── config.rs
+    │   │   ├── error.rs
+    │   │   ├── extensions.rs
+    │   │   ├── lib.rs
+    │   │   ├── request.rs
+    │   │   ├── response.rs
+    │   │   ├── stream.rs
+    │   │   └── usage.rs
+    │   └── tests
+    │       ├── continuation.rs
+    │       ├── error_mapping.rs
+    │       ├── group_integration.rs
+    │       ├── local_http.rs
+    │       ├── request_mapping.rs
+    │       ├── response_mapping.rs
+    │       ├── stream_compatibility.rs
+    │       ├── stream_mapping.rs
+    │       └── support
+    │           └── mod.rs
     ├── group-agent-model
     │   ├── Cargo.toml
     │   ├── benches
@@ -1466,8 +1618,24 @@ cargo run -p group-agent-core --example replay
 cargo run -p group-agent-core --example resume
 cargo run -p group-agent-core --example interrupt
 cargo run -p group-agent-model --example model_node
+cargo run -p group-agent-genai --example genai_model
+cargo check -p group-agent-genai --example genai_node
 cargo bench --workspace --no-run
 ```
+
+The stable toolchain always validates the full workspace. MSRV validation is
+split between the Runtime/Model workspace and the optional provider adapter:
+
+```bash
+cargo +1.85.0 check --workspace --exclude group-agent-genai --all-targets --all-features
+cargo +1.85.0 test --workspace --exclude group-agent-genai
+cargo +1.88.0 check -p group-agent-genai --all-targets --all-features
+cargo +1.88.0 test -p group-agent-genai
+cargo +1.88.0 test -p group-agent-genai --doc
+```
+
+The complete acceptance matrix remains documented in
+[`AGENTS.md`](AGENTS.md#required-validation).
 
 ## Current exclusions
 
@@ -1477,14 +1645,15 @@ parallel interrupts, Replay writes or historical State modification, Time
 Travel, PostgreSQL, built-in Serde codecs, arbitrary Node Command or Send APIs,
 conditional fan-out into subgraph mounts, custom asynchronous backpressure,
 disk event queues, OpenTelemetry exporters, metrics exporters, WebSocket or SSE
-servers, network event proxies, standalone reducer registration, real LLM
-provider clients, tool execution APIs, MCP, RAG, Tower middleware, Axum, HTTP
+servers, network event proxies, standalone reducer registration, provider
+fallback or retry, tool execution APIs, MCP, RAG, Tower middleware, Axum, HTTP
 services, distributed workers, macro DSLs, or visualization. SQLite is the only
 reference database backend; the bounded Tokio stream adapter is process-local
-and intentionally lossy. `group-agent-model` adds model and tool data
-abstractions but still excludes real LLM providers, genai or other provider
-adapters, HTTP, API keys, retry policies, rate limiters, tool execution and
-registries, MCP, embeddings, RAG, agent memory, ReAct, and prebuilt agents.
+and intentionally lossy. `group-agent-model` remains provider-neutral.
+`group-agent-genai` is the sole real chat provider adapter and is fixed to
+genai 0.6.5; it excludes credential storage, `.env` loading, retries, rate
+limiters, fallback, tool execution and registries, MCP, embeddings, RAG, agent
+memory, ReAct, and prebuilt agents.
 
 ## Architecture review cadence
 
@@ -1499,4 +1668,5 @@ Stage 16 adds an independent application-layer model abstraction without
 changing Core or its durable APIs. Stage 16.1 hardens that boundary with a
 validated facade, partial usage, redacted Debug, and continuation Extensions.
 Stage 16.2 makes raw validation non-bypassable and stream/Usage merging atomic.
-Stage 17 is reserved for a separate genai adapter.
+Stage 17 adds the separate genai 0.6.5 adapter without changing Core or Model
+dependency direction.

@@ -177,7 +177,8 @@ fn large_usage_extension_merge(criterion: &mut Criterion) {
         bencher.iter_batched(
             || (existing.clone(), next.clone()),
             |(mut existing, next)| {
-                black_box(existing.merge_snapshot(next)).expect("valid cumulative merge")
+                black_box(existing.merge_snapshot(next)).expect("valid cumulative merge");
+                existing
             },
             BatchSize::SmallInput,
         );
@@ -200,7 +201,9 @@ fn atomic_extension_conflict(criterion: &mut Criterion) {
         bencher.iter_batched(
             || (existing.clone(), conflicting.clone()),
             |(mut existing, conflicting)| {
-                black_box(existing.merge_idempotent(conflicting)).expect_err("conflict is expected")
+                black_box(existing.merge_idempotent(conflicting))
+                    .expect_err("conflict is expected");
+                existing
             },
             BatchSize::SmallInput,
         );
