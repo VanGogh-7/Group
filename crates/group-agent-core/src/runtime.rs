@@ -3058,9 +3058,17 @@ mod resume_validation_tests {
                 .await
                 .expect_err("mismatched resume interrupt metadata"),
             validation_graph()
-                .replay(ReplayConfig::new("validation-thread", checkpoint_id, store))
+                .replay(ReplayConfig::new(
+                    "validation-thread",
+                    checkpoint_id,
+                    Arc::clone(&store),
+                ))
                 .await
                 .expect_err("mismatched replay interrupt metadata"),
+            validation_graph()
+                .fork(ForkConfig::new("validation-thread", checkpoint_id, store))
+                .await
+                .expect_err("mismatched fork interrupt metadata"),
         ] {
             assert!(matches!(
                 error,
@@ -3115,9 +3123,17 @@ mod resume_validation_tests {
                 .await
                 .expect_err("nested resume interrupt metadata"),
             nested_validation_graph()
-                .replay(ReplayConfig::new("validation-thread", checkpoint_id, store))
+                .replay(ReplayConfig::new(
+                    "validation-thread",
+                    checkpoint_id,
+                    Arc::clone(&store),
+                ))
                 .await
                 .expect_err("nested replay interrupt metadata"),
+            nested_validation_graph()
+                .fork(ForkConfig::new("validation-thread", checkpoint_id, store))
+                .await
+                .expect_err("nested fork interrupt metadata"),
         ] {
             assert!(matches!(
                 error,

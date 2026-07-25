@@ -333,6 +333,36 @@ async fn fork_branch_resume_and_fork_failure_are_delivered_through_the_stream() 
         } if branch_id == fork.branch_id()
     ));
 
+    let mut resume_failure_stream = broadcast.subscribe();
+    let _error = graph
+        .resume(
+            ResumeConfig::new(
+                "stream-fork",
+                Arc::clone(&checkpointer) as Arc<dyn Checkpointer<usize>>,
+            )
+            .with_branch_id(fork.branch_id())
+            .with_resume_value(())
+            .with_event_config(event_config(&broadcast, EventRetention::None)),
+        )
+        .await
+        .expect_err("completed branch rejects a resume value");
+    let resume_failure_events = receive(&mut resume_failure_stream, 2).await;
+    assert!(matches!(
+        resume_failure_events.as_slice(),
+        [
+            GraphEvent::RunStarted { .. },
+            GraphEvent::RunFailed {
+                failure: RunFailure::UnexpectedResumeValue { .. },
+                ..
+            }
+        ]
+    ));
+    assert!(
+        !resume_failure_events
+            .iter()
+            .any(|event| matches!(event, GraphEvent::BranchResumed { .. }))
+    );
+
     let mut failure_stream = broadcast.subscribe();
     let _error = graph
         .fork(

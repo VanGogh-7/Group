@@ -7,7 +7,8 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 15.1 hardens explicit writable Forks and independent branch heads. Resume
+Stage 15.2 hardens SQLite reads for explicit writable Forks and independent
+branch heads. Resume
 continues the latest head of either the default lineage or a selected branch;
 Replay remains strictly read-only; Fork creates a new `BranchId` from one exact
 historical checkpoint. The Stage 10.1 Record/Codec/content-idempotency contract
@@ -616,12 +617,23 @@ storage failure keeps the Branch at its last confirmed head. In particular, a
 Fork that fails before its first successful descendant save retains the source
 checkpoint as its head and can be continued by explicit branch Resume.
 
-SQLite migrations `0002_branch_heads.sql` and `0003_branch_ownership.sql`
-persist branch metadata separately. The latter adds composite ThreadId
-ownership constraints for source, head, and membership. A branch save updates
-its Record, membership row, and head in one `BEGIN IMMEDIATE` transaction, so
-any failure rolls back all three. File-database restart tests reconstruct
-branches without relying on process caches.
+SQLite migrations `0002_branch_heads.sql`, `0003_branch_ownership.sql`, and
+`0004_branch_read_consistency.sql` persist branch metadata separately. The
+ownership migration adds composite ThreadId constraints for source, head, and
+membership. The consistency migration adds a branch-first membership index and
+triggers requiring an initial source head, membership for every non-source
+head, and a parent-continuous membership insertion. A branch save updates its
+Record, membership row, and head in one `BEGIN IMMEDIATE` transaction, so any
+failure rolls back all three.
+
+SQLite `branch_head` and `branch_history` each use one read transaction and one
+JOIN-based record query scoped by both `thread_id` and `branch_id`. The shared
+decoder verifies source and head ownership, requires a non-source head to be a
+member, and validates the complete stable `source -> descendants -> head`
+parent chain before returning any Record. Missing, cross-thread, non-member,
+duplicate, or discontinuous data returns a structured corruption error.
+Concurrent saves therefore cannot expose a mixed metadata/Record snapshot.
+File-database restart tests reconstruct branches without process caches.
 
 Fork starts from the exact historical State and does not accept a State patch.
 There is no branch merge, branch deletion, or implicit branch selection. See
@@ -1135,10 +1147,12 @@ Stage 14 adds read-only replay from a middle checkpoint through one immediate
 node, completed-checkpoint no-op replay, and replay of a two-node frontier.
 Stage 15 adds a historical fork plus one immediate node in the same harness.
 Stage 15.1 adds a branch Resume baseline and an independent SQLite
-restart-plus-branch-Resume benchmark. Criterion uses explicit warm-up,
-measurement, sample-size, and noise-threshold settings. Results are local
-regression baselines only; short-run variation is not a reason to redesign the
-runtime.
+restart-plus-branch-Resume benchmark. Stage 15.2 runs the branch Resume
+baseline against a real `InMemoryCheckpointStore` and `RecordCheckpointer`,
+rather than a benchmark-only branch implementation. Criterion uses explicit
+warm-up, measurement, sample-size, and noise-threshold settings. Results are
+local regression baselines only; short-run variation is not a reason to
+redesign the runtime.
 
 ## Workspace
 
@@ -1155,7 +1169,8 @@ runtime.
     │   ├── migrations
     │   │   ├── 0001_checkpoint_store.sql
     │   │   ├── 0002_branch_heads.sql
-    │   │   └── 0003_branch_ownership.sql
+    │   │   ├── 0003_branch_ownership.sql
+    │   │   └── 0004_branch_read_consistency.sql
     │   ├── benches
     │   │   └── branch_restart.rs
     │   ├── src

@@ -572,6 +572,75 @@ async fn incompatible_graph_version_fails_before_branch_creation() {
 }
 
 #[tokio::test]
+async fn branch_resume_preparation_failure_does_not_emit_branch_resumed() {
+    let graph = graph();
+    let store = Arc::new(InMemoryCheckpointer::new(Codec));
+    seed(&graph, &store, "branch-resume-preparation").await;
+    let source = store
+        .latest(&"branch-resume-preparation".into())
+        .await
+        .expect("latest")
+        .expect("source")
+        .id();
+    let branch_id = graph
+        .fork(ForkConfig::new(
+            "branch-resume-preparation",
+            source,
+            typed(&store),
+        ))
+        .await
+        .expect("completed source fork")
+        .branch_id();
+
+    let mut incompatible = StateGraph::new();
+    incompatible.set_version("fork-v2");
+    incompatible.add_node("one", Add(1)).expect("one");
+    incompatible.add_node("two", Add(2)).expect("two");
+    incompatible.add_node("three", Add(3)).expect("three");
+    incompatible
+        .add_edge(START, "one")
+        .add_edge("one", "two")
+        .add_edge("two", "three")
+        .add_edge("three", END);
+    let incompatible = incompatible.compile().expect("incompatible graph");
+    let sink = Arc::new(RecordingSink::default());
+    let error = incompatible
+        .resume(
+            ResumeConfig::new("branch-resume-preparation", typed(&store))
+                .with_branch_id(branch_id)
+                .with_event_config(
+                    EventConfig::new(EventRetention::None)
+                        .with_sink(Arc::clone(&sink) as Arc<dyn EventSink>),
+                ),
+        )
+        .await
+        .expect_err("version mismatch");
+    assert!(matches!(
+        error,
+        GraphRunError::CheckpointIncompatible {
+            reason: CheckpointIncompatibility::GraphVersionMismatch { .. },
+            ..
+        }
+    ));
+    let events = sink.0.lock().expect("events");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            GraphEvent::RunStarted { .. },
+            GraphEvent::RunFailed {
+                failure: RunFailure::CheckpointIncompatible { .. },
+                ..
+            }
+        ]
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GraphEvent::BranchResumed { .. }))
+    );
+}
+
+#[tokio::test]
 async fn fork_control_failures_have_one_terminal_event_and_preserve_branch_contract() {
     let graph = control_graph();
     let store = Arc::new(InMemoryCheckpointer::new(Codec));

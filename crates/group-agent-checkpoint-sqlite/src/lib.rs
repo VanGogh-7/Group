@@ -4,6 +4,7 @@
 //! [`group_agent_core::CheckpointCodec`]. This crate stores and reconstructs
 //! only the storage-neutral [`group_agent_core::CheckpointRecord`] model.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,22 @@ const SELECT_RECORD_COLUMNS: &str = "\
     snapshot_schema_version, snapshot_encoding, snapshot_bytes, frontier_json, \
     completed, interrupt_id, interrupt_node_path_json, interrupt_schema, \
     interrupt_schema_version, interrupt_encoding, interrupt_bytes";
+
+const SELECT_QUALIFIED_RECORD_COLUMNS: &str = "\
+    records.sequence AS sequence, records.checkpoint_id AS checkpoint_id, \
+    records.thread_id AS thread_id, records.run_id AS run_id, \
+    records.parent_id AS parent_id, records.graph_version AS graph_version, \
+    records.format_version AS format_version, records.superstep_be AS superstep_be, \
+    records.step_be AS step_be, records.snapshot_schema AS snapshot_schema, \
+    records.snapshot_schema_version AS snapshot_schema_version, \
+    records.snapshot_encoding AS snapshot_encoding, \
+    records.snapshot_bytes AS snapshot_bytes, records.frontier_json AS frontier_json, \
+    records.completed AS completed, records.interrupt_id AS interrupt_id, \
+    records.interrupt_node_path_json AS interrupt_node_path_json, \
+    records.interrupt_schema AS interrupt_schema, \
+    records.interrupt_schema_version AS interrupt_schema_version, \
+    records.interrupt_encoding AS interrupt_encoding, \
+    records.interrupt_bytes AS interrupt_bytes";
 
 /// SQLx SQLite failures exposed by the durable store adapter.
 #[derive(Debug, Error)]
@@ -125,6 +142,18 @@ pub enum SqliteRecordError {
         branch_id: BranchId,
         expected_head: CheckpointId,
         actual_head: CheckpointId,
+    },
+    /// A non-source branch head has no membership in the selected branch.
+    #[error("checkpoint branch `{branch_id}` head record `{checkpoint_id}` is not a branch member")]
+    BranchHeadNotMember {
+        branch_id: BranchId,
+        checkpoint_id: CheckpointId,
+    },
+    /// A source or descendant appeared more than once in one branch history.
+    #[error("checkpoint branch `{branch_id}` contains duplicate record `{checkpoint_id}`")]
+    DuplicateBranchRecord {
+        branch_id: BranchId,
+        checkpoint_id: CheckpointId,
     },
     /// A stored branch descendant does not continue its branch parent lineage.
     #[error(
@@ -531,35 +560,16 @@ impl CheckpointStore for SqliteCheckpointStore {
         thread_id: &ThreadId,
         branch_id: BranchId,
     ) -> Result<Option<Arc<CheckpointRecord>>, CheckpointerError> {
-        let row = sqlx::query(
-            "SELECT head_checkpoint_id FROM group_checkpoint_branches \
-             WHERE thread_id = ? AND branch_id = ?",
-        )
-        .bind(thread_id.as_str())
-        .bind(branch_id.into_bytes().to_vec())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| store_read_error(database_error("branch head query", source)))?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let checkpoint_id = column::<Vec<u8>>(&row, "head_checkpoint_id")
-            .and_then(|bytes| decode_uuid("head_checkpoint_id", bytes))
-            .map(CheckpointId::from_bytes)
-            .map_err(branch_read_corruption)?;
-        let record = fetch_record_by_id_pool(&self.pool, checkpoint_id)
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            store_read_error(database_error("branch read transaction begin", source))
+        })?;
+        let history = fetch_branch_history(&mut transaction, thread_id, branch_id)
             .await
-            .map_err(store_read_error)?
-            .ok_or_else(|| {
-                branch_read_corruption(SqliteRecordError::MissingBranchRecord {
-                    relation: "head",
-                    branch_id,
-                    checkpoint_id,
-                })
-            })?;
-        ensure_branch_record_thread("head", branch_id, thread_id, &record)
-            .map_err(branch_read_corruption)?;
-        Ok(Some(Arc::new(record)))
+            .map_err(store_read_error)?;
+        transaction.commit().await.map_err(|source| {
+            store_read_error(database_error("branch read transaction commit", source))
+        })?;
+        Ok(history.and_then(|history| history.into_iter().last().map(Arc::new)))
     }
 
     async fn branch_history(
@@ -567,115 +577,20 @@ impl CheckpointStore for SqliteCheckpointStore {
         thread_id: &ThreadId,
         branch_id: BranchId,
     ) -> Result<Vec<Arc<CheckpointRecord>>, CheckpointerError> {
-        let source = sqlx::query(
-            "SELECT source_checkpoint_id, head_checkpoint_id FROM group_checkpoint_branches \
-             WHERE thread_id = ? AND branch_id = ?",
-        )
-        .bind(thread_id.as_str())
-        .bind(branch_id.into_bytes().to_vec())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| store_read_error(database_error("branch history lookup", source)))?;
-        let Some(source) = source else {
-            return Ok(Vec::new());
-        };
-        let source_id = column::<Vec<u8>>(&source, "source_checkpoint_id")
-            .and_then(|bytes| decode_uuid("source_checkpoint_id", bytes))
-            .map(CheckpointId::from_bytes)
-            .map_err(branch_read_corruption)?;
-        let head_id = column::<Vec<u8>>(&source, "head_checkpoint_id")
-            .and_then(|bytes| decode_uuid("head_checkpoint_id", bytes))
-            .map(CheckpointId::from_bytes)
-            .map_err(branch_read_corruption)?;
-        let source_record = fetch_record_by_id_pool(&self.pool, source_id)
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            store_read_error(database_error("branch read transaction begin", source))
+        })?;
+        let history = fetch_branch_history(&mut transaction, thread_id, branch_id)
             .await
-            .map_err(store_read_error)?
-            .ok_or_else(|| {
-                branch_read_corruption(SqliteRecordError::MissingBranchRecord {
-                    relation: "source",
-                    branch_id,
-                    checkpoint_id: source_id,
-                })
-            })?;
-        ensure_branch_record_thread("source", branch_id, thread_id, &source_record)
-            .map_err(branch_read_corruption)?;
-        let head_record = fetch_record_by_id_pool(&self.pool, head_id)
-            .await
-            .map_err(store_read_error)?
-            .ok_or_else(|| {
-                branch_read_corruption(SqliteRecordError::MissingBranchRecord {
-                    relation: "head",
-                    branch_id,
-                    checkpoint_id: head_id,
-                })
-            })?;
-        ensure_branch_record_thread("head", branch_id, thread_id, &head_record)
-            .map_err(branch_read_corruption)?;
-        let mut history = vec![Arc::new(source_record)];
-        let rows = sqlx::query(
-            "SELECT branch_records.checkpoint_id, branch_records.thread_id \
-             FROM group_checkpoint_branch_records AS branch_records \
-             LEFT JOIN group_checkpoint_records AS records \
-               ON records.checkpoint_id = branch_records.checkpoint_id \
-             WHERE branch_records.branch_id = ? \
-             ORDER BY records.sequence ASC",
-        )
-        .bind(branch_id.into_bytes().to_vec())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| store_read_error(database_error("branch history query", source)))?;
-        for row in rows {
-            let checkpoint_id = column::<Vec<u8>>(&row, "checkpoint_id")
-                .and_then(|bytes| decode_uuid("checkpoint_id", bytes))
-                .map(CheckpointId::from_bytes)
-                .map_err(branch_read_corruption)?;
-            let membership_thread =
-                ThreadId::new(column::<String>(&row, "thread_id").map_err(branch_read_corruption)?);
-            if membership_thread != *thread_id {
-                return Err(branch_read_corruption(SqliteRecordError::BranchOwnership {
-                    relation: "membership",
-                    branch_id,
-                    checkpoint_id,
-                    expected_thread: thread_id.clone(),
-                    actual_thread: membership_thread,
-                }));
-            }
-            let record = fetch_record_by_id_pool(&self.pool, checkpoint_id)
-                .await
-                .map_err(store_read_error)?
-                .ok_or_else(|| {
-                    branch_read_corruption(SqliteRecordError::MissingBranchRecord {
-                        relation: "membership",
-                        branch_id,
-                        checkpoint_id,
-                    })
-                })?;
-            ensure_branch_record_thread("membership", branch_id, thread_id, &record)
-                .map_err(branch_read_corruption)?;
-            let expected_parent = history.last().expect("source was inserted").id();
-            if record.parent_id() != Some(expected_parent) {
-                return Err(branch_read_corruption(
-                    SqliteRecordError::BranchParentMismatch {
-                        branch_id,
-                        checkpoint_id,
-                        expected_parent,
-                        actual_parent: record.parent_id(),
-                    },
-                ));
-            }
-            history.push(Arc::new(record));
-        }
-        let actual_head = history.last().expect("source was inserted").id();
-        if actual_head != head_id {
-            return Err(branch_read_corruption(
-                SqliteRecordError::BranchHeadMismatch {
-                    branch_id,
-                    expected_head: actual_head,
-                    actual_head: head_id,
-                },
-            ));
-        }
-        Ok(history)
+            .map_err(store_read_error)?;
+        transaction.commit().await.map_err(|source| {
+            store_read_error(database_error("branch read transaction commit", source))
+        })?;
+        Ok(history
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect())
     }
 }
 
@@ -780,20 +695,157 @@ async fn fetch_record_by_id(
     row.map(|row| decode_row(&row)).transpose()
 }
 
-async fn fetch_record_by_id_pool(
-    pool: &SqlitePool,
-    checkpoint_id: CheckpointId,
-) -> Result<Option<CheckpointRecord>, SqliteCheckpointError> {
+async fn fetch_branch_history(
+    transaction: &mut Transaction<'_, Sqlite>,
+    thread_id: &ThreadId,
+    branch_id: BranchId,
+) -> Result<Option<Vec<CheckpointRecord>>, SqliteCheckpointError> {
     let sql = format!(
-        "SELECT {SELECT_RECORD_COLUMNS} FROM group_checkpoint_records \
-         WHERE checkpoint_id = ?"
+        "WITH selected_branch AS (\
+             SELECT branch_id, thread_id, source_checkpoint_id, head_checkpoint_id \
+             FROM group_checkpoint_branches \
+             WHERE thread_id = ? AND branch_id = ?\
+         ), selected_checkpoints AS (\
+             SELECT source_checkpoint_id AS checkpoint_id, 0 AS membership_role \
+             FROM selected_branch \
+             UNION ALL \
+             SELECT membership.checkpoint_id, 1 AS membership_role \
+             FROM selected_branch AS branch \
+             JOIN group_checkpoint_branch_records AS membership \
+               ON membership.thread_id = branch.thread_id \
+              AND membership.branch_id = branch.branch_id \
+             UNION ALL \
+             SELECT head_checkpoint_id AS checkpoint_id, 2 AS membership_role \
+             FROM selected_branch\
+         ) \
+         SELECT branch.source_checkpoint_id AS branch_source_checkpoint_id, \
+                branch.head_checkpoint_id AS branch_head_checkpoint_id, \
+                selected.checkpoint_id AS selected_checkpoint_id, \
+                selected.membership_role AS membership_role, \
+                {SELECT_QUALIFIED_RECORD_COLUMNS} \
+         FROM selected_branch AS branch \
+         JOIN selected_checkpoints AS selected ON TRUE \
+         LEFT JOIN group_checkpoint_records AS records \
+           ON records.checkpoint_id = selected.checkpoint_id \
+         ORDER BY selected.membership_role ASC, records.sequence ASC, \
+                  selected.checkpoint_id ASC"
     );
-    let row = sqlx::query(&sql)
-        .bind(checkpoint_id.into_bytes().to_vec())
-        .fetch_optional(pool)
+    let rows = sqlx::query(&sql)
+        .bind(thread_id.as_str())
+        .bind(branch_id.into_bytes().to_vec())
+        .fetch_all(&mut **transaction)
         .await
-        .map_err(|source| database_error("branch record query", source))?;
-    row.map(|row| decode_row(&row)).transpose()
+        .map_err(|source| database_error("branch history snapshot query", source))?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let source_id = column::<Vec<u8>>(first, "branch_source_checkpoint_id")
+        .and_then(|bytes| decode_uuid("branch_source_checkpoint_id", bytes))
+        .map(CheckpointId::from_bytes)
+        .map_err(branch_corruption)?;
+    let head_id = column::<Vec<u8>>(first, "branch_head_checkpoint_id")
+        .and_then(|bytes| decode_uuid("branch_head_checkpoint_id", bytes))
+        .map(CheckpointId::from_bytes)
+        .map_err(branch_corruption)?;
+
+    let mut history: Vec<CheckpointRecord> = Vec::with_capacity(rows.len().saturating_sub(1));
+    let mut seen = HashSet::with_capacity(rows.len());
+    let mut validated_head = false;
+    for (position, row) in rows.into_iter().enumerate() {
+        let selected_id = column::<Vec<u8>>(&row, "selected_checkpoint_id")
+            .and_then(|bytes| decode_uuid("selected_checkpoint_id", bytes))
+            .map(CheckpointId::from_bytes)
+            .map_err(branch_corruption)?;
+        let role = column::<i64>(&row, "membership_role").map_err(branch_corruption)?;
+        let relation = match role {
+            0 => "source",
+            1 => "membership",
+            2 => "head",
+            _ => {
+                return Err(branch_corruption(SqliteRecordError::MissingBranchRecord {
+                    relation: "metadata",
+                    branch_id,
+                    checkpoint_id: selected_id,
+                }));
+            }
+        };
+        if position == 0 && (role != 0 || selected_id != source_id) {
+            return Err(branch_corruption(SqliteRecordError::MissingBranchRecord {
+                relation: "source",
+                branch_id,
+                checkpoint_id: source_id,
+            }));
+        }
+        if role != 2 && !seen.insert(selected_id) {
+            return Err(branch_corruption(
+                SqliteRecordError::DuplicateBranchRecord {
+                    branch_id,
+                    checkpoint_id: selected_id,
+                },
+            ));
+        }
+        if column::<Option<Vec<u8>>>(&row, "checkpoint_id")
+            .map_err(branch_corruption)?
+            .is_none()
+        {
+            return Err(branch_corruption(SqliteRecordError::MissingBranchRecord {
+                relation,
+                branch_id,
+                checkpoint_id: selected_id,
+            }));
+        }
+        let record = decode_row(&row)?;
+        ensure_branch_record_thread(relation, branch_id, thread_id, &record)
+            .map_err(branch_corruption)?;
+        if role == 2 {
+            if selected_id != head_id {
+                return Err(branch_corruption(SqliteRecordError::BranchHeadMismatch {
+                    branch_id,
+                    expected_head: selected_id,
+                    actual_head: head_id,
+                }));
+            }
+            validated_head = true;
+            continue;
+        }
+        if let Some(previous) = history.last() {
+            if record.parent_id() != Some(previous.id()) {
+                return Err(branch_corruption(SqliteRecordError::BranchParentMismatch {
+                    branch_id,
+                    checkpoint_id: record.id(),
+                    expected_parent: previous.id(),
+                    actual_parent: record.parent_id(),
+                }));
+            }
+        }
+        history.push(record);
+    }
+
+    if !validated_head {
+        return Err(branch_corruption(SqliteRecordError::MissingBranchRecord {
+            relation: "head",
+            branch_id,
+            checkpoint_id: head_id,
+        }));
+    }
+    if head_id != source_id && !history.iter().skip(1).any(|record| record.id() == head_id) {
+        return Err(branch_corruption(SqliteRecordError::BranchHeadNotMember {
+            branch_id,
+            checkpoint_id: head_id,
+        }));
+    }
+    let actual_head = history
+        .last()
+        .expect("selected branch always contributes its source")
+        .id();
+    if actual_head != head_id {
+        return Err(branch_corruption(SqliteRecordError::BranchHeadMismatch {
+            branch_id,
+            expected_head: actual_head,
+            actual_head: head_id,
+        }));
+    }
+    Ok(Some(history))
 }
 
 fn ensure_branch_record_thread(
@@ -813,6 +865,10 @@ fn ensure_branch_record_thread(
             actual_thread: record.thread_id().clone(),
         })
     }
+}
+
+fn branch_corruption(source: SqliteRecordError) -> SqliteCheckpointError {
+    SqliteCheckpointError::CorruptRecord { source }
 }
 
 async fn fetch_head(
@@ -1064,8 +1120,4 @@ fn branch_write_corruption(source: SqliteRecordError) -> CheckpointWriteError {
 
 fn store_read_error(source: SqliteCheckpointError) -> CheckpointerError {
     CheckpointerError::with_source("SQLite checkpoint storage failed", source)
-}
-
-fn branch_read_corruption(source: SqliteRecordError) -> CheckpointerError {
-    store_read_error(SqliteCheckpointError::CorruptRecord { source })
 }

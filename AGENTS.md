@@ -465,11 +465,18 @@ The current workspace provides an immutable compiled state-graph core with:
   read-only execution, and Fork remains the only branch-creation operation.
 - Fork starts from the exact historical State. State patches, branch merge,
   branch deletion, and implicit branch selection are out of scope.
-- SQLite migrations `0002_branch_heads.sql` and
-  `0003_branch_ownership.sql` persist branch metadata and enforce composite
-  ThreadId ownership for source, head, and membership. Branch Record insertion,
-  membership insertion, and branch-head update occur in one short
-  `BEGIN IMMEDIATE` transaction and roll back together.
+- SQLite migrations `0002_branch_heads.sql`,
+  `0003_branch_ownership.sql`, and `0004_branch_read_consistency.sql` persist
+  branch metadata, enforce composite ThreadId ownership, require non-source
+  heads to be members, and require inserted members to continue the current
+  head. Branch Record insertion, membership insertion, and branch-head update
+  occur in one short `BEGIN IMMEDIATE` transaction and roll back together.
+- SQLite `branch_head` and `branch_history` run in one read transaction and
+  share one JOIN-based query scoped by both ThreadId and BranchId. Before
+  returning data they validate source/head ownership, non-source head
+  membership, stable ordering, and the complete source-to-head parent lineage.
+  Corrupt, cross-thread, missing, duplicate, non-member, or discontinuous data
+  returns a structured storage corruption error.
 
 ## Suspension boundaries
 
@@ -519,6 +526,9 @@ The current workspace provides an immutable compiled state-graph core with:
 - Fork traverses only its exact source frontier and adds no work to ordinary
   invoke, default Resume, or Replay. Branch metadata is touched only when
   explicitly requested.
+- Branch Resume performance baselines must use the real
+  `InMemoryCheckpointStore` plus `RecordCheckpointer`; benchmark-only branch
+  implementations do not validate the Store read path.
 - Frontier deduplication must operate on produced successors and must not scan
   every compiled graph node.
 - Do not clone complete state values per step.

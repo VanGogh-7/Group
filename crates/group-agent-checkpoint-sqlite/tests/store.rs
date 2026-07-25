@@ -198,6 +198,19 @@ async fn ownership_migration_upgrades_an_existing_branch_database() {
 
     store.migrate().await.expect("ownership migration");
     store.migrate().await.expect("repeat completed migration");
+    let consistency_objects: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master \
+         WHERE name IN (\
+             'group_checkpoint_branch_records_branch_thread_checkpoint', \
+             'group_checkpoint_branch_insert_requires_source_head', \
+             'group_checkpoint_branch_head_requires_membership', \
+             'group_checkpoint_branch_membership_requires_parent'\
+         ) ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("consistency migration objects");
+    assert_eq!(consistency_objects.len(), 4);
     assert_eq!(
         store
             .branch_history(&ThreadId::from("upgrade"), branch_id)
@@ -616,6 +629,10 @@ async fn corrupted_branch_ownership_returns_a_structured_error() {
         .execute(&pool)
         .await
         .expect("disable foreign keys for corruption injection");
+    sqlx::query("DROP TRIGGER group_checkpoint_branch_head_requires_membership")
+        .execute(&pool)
+        .await
+        .expect("disable branch head guard for corruption injection");
     sqlx::query("UPDATE group_checkpoint_branches SET head_checkpoint_id = ? WHERE branch_id = ?")
         .bind(other.id().into_bytes().to_vec())
         .bind(branch_id.into_bytes().to_vec())
@@ -645,16 +662,211 @@ async fn corrupted_branch_ownership_returns_a_structured_error() {
 }
 
 #[tokio::test]
+async fn same_thread_non_member_forged_as_head_is_structured_corruption() {
+    let (_directory, database_url) = database();
+    let options: SqliteConnectOptions = database_url.parse().expect("valid database URL");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.create_if_missing(true).foreign_keys(true))
+        .await
+        .expect("pool");
+    let store = SqliteCheckpointStore::from_pool(pool.clone());
+    store.migrate().await.expect("migrate");
+    let source = record(CheckpointId::new(), "same-thread-head", None, 1, false);
+    let non_member = record(
+        CheckpointId::new(),
+        "same-thread-head",
+        Some(source.id()),
+        2,
+        false,
+    );
+    store.save(source.clone()).await.expect("source");
+    store
+        .save(non_member.clone())
+        .await
+        .expect("same-thread non-member");
+    let branch_id = BranchId::new();
+    store
+        .create_branch(&ThreadId::from("same-thread-head"), branch_id, source.id())
+        .await
+        .expect("branch");
+
+    sqlx::query("DROP TRIGGER group_checkpoint_branch_head_requires_membership")
+        .execute(&pool)
+        .await
+        .expect("disable branch head guard for corruption injection");
+    sqlx::query(
+        "UPDATE group_checkpoint_branches SET head_checkpoint_id = ? \
+         WHERE thread_id = ? AND branch_id = ?",
+    )
+    .bind(non_member.id().into_bytes().to_vec())
+    .bind("same-thread-head")
+    .bind(branch_id.into_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("forge non-member head");
+
+    for error in [
+        store
+            .branch_head(&ThreadId::from("same-thread-head"), branch_id)
+            .await
+            .expect_err("head query must reject a non-member"),
+        store
+            .branch_history(&ThreadId::from("same-thread-head"), branch_id)
+            .await
+            .expect_err("history query must reject a non-member head"),
+    ] {
+        let adapter = error
+            .source()
+            .and_then(|source| source.downcast_ref::<SqliteCheckpointError>())
+            .expect("adapter source");
+        assert!(matches!(
+            adapter,
+            SqliteCheckpointError::CorruptRecord {
+                source: SqliteRecordError::BranchHeadNotMember {
+                    branch_id: actual,
+                    checkpoint_id,
+                }
+            } if *actual == branch_id && *checkpoint_id == non_member.id()
+        ));
+    }
+}
+
+#[tokio::test]
+async fn broken_branch_parent_lineage_fails_head_and_history_queries() {
+    let (_directory, database_url) = database();
+    let options: SqliteConnectOptions = database_url.parse().expect("valid database URL");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.create_if_missing(true).foreign_keys(true))
+        .await
+        .expect("pool");
+    let store = SqliteCheckpointStore::from_pool(pool.clone());
+    store.migrate().await.expect("migrate");
+    let source = record(CheckpointId::new(), "broken-lineage", None, 1, false);
+    store.save(source.clone()).await.expect("source");
+    let branch_id = BranchId::new();
+    store
+        .create_branch(&ThreadId::from("broken-lineage"), branch_id, source.id())
+        .await
+        .expect("branch");
+    let child = record(
+        CheckpointId::new(),
+        "broken-lineage",
+        Some(source.id()),
+        2,
+        true,
+    );
+    store
+        .save_branch(branch_id, child.clone())
+        .await
+        .expect("branch child");
+    sqlx::query("UPDATE group_checkpoint_records SET parent_id = NULL WHERE checkpoint_id = ?")
+        .bind(child.id().into_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("corrupt parent lineage");
+
+    for error in [
+        store
+            .branch_head(&ThreadId::from("broken-lineage"), branch_id)
+            .await
+            .expect_err("head query must validate lineage"),
+        store
+            .branch_history(&ThreadId::from("broken-lineage"), branch_id)
+            .await
+            .expect_err("history query must validate lineage"),
+    ] {
+        let adapter = error
+            .source()
+            .and_then(|source| source.downcast_ref::<SqliteCheckpointError>())
+            .expect("adapter source");
+        assert!(matches!(
+            adapter,
+            SqliteCheckpointError::CorruptRecord {
+                source: SqliteRecordError::BranchParentMismatch {
+                    branch_id: actual,
+                    checkpoint_id,
+                    expected_parent,
+                    actual_parent: None,
+                }
+            } if *actual == branch_id
+                && *checkpoint_id == child.id()
+                && *expected_parent == source.id()
+        ));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branch_history_concurrent_with_save_returns_one_consistent_snapshot() {
+    let (_directory, database_url) = database();
+    let store = Arc::new(store(&database_url).await);
+    let source = record(CheckpointId::new(), "history-snapshot", None, 1, false);
+    store.save(source.clone()).await.expect("source");
+
+    for step in 2..=32 {
+        let branch_id = BranchId::new();
+        store
+            .create_branch(&ThreadId::from("history-snapshot"), branch_id, source.id())
+            .await
+            .expect("branch");
+        let child = record(
+            CheckpointId::new(),
+            "history-snapshot",
+            Some(source.id()),
+            step,
+            true,
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let writer = tokio::spawn({
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let child = child.clone();
+            async move {
+                barrier.wait().await;
+                store.save_branch(branch_id, child).await
+            }
+        });
+        let reader = tokio::spawn({
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                store
+                    .branch_history(&ThreadId::from("history-snapshot"), branch_id)
+                    .await
+            }
+        });
+        barrier.wait().await;
+        let history = reader
+            .await
+            .expect("reader task")
+            .expect("consistent branch history");
+        writer
+            .await
+            .expect("writer task")
+            .expect("concurrent branch save");
+        let ids = history.iter().map(|record| record.id()).collect::<Vec<_>>();
+        assert!(
+            ids == [source.id()] || ids == [source.id(), child.id()],
+            "read transaction must expose either the pre-save or post-save snapshot"
+        );
+    }
+}
+
+#[tokio::test]
 async fn branch_membership_and_head_failures_roll_back_record_membership_and_head() {
-    for (name, trigger) in [
+    for (name, trigger_name, trigger) in [
         (
             "membership",
+            "reject_branch_membership",
             "CREATE TRIGGER reject_branch_membership \
              BEFORE INSERT ON group_checkpoint_branch_records \
              BEGIN SELECT RAISE(ABORT, 'injected membership failure'); END",
         ),
         (
             "head",
+            "reject_branch_head_update",
             "CREATE TRIGGER reject_branch_head_update \
              BEFORE UPDATE OF head_checkpoint_id ON group_checkpoint_branches \
              BEGIN SELECT RAISE(ABORT, 'injected branch head failure'); END",
@@ -720,6 +932,65 @@ async fn branch_membership_and_head_failures_roll_back_record_membership_and_hea
             (record_count, membership_count, head),
             (0, 0, source.id().into_bytes().to_vec()),
             "{name} failure must roll back all three writes"
+        );
+        assert_eq!(
+            store
+                .latest(&ThreadId::from("rollback-branch"))
+                .await
+                .expect("default head")
+                .expect("source")
+                .id(),
+            source.id()
+        );
+        assert_eq!(
+            store
+                .history(&ThreadId::from("rollback-branch"))
+                .await
+                .expect("default history")
+                .iter()
+                .map(|record| record.id())
+                .collect::<Vec<_>>(),
+            [source.id()]
+        );
+
+        sqlx::query(&format!("DROP TRIGGER {trigger_name}"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{name} trigger cleanup failed: {error}"));
+        store
+            .save_branch(branch_id, child.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{name} branch reuse failed: {error}"));
+        let default_child = record(
+            CheckpointId::new(),
+            "rollback-branch",
+            Some(source.id()),
+            3,
+            true,
+        );
+        store
+            .save(default_child.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{name} default reuse failed: {error}"));
+        assert_eq!(
+            store
+                .history(&ThreadId::from("rollback-branch"))
+                .await
+                .expect("reused default history")
+                .iter()
+                .map(|record| record.id())
+                .collect::<Vec<_>>(),
+            [source.id(), default_child.id()]
+        );
+        assert_eq!(
+            store
+                .branch_history(&ThreadId::from("rollback-branch"), branch_id)
+                .await
+                .expect("reused branch history")
+                .iter()
+                .map(|record| record.id())
+                .collect::<Vec<_>>(),
+            [source.id(), child.id()]
         );
     }
 }

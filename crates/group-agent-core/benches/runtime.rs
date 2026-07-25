@@ -181,69 +181,6 @@ impl Checkpointer<usize> for ResumeBenchCheckpointer {
     }
 }
 
-struct BranchResumeBenchCheckpointer {
-    checkpoint: Arc<Checkpoint<usize>>,
-    branch_id: group_agent_core::BranchId,
-}
-
-#[async_trait]
-impl Checkpointer<usize> for BranchResumeBenchCheckpointer {
-    async fn save(
-        &self,
-        request: CheckpointRequest<usize>,
-    ) -> Result<Arc<Checkpoint<usize>>, CheckpointWriteError> {
-        Ok(Arc::new(request.into_checkpoint()))
-    }
-
-    async fn latest(
-        &self,
-        _thread_id: &ThreadId,
-    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
-        Ok(None)
-    }
-
-    async fn history(
-        &self,
-        _thread_id: &ThreadId,
-    ) -> Result<Vec<Arc<Checkpoint<usize>>>, CheckpointerError> {
-        Ok(Vec::new())
-    }
-
-    async fn save_branch(
-        &self,
-        branch_id: group_agent_core::BranchId,
-        request: CheckpointRequest<usize>,
-    ) -> Result<Arc<Checkpoint<usize>>, CheckpointWriteError> {
-        assert_eq!(branch_id, self.branch_id);
-        Ok(Arc::new(request.into_checkpoint()))
-    }
-
-    async fn branch_head(
-        &self,
-        thread_id: &ThreadId,
-        branch_id: group_agent_core::BranchId,
-    ) -> Result<Option<Arc<Checkpoint<usize>>>, CheckpointerError> {
-        Ok(
-            (branch_id == self.branch_id && self.checkpoint.thread_id() == thread_id)
-                .then(|| Arc::clone(&self.checkpoint)),
-        )
-    }
-
-    async fn branch_history(
-        &self,
-        thread_id: &ThreadId,
-        branch_id: group_agent_core::BranchId,
-    ) -> Result<Vec<Arc<Checkpoint<usize>>>, CheckpointerError> {
-        Ok(
-            if branch_id == self.branch_id && self.checkpoint.thread_id() == thread_id {
-                vec![Arc::clone(&self.checkpoint)]
-            } else {
-                Vec::new()
-            },
-        )
-    }
-}
-
 fn fixed_graph_builder(node_count: usize) -> StateGraph<BenchState> {
     let mut graph = StateGraph::new();
     graph.set_version("benchmark-v1");
@@ -449,12 +386,6 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
         .expect("middle checkpoint query should succeed")
         .expect("middle checkpoint should exist");
     let middle_checkpoint_id = middle_checkpoint.id();
-    let branch_resume_id = group_agent_core::BranchId::new();
-    let branch_resume_store: Arc<dyn Checkpointer<usize>> =
-        Arc::new(BranchResumeBenchCheckpointer {
-            checkpoint: Arc::clone(&middle_checkpoint),
-            branch_id: branch_resume_id,
-        });
     let middle_record = runtime
         .block_on(
             middle_store
@@ -864,16 +795,31 @@ fn runtime_benchmarks(criterion: &mut Criterion) {
     });
 
     criterion.bench_function("branch_resume_one_immediate_node", |bencher| {
-        bencher.to_async(&runtime).iter_batched(
+        bencher.iter_batched(
             || {
-                ResumeConfig::new("resume-middle-benchmark", Arc::clone(&branch_resume_store))
-                    .with_branch_id(branch_resume_id)
+                let store = Arc::new(
+                    InMemoryCheckpointStore::try_from_records([middle_record.as_ref().clone()])
+                        .expect("persisted branch setup record should import"),
+                );
+                let branch_id = group_agent_core::BranchId::new();
+                runtime
+                    .block_on(store.create_branch(
+                        &ThreadId::from("resume-middle-benchmark"),
+                        branch_id,
+                        middle_checkpoint_id,
+                    ))
+                    .expect("benchmark branch should be created");
+                let adapter: Arc<dyn Checkpointer<usize>> = Arc::new(RecordCheckpointer::new(
+                    store as Arc<dyn CheckpointStore>,
+                    Arc::new(BenchCodec),
+                ));
+                ResumeConfig::new("resume-middle-benchmark", adapter)
+                    .with_branch_id(branch_id)
                     .with_run_config(RunConfig::new(1))
             },
-            |config| async {
-                let report = fixed_2
-                    .resume(config)
-                    .await
+            |config| {
+                let report = runtime
+                    .block_on(fixed_2.resume(config))
                     .expect("branch resume benchmark should succeed");
                 black_box(report.steps());
             },

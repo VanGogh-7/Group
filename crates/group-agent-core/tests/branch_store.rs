@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use group_agent_core::{
     BranchId, CheckpointFormatVersion, CheckpointId, CheckpointRecord, CheckpointRecordParts,
     CheckpointStore, CheckpointWriteError, CodecDescriptor, EncodedValue, GraphVersion,
     InMemoryCheckpointStore, RunId, ThreadId,
 };
+use tokio::sync::{Barrier, Notify};
 
 fn record(
     checkpoint_id: CheckpointId,
@@ -107,19 +109,40 @@ async fn two_branches_from_one_source_advance_independently() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_and_repeated_branch_creation_never_becomes_idempotent_success() {
     let store = Arc::new(InMemoryCheckpointStore::new());
     let source = record(CheckpointId::new(), "thread", None, 1);
     store.save(source.clone()).await.expect("source");
     let branch_id = BranchId::new();
 
-    let left_store = Arc::clone(&store);
-    let right_store = Arc::clone(&store);
+    let barrier = Arc::new(Barrier::new(3));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let ready_notify = Arc::new(Notify::new());
     let thread = ThreadId::from("thread");
-    let (left, right) = tokio::join!(
-        left_store.create_branch(&thread, branch_id, source.id()),
-        right_store.create_branch(&thread, branch_id, source.id()),
+    let source_id = source.id();
+    let create = |store: Arc<InMemoryCheckpointStore>| {
+        let barrier = Arc::clone(&barrier);
+        let ready = Arc::clone(&ready);
+        let ready_notify = Arc::clone(&ready_notify);
+        let thread = thread.clone();
+        tokio::spawn(async move {
+            if ready.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                ready_notify.notify_one();
+            }
+            barrier.wait().await;
+            store.create_branch(&thread, branch_id, source_id).await
+        })
+    };
+    let left = create(Arc::clone(&store));
+    let right = create(Arc::clone(&store));
+    while ready.load(Ordering::SeqCst) != 2 {
+        ready_notify.notified().await;
+    }
+    barrier.wait().await;
+    let (left, right) = (
+        left.await.expect("left create task"),
+        right.await.expect("right create task"),
     );
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
     assert!(matches!(
