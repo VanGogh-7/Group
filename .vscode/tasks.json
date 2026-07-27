@@ -1,0 +1,171 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Cargo: Fetch Dependencies",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "fetch",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Cargo: Build Workspace",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--workspace"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Cargo: Check Workspace",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--all-features"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc",
+      "group": "build"
+    },
+    {
+      "label": "Cargo: Test Workspace",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "test",
+        "--workspace"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Cargo: Clippy Workspace",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "Cargo: Format Check",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Cargo: Run Core Example",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "run",
+        "-p",
+        "group-agent-core",
+        "--example",
+        "${input:coreExample}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "Cargo: Check MSRV 1.85 (Non-Genai)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "+1.85.0",
+        "check",
+        "--workspace",
+        "--exclude",
+        "group-agent-genai",
+        "--all-targets",
+        "--all-features"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "Cargo: Check Genai Rust 1.88",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "+1.88.0",
+        "check",
+        "-p",
+        "group-agent-genai",
+        "--all-targets",
+        "--all-features"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "coreExample",
+      "type": "pickString",
+      "description": "Core example to run",
+      "options": [
+        "checkpoint",
+        "conditional",
+        "conditional_fan_out",
+        "fork",
+        "interrupt",
+        "linear",
+        "parallel",
+        "replay",
+        "resume",
+        "subgraph"
+      ],
+      "default": "linear"
+    }
+  ]
+}

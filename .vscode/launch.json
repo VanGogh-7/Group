@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Core Example: linear",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "group-agent-core",
+          "--example",
+          "linear"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "linear",
+          "kind": "example"
+        }
+      },
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ]
+}
