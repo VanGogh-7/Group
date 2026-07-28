@@ -1,7 +1,9 @@
-# Stage 17: genai Chat Model Adapter
+# Genai Adapter
 
-Stage 17 adds `group-agent-genai`, an application-layer bridge between
-`group-agent-model` and exactly `genai` 0.6.5. It does not change
+`group-agent-genai` is an application-layer bridge between
+`group-agent-model` and exactly `genai` 0.6.5. The design was originally
+introduced in Stage 17, but this document describes the current adapter
+contract rather than the stage history. The adapter does not change
 `group-agent-core`, the checkpoint contract, or the provider-neutral Model
 crate.
 
@@ -268,13 +270,13 @@ continuation is admitted only after genai has fully captured it, restricted to
 mapping, and discarded immediately. Its parser admission limit is not a
 network or peak-memory limit.
 
-Stage 17 has no retry, fallback, rate limiter, circuit breaker, credential
+The adapter has no retry, fallback, rate limiter, circuit breaker, credential
 storage, `.env` loader, tool execution, MCP, embedding, RAG, memory, ReAct, or
 prebuilt Agent. Upgrading to genai 0.7 is a separate migration.
 
 ## Compiler support policy
 
-Stage 17 uses a layered minimum supported Rust version:
+Group uses a layered minimum supported Rust version:
 
 | Crate / layer | MSRV |
 | --- | --- |

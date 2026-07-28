@@ -572,7 +572,7 @@ directly owns the genai stream. Normal EOF without genai `End` on an allowed
 path is an explicit Protocol error, and dropping the Future or stream releases
 that ownership without a detached task. `ResponseId` Debug and Display are
 redacted; `as_str()` is the deliberate raw-value accessor. See
-[`docs/stage-17-genai.md`](docs/stage-17-genai.md) for the mapping table,
+[`docs/adapters/genai.md`](docs/adapters/genai.md) for the mapping table,
 continuation example, extension contract, current limits, and the discovered
 split compiler-support policy required by genai 0.6.5.
 
@@ -1711,7 +1711,8 @@ reason to redesign the runtime.
 ├── Cargo.toml
 ├── README.md
 ├── docs
-│   └── stage-17-genai.md
+│   └── adapters
+│       └── genai.md
 ├── rust-toolchain.toml
 ├── rustfmt.toml
 └── crates
