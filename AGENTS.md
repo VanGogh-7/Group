@@ -55,6 +55,18 @@ The current workspace provides an immutable compiled state-graph core with:
   Client/auth/endpoint configuration, request/response/tool mapping, online
   stream normalization, explicit continuation Extensions, partial Usage,
   source-preserving error classification, and offline loopback HTTP coverage.
+- an independent Rust 1.85 `group-agent-tool` crate with object-safe local
+  tools, deterministic immutable registration, precompiled JSON Schema
+  validation with concrete source retention, explicit side-effect behavior,
+  caller-runtime timeouts, fallible panic-safe payload-free observers,
+  stop-scheduling-and-drain fail-fast, call-ID-safe Tool messages, and
+  spawn-free deterministic batches.
+- an independent client-only `group-agent-mcp` crate fixed to rmcp 2.2.0 with
+  reusable stdio sessions, cycle- and limit-safe adapter-owned Tool discovery,
+  immutable Registry snapshots, reversible namespace mapping, conservative
+  remote behavior, fail-closed content mapping, explicit close/kill/wait,
+  runtime-independent best-effort direct-child Drop fallback, and offline
+  lifecycle tests.
 
 ## Mandatory state and execution boundaries
 
@@ -588,16 +600,187 @@ The current workspace provides an immutable compiled state-graph core with:
   provider. `group-agent-genai` is the separate Stage 17 provider boundary and
   must not add model concepts to Core or genai types to Model.
 
+## Tool Runtime boundaries
+
+- `group-agent-tool` depends normally on `group-agent-model`. Core and Model
+  never depend on Tool. Tool may use Core only as a dev-dependency for ordinary
+  Node examples and integration tests.
+- Tool's normal dependency graph must contain no `group-agent-core`, `genai`,
+  HTTP client, SQLx, MCP, or provider SDK. The crate inherits Rust 1.85.
+- `Tool` is object-safe, `Send + Sync`, and storable as `Arc<dyn Tool>`.
+  Implementations expose one immutable cached `ToolDefinition` and stable
+  `ToolBehavior`. They receive validated borrowed JSON arguments, call
+  identity, an optional opaque idempotency key, and provider-neutral execution
+  metadata.
+- Tool implementations receive no `NodeContext`, `RunControl`, Group
+  cancellation token, runtime, channel, or detached task. Cancellation is
+  Future drop. Dropping a single or batch Runtime Future must drop all
+  still-pending Tool Futures. External side effects are not rolled back.
+- `ToolOutput` contains an existing `ToolResult` and optional Extensions.
+  Business rejection is an explicit `ToolResult { is_error: true }`.
+  Infrastructure failure remains a source-preserving `ToolError` and
+  `ToolRuntimeError`; Runtime must never silently convert it to success.
+- `ToolBehavior` classifies `ReadOnly`, `IdempotentWrite`, and
+  `NonIdempotentWrite`, records explicit parallel eligibility, and may require
+  an idempotency key. Read-only tools cannot require a write-idempotency key.
+  Non-idempotent writes cannot require a key that would make their declared
+  behavior idempotent; they are sequential by default and overlap only after
+  an explicit Tool declaration.
+- Behavior metadata is advisory policy input, not an exactly-once claim.
+  Stage 18 adds no automatic retry, durable idempotency store, distributed
+  lock, permission system, or rollback mechanism.
+- Registry construction rejects invalid or mismatched definitions, empty
+  descriptions, non-canonical names, duplicate names, inconsistent behavior,
+  and invalid JSON Schema. Each schema is compiled once at registration and
+  cached with its Tool; execution must not rebuild definitions or validators.
+- The immutable registry keeps definitions in lexical ToolName order and uses
+  an index for lookup rather than a full scan. It is cheaply cloned through
+  shared immutable ownership; there is no global registry or execution-time
+  lock.
+- JSON Schema validation uses the mature `jsonschema` crate with default
+  resolver features disabled. Validation errors expose JSON instance/schema
+  pointers and the rejecting keyword in default formatting, never complete
+  arguments, schema values, or source messages. Registration and execution
+  errors retain the concrete `jsonschema::ValidationError` source. Explicit
+  source-chain traversal can expose upstream details, so applications must
+  filter such diagnostics before logging them.
+- Single execution order is call-identity validation, indexed lookup, cached
+  schema validation, behavior/idempotency policy, Tool execution, and explicit
+  ToolOutput-to-ToolResult conversion. Missing or invalid calls never enter a
+  Tool.
+- Per-call timeout uses Tokio time from the caller's runtime and drops the Tool
+  Future when elapsed. Runtime creates no Tokio runtime. Timeout errors retain
+  call identity, Tool name, duration, and the concrete timeout source.
+- Batch validates duplicate ToolCallId values before any execution,
+  prevalidates every call, uses bounded `FuturesUnordered` scheduling without
+  per-call `tokio::spawn`, and stores results directly by input index in O(n).
+  The default collect-all policy isolates per-call failures. Fail-fast is
+  explicit: after the first observed primary failure it stops scheduling new
+  calls, drains every already-started call to its real observable outcome, and
+  marks only never-started calls `NotStartedDueToFailFast`.
+- Batch results always match input order, regardless of completion order.
+  Invalid-schema and missing-tool items do not enter Tools. A dropped batch
+  Future cancels every still-pending Tool Future without fabricating a report;
+  this caller-owned drop boundary is distinct from fail-fast.
+- `ToolEventSink` is synchronous, fallible, optional, panic-caught, and called
+  inline outside Registry locks.
+  Events contain only safe call identity, batch index, result/error class, and
+  timeout duration. They never contain arguments, Tool output, metadata values,
+  or source text. `ExecutionStarted` observer failure or panic prevents Tool
+  execution and returns `ObserverFailed`. Completed, failed, and timed-out
+  observer failures are retained only as secondary diagnostics and never
+  replace the already determined primary Tool outcome.
+- Public Tool Runtime errors are typed and source-preserving. Default Debug and
+  Display redact arguments, output, Tool messages, metadata values, schema
+  values, and source secrets. Applications that explicitly traverse a source
+  chain remain responsible for filtering upstream data.
+- `ToolResult` remains payload-only Model data. `execute_message` and ordered
+  batch message conversion pair it with the original `ToolCallId` through
+  `Message::tool`; callers should not manually pair unrelated IDs and results.
+- Tool execution provides no retry, exactly-once guarantee, side-effect
+  rollback, or recovery of execution facts after the caller drops the complete
+  Runtime Future.
+- Group integration is application-level: an ordinary Node may hold
+  `ToolRuntime`, execute a call read from State, return a State Update, and wrap
+  Runtime failure with `NodeError::with_source`. Group continues to own node
+  cancellation and deadlines; Tool Runtime does not modify Core.
+
+## MCP Tool Adapter boundaries
+
+- `group-agent-mcp` depends normally on Model, Tool, and official crates.io
+  `rmcp = "=2.2.0"`. Core is a dev-dependency only. Core, Model, and Tool never
+  depend on MCP.
+- rmcp default features are disabled. Enable only `client` and
+  `transport-async-rw`; stdio uses adapter-owned direct-child construction so
+  its guard remains valid during Tokio runtime teardown. Do not enable rmcp
+  child-process helpers, server macros, HTTP transports, OAuth, or unrelated
+  MCP capabilities.
+- The MCP crate declares Rust 1.88 independently because rmcp 2.2.0's published
+  source uses let-chain syntax not accepted by Rust 1.87. Do not raise the Rust
+  1.85 MSRV of Core, Model, Tool, SQLite, or observability, and do not patch,
+  vendor, or downgrade upstream to evade that requirement.
+- `McpClientSession` performs one initialization and reuses one rmcp service.
+  It is cheaply shared, owns rmcp's service task, supports explicit shutdown,
+  and must not add per-call detached tasks, forwarding channels, a Runtime, or
+  a global session. Stdio commands use an executable plus argument vector,
+  never a shell command string.
+- Explicit stdio shutdown atomically rejects new calls, closes and joins rmcp,
+  waits for the direct child, kills it after the configured bounded grace
+  period when needed, and waits again to reap it before publishing success or
+  failure. Service close and child cleanup use independent tasks that the
+  supervisor always awaits, so service or child worker panic cannot skip child
+  cleanup. If both paths fail, the service failure is primary. One
+  Session-owned cleanup supervisor and completion serve every concurrent or
+  repeated shutdown caller; cancellation of a caller Future must not cancel
+  cleanup. Store the final result, publish `CLOSED`, and only then wake
+  completion waiters. Outer rmcp JoinError, `QuitReason::JoinError`, and worker
+  panic are source-preserving `ShutdownFailed`. rmcp 2.2.0 logs but does not
+  return `transport.close()` errors, so Group cannot expose them. Zero grace
+  performs one non-blocking exit check then immediately kills and waits for a
+  still-live direct child.
+- Drop is not explicit shutdown: it must not block, await the shared completion,
+  report an async result, or depend on Tokio cleanup. It synchronously requests
+  direct-child termination and tries to give wait/reap to a standard thread.
+  When standard-thread creation fails because of OS or resource exhaustion,
+  kill has still been attempted but wait/reap is not guaranteed and a zombie
+  may remain until parent exit or another OS mechanism reaps it. Never add an
+  unbounded Drop wait or a global reaper; explicit shutdown is the reliable,
+  recommended lifecycle path. If the explicit cleanup task already owns the
+  child, Drop must not double-kill or double-wait it. No process-tree cleanup is
+  claimed.
+- Discovery requires the server tools capability and owns the `tools/list`
+  pagination state machine. Track all returned cursors, reject same-cursor and
+  multi-cursor cycles, enforce non-zero page/tool limits with checked
+  arithmetic, and stage every page privately. Mapping, Schema compilation,
+  Registry construction, and immutable `McpToolSet` publication occur only
+  after all pages succeed. Refresh creates a new snapshot; Stage 19.1 does not
+  listen to `tools/list_changed` or mutate a live Registry.
+- Preserve legal names for a single server. Multi-server use requires a stable
+  namespace or prefix whose frozen mapping retains the exact local, server, and
+  remote names. Invalid names and collisions fail before publication. Calls
+  always send the original remote name and never modify arguments with routing
+  data.
+- Registry registration owns JSON Schema compilation and validation. Invalid
+  arguments must fail locally without issuing an MCP request. The adapter must
+  not recompile schemas or repeat Tool Runtime domain validation.
+- Remote Tools default to `NonIdempotentWrite` and sequential execution.
+  Annotations are untrusted hints. Only an explicit exact server/tool behavior
+  override may expand concurrency, and every override is validated and frozen
+  during discovery. Repeated entries for the same remote Tool are invalid even
+  when the values match; never use last-write-wins. The adapter never retries
+  and claims neither exactly-once execution nor rollback.
+- Text blocks retain their order; structured content is serialized once and
+  appended as one JSON text part. MCP `isError` remains a business
+  `ToolResult`. Image, audio, binary, embedded-resource, resource-link, and
+  unknown content fail closed as `UnsupportedContent`; never discard, download,
+  or synthesize placeholder content.
+- Transport, protocol, discovery, process, Schema, and serialization failures
+  retain concrete sources. Default Debug/Display must redact command
+  environment, arguments, output, raw protocol payloads, and source messages.
+  rmcp MCP/JSON-RPC error responses classify as `Protocol`; I/O, send, and
+  connection-closure failures classify as `Transport`; explicitly closed
+  sessions classify as `SessionClosed`. `McpToolSet` Debug exposes only server
+  IDs, counts, Registry presence, and naming-policy categories, never mappings
+  or Tool names. Applications that explicitly traverse sources own upstream
+  log filtering.
+- Tool Runtime continues to own identity, Schema, timeout, batch, side-effect,
+  fail-fast-drain, and ToolMessage pairing semantics. Dropping a call Future
+  releases local ownership but provides no remote side-effect rollback or
+  immediate termination guarantee.
+- Stage 19 production transport support is child-process stdio. HTTP, OAuth,
+  credential storage, server hosting, Resources, Prompts, Sampling, Roots,
+  automatic refresh, sandboxing, retry, and Agent loops remain out of scope.
+
 ## Genai adapter boundaries
 
 - `group-agent-genai` is fixed to `genai = "=0.6.5"` for Stage 17. Do not use
   0.7 beta, Git dependencies, unpublished commits, or a locally patched genai.
-- The workspace package MSRV default remains Rust 1.85. Core, Model, SQLite,
-  and observability inherit that default. `group-agent-genai` alone declares
-  Rust 1.88 because the published genai 0.6.5 source uses let-chain syntax that
-  became stable in Rust 1.88. This is an effective source-derived requirement;
-  do not claim that genai 0.6.5 declares `rust-version = "1.88"` in its
-  manifest.
+- The workspace package MSRV default remains Rust 1.85. Core, Model, Tool,
+  SQLite, and observability inherit that default. `group-agent-genai` alone
+  declares Rust 1.88 because the published genai 0.6.5 source uses let-chain
+  syntax that became stable in Rust 1.88. This is an effective source-derived
+  requirement; do not claim that genai 0.6.5 declares
+  `rust-version = "1.88"` in its manifest.
 - Applications inject one preconfigured `genai::Client`. The adapter never
   reads `.env`, resolves organization credential policy, prints secrets, or
   rebuilds a Client per request.
@@ -730,6 +913,16 @@ The current workspace provides an immutable compiled state-graph core with:
 - The Tokio broadcast Sink may clone only the lightweight `GraphEvent` needed
   for channel ownership. It must not block, await, spawn per node, or allocate
   an unbounded queue.
+- Tool registry lookup uses its immutable name index and never scans every
+  definition. JSON Schema validators compile only during registration.
+- Tool Runtime must not enter Core's hot path, clone complete ToolCall
+  arguments without ownership need, spawn per batch call, or perform
+  superlinear result reordering. Benchmark registries, schemas, calls, and
+  batch setup remain outside measured iterations.
+- MCP execution reuses its initialized session, immutable discovery snapshot,
+  existing Registry index, and precompiled schemas. Benchmarks cover only
+  offline mapping and injected-session dispatch; never benchmark child-process
+  startup, network transport, or sleeps.
 - Performance conclusions require repeatable benchmarks. Do not make comparative
   performance claims from architecture alone.
 
@@ -742,7 +935,10 @@ or built-in Serde codecs, arbitrary Node Command or Send APIs, conditional
 fan-out into subgraph mounts, custom asynchronous event backpressure, disk
 event queues, OpenTelemetry or metrics exporters, WebSocket or SSE servers,
 network event proxies, provider fallback, credential storage, provider retries
-or rate limiters, tool execution or registries, MCP, RAG,
+or rate limiters, automatic Tool retry, exactly-once Tool execution, durable
+Tool idempotency storage, Tool sandboxing, distributed Tool locks, MCP HTTP,
+MCP OAuth, MCP server hosting, MCP Resources, Prompts, Sampling, Roots,
+automatic MCP discovery refresh, RAG,
 embeddings, agent memory, ReAct, prebuilt agents, standalone reducer
 registration, Tower middleware, Axum, distributed workers, macro DSLs, or a
 visual interface unless a later stage explicitly authorizes them.
@@ -778,22 +974,42 @@ cargo run -p group-agent-core --example interrupt
 cargo run -p group-agent-model --example model_node
 cargo run -p group-agent-genai --example genai_model
 cargo check -p group-agent-genai --example genai_node
+cargo run -p group-agent-tool --example tool_runtime
+cargo run -p group-agent-tool --example tool_node
+cargo test -p group-agent-tool --doc
+cargo run -p group-agent-mcp --example mcp_stdio
+cargo run -p group-agent-mcp --example mcp_tool_node
+cargo test -p group-agent-mcp --doc
 cargo bench --workspace --no-run
 cargo check --workspace --all-targets --all-features
 ```
 
 Validate the layered MSRV. Rust 1.85 covers every workspace crate except the
-optional genai provider adapter:
+MCP and genai adapters:
 
 ```bash
 cargo +1.85.0 check \
   --workspace \
   --exclude group-agent-genai \
+  --exclude group-agent-mcp \
   --all-targets \
   --all-features
 cargo +1.85.0 test \
   --workspace \
-  --exclude group-agent-genai
+  --exclude group-agent-genai \
+  --exclude group-agent-mcp
+```
+
+Rust 1.88 covers the MCP adapter's targets, features, examples, benchmarks,
+tests, and documentation:
+
+```bash
+cargo +1.88.0 check \
+  -p group-agent-mcp \
+  --all-targets \
+  --all-features
+cargo +1.88.0 test -p group-agent-mcp
+cargo +1.88.0 test -p group-agent-mcp --doc
 ```
 
 Rust 1.88 covers all genai adapter targets, features, examples, benchmarks,
@@ -814,6 +1030,8 @@ Finally inspect dependencies and check the working-tree diff:
 cargo tree --workspace
 cargo tree -p group-agent-core -e normal
 cargo tree -p group-agent-model -e normal
+cargo tree -p group-agent-tool -e normal
+cargo tree -p group-agent-mcp -e normal
 cargo tree -p group-agent-genai -e normal
 cargo metadata --no-deps --format-version 1
 git diff --check
@@ -858,3 +1076,27 @@ Client ownership, offline HTTP coverage, and no Core changes. The Stage 17 MSRV
 resolution retains Rust 1.85 for Runtime, Model, SQLite, and observability while
 declaring Rust 1.88 only for the optional genai adapter; the stable full
 workspace gate remains mandatory.
+Stage 18 adds the separate Rust 1.85 local Tool Runtime with Model-only normal
+dependency, registration-time schema compilation, Future-drop cancellation,
+deterministic batches, offline Group Node integration, and no Core changes.
+Stage 18.1 retains concrete Schema sources, changes fail-fast to
+stop-scheduling plus drain-started outcomes, makes observer failures
+non-overwriting and panic-safe, and adds ToolCallId-safe message helpers without
+changing Core or Model semantics.
+Stage 19 adds the separate client-only MCP Tool adapter with exact rmcp 2.2.0,
+reusable stdio sessions, paginated immutable discovery, conservative behavior,
+fail-closed result mapping, explicit shutdown, offline process lifecycle
+coverage, and no Core, Model, or Tool reverse dependency.
+Stage 19.1 makes pagination adapter-owned and bounded with cursor-cycle
+detection and no partial snapshot, makes MCP error classification exact,
+rejects duplicate behavior overrides, redacts Tool-set Debug, and hardens stdio
+with explicit close/kill/wait plus a runtime-independent direct-child Drop
+fallback.
+Stage 19.2 makes shutdown cleanup and completion Session-owned, maps rmcp outer
+and `QuitReason` JoinErrors to source-preserving `ShutdownFailed`, keeps cleanup
+running after waiter cancellation, defines zero-grace immediate kill/wait, and
+limits observable guarantees to errors rmcp 2.2.0 actually returns.
+Stage 19.3 separates service and child cleanup outcomes so worker panic cannot
+skip direct-child reap, publishes `CLOSED` before waking completion waiters,
+and documents standard-thread reaper creation failure as a best-effort Drop
+boundary.

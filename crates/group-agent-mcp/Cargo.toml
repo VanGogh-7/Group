@@ -1,0 +1,30 @@
+[package]
+name = "group-agent-mcp"
+description = "MCP client adapter for the Group Tool Runtime"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+group-agent-model = { path = "../group-agent-model" }
+group-agent-tool = { path = "../group-agent-tool" }
+rmcp.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "process"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+group-agent-core = { path = "../group-agent-core" }
+jsonschema.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "mapping"
+harness = false
+
+[lints]
+workspace = true

@@ -7,7 +7,26 @@ It does not claim to implement a mathematical group.
 
 ## Current stage
 
-Stage 17 adds the independent `group-agent-genai` crate, fixed to `genai`
+Stage 19.3 finalizes the independent `group-agent-mcp` client adapter, fixed to
+`rmcp = 2.2.0` with default features disabled. One reusable MCP session
+discovers every `tools/list` page with cursor-cycle and traversal limits, maps
+only a complete result into an immutable `group-agent-tool` Registry snapshot,
+and dispatches validated calls over child-process stdio or an injected async
+read/write transport. Explicit stdio shutdown closes, bounds, kills when
+needed, and reaps the direct child before publishing either success or failure
+through one Session-owned completion that survives waiter cancellation. Drop
+keeps only a best-effort runtime-independent termination fallback. Tool Runtime
+continues to own schema validation, timeout, batch scheduling, side-effect
+policy, fail-fast draining, and Tool-message pairing. MCP adds no
+Core/Model/Tool reverse dependency, retry, exactly-once claim, HTTP, OAuth,
+credential storage, sandbox, Resources, Prompts, Sampling, Roots, or Agent
+loop.
+
+Stage 18.1 hardens the independent `group-agent-tool` crate with concrete Schema
+sources, stop-scheduling-and-drain fail-fast, panic-safe before/after observer
+semantics, and call-ID-safe Tool messages.
+
+Stage 17 added the independent `group-agent-genai` crate, fixed to `genai`
 0.6.5. It maps the Stage 16.2 validated model boundary to an
 application-injected `genai::Client`, including messages, tools, generation
 controls, non-streaming responses, online stream normalization, partial usage,
@@ -50,6 +69,13 @@ The current workspace includes:
   boundary;
 - strongly typed messages, tool definitions/calls/results, generation controls,
   model capabilities, metadata, token usage, and finish reasons;
+- an independent local Tool Runtime with object-safe tools, cached JSON Schema
+  validation, explicit side-effect behavior, and redacted typed errors;
+- deterministic bounded Tool batches with collect-all or fail-fast policy,
+  stable input-order results, and conservative non-idempotent-write scheduling;
+- an independent MCP 2.2.0 client adapter with paginated Tool discovery,
+  immutable Registry snapshots, conservative remote behavior, stdio lifecycle,
+  content-policy enforcement, and source-preserving redacted errors;
 - a provider-neutral stream-event protocol and reusable validating response
   collector;
 - a separate `genai` 0.6.5 chat adapter with injected authentication and
@@ -99,6 +125,12 @@ dependency on the model crate. Applications opt into both:
 application
 ├── group-agent-core
 ├── group-agent-model
+├── group-agent-tool
+│   └── group-agent-model
+├── group-agent-mcp
+│   ├── group-agent-model
+│   ├── group-agent-tool
+│   └── rmcp = 2.2.0
 └── group-agent-genai
     ├── group-agent-model
     └── genai = 0.6.5
@@ -112,9 +144,9 @@ useful for tool-only assistant turns. Text helpers concatenate only text parts
 in order. `AssistantMessage` can contain text and zero or more `ToolCall`
 values together. `ToolCallId` provides the stable link to
 `ToolMessage` and `ToolResult`. `ToolDefinition` contains only a name,
-description, and provider-neutral JSON Schema. These tool types are data
-representations: there is no Tool trait, registry, execution, timeout, retry, or
-MCP integration.
+description, and provider-neutral JSON Schema. These types remain data only
+inside `group-agent-model`; execution is an opt-in responsibility of the
+separate `group-agent-tool` crate.
 
 `ChatRequest::validate` checks non-empty messages, finite provider-neutral
 generation controls, stop sequences, duplicate tool definitions, named tool
@@ -248,6 +280,195 @@ Stage 17 adds the separate
 crate or Core. It provides no API-key loading, retry, fallback, tool runtime,
 MCP, embeddings, RAG, memory, ReAct, or prebuilt agent.
 
+## Local Tool Runtime
+
+[`group-agent-tool`](crates/group-agent-tool) depends on
+`group-agent-model`, while Model and Core do not depend on it. Core is used only
+as a dev-dependency for the offline Node integration example and tests. The
+crate's normal dependency graph contains no `group-agent-core`, `genai`, HTTP
+client, SQLx, MCP, or provider SDK.
+
+`Tool` is an object-safe asynchronous `Send + Sync` port stored as
+`Arc<dyn Tool>`. Its borrowed `ToolInput` contains the validated call ID, tool
+name, structured JSON arguments, optional opaque idempotency key, and
+provider-neutral execution metadata. It deliberately contains no
+`NodeContext`, Group cancellation token, runtime, channel, or background task.
+`ToolOutput` wraps an existing `ToolResult` and optional Extensions. A
+model-visible business rejection is an explicit `ToolResult` with
+`is_error = true`; infrastructure failure remains a source-preserving
+`ToolError`/`ToolRuntimeError` and is never silently converted to success.
+
+`ToolRegistryBuilder` validates the advertised name, cached definition,
+description, behavior consistency, duplicate names, and JSON Schema. It
+compiles one `jsonschema::Validator` per successful registration, then freezes
+entries into an immutable, cheaply cloned registry with indexed lookup and
+lexically stable definitions. Schema compilation is never repeated during
+execution. The validator is built with default features disabled, so Tool
+Runtime does not acquire HTTP or filesystem schema resolvers.
+Registration and argument-validation errors keep a concrete owned
+`jsonschema::ValidationError` in their source chains. Their default Debug and
+Display expose only Tool identity, instance path, schema path, and keyword—not
+arguments, schema values, or the upstream source message. Explicit
+`Error::source()` traversal can reach upstream details; applications are
+responsible for filtering a complete source chain before logging it.
+
+`ToolRuntime` follows one fixed path:
+
+```text
+ToolCall -> call identity -> registry lookup -> cached schema validation
+         -> side-effect/idempotency policy -> Tool::execute -> ToolOutput
+         -> ToolResult -> Message::tool(original ToolCallId, result)
+```
+
+Per-call timeouts use Tokio time from the caller's runtime. Timeout drops the
+in-flight Tool Future and returns a structured `TimedOut` error retaining safe
+call identity and its timeout source. Dropping a single or batch Runtime Future
+drops all still-pending Tool Futures; no detached task remains. This is
+cooperative Future-drop cancellation and cannot roll back external side
+effects.
+
+`ToolBehavior` classifies tools as `ReadOnly`, `IdempotentWrite`, or
+`NonIdempotentWrite`, independently records whether overlap is allowed, and may
+require an explicit idempotency key. There is no automatic retry, durable key
+store, distributed lock, or exactly-once guarantee. Non-idempotent writes are
+sequential by default and overlap only when the Tool explicitly opts in.
+
+Batches reject duplicate `ToolCallId` values before execution, prevalidate
+every item, use bounded `FuturesUnordered` scheduling without per-call spawn,
+and reorder results in O(n) to the original input order. Collect-all is the
+default. Fail-fast means stop scheduling after the first observed primary
+failure and drain every already-started call to its real success or failure;
+only calls never started are `NotStartedDueToFailFast`. It does not invent
+`Cancelled` outcomes. Dropping the complete batch Future is different: it
+drops pending Tool Futures and produces no execution report. Invalid-schema and
+missing-tool items never enter a Tool.
+
+Optional synchronous `ToolEventSink` callbacks are fallible, called outside
+Registry locks, and have panic capture that never formats or retains panic
+payloads. `ExecutionStarted` runs before Tool execution; its error or panic
+prevents the Tool from running and returns `ObserverFailed`. Completed, failed,
+and timed-out events run only after the primary outcome is known. Their error
+or panic cannot overwrite a `ToolResult`, `ToolError`, or `TimedOut`; use
+`execute_report` or the batch report's ordered observer diagnostics to inspect
+that secondary failure. Events contain only call identity, batch index, outcome
+class, and timeout duration—not arguments, output, metadata values, or source
+text.
+
+`ToolResult` remains payload-only Model data. Use `execute_message`,
+`execute_message_report`, or `ToolBatchReport::into_tool_messages` to construct
+`Message::Tool` with the original `ToolCallId` while preserving content and
+`is_error`. The Runtime supplies no retry, exactly-once guarantee, or rollback
+for external side effects.
+
+See the offline
+[`tool_runtime`](crates/group-agent-tool/examples/tool_runtime.rs) and
+[`tool_node`](crates/group-agent-tool/examples/tool_node.rs) examples. The Node
+example preserves Runtime failures through `NodeError::with_source`; Group
+continues to own node cancellation and deadlines without any Core change.
+
+## MCP Tool Adapter
+
+[`group-agent-mcp`](crates/group-agent-mcp) is a client-only Tool backend.
+It depends on Model, Tool, and the official crates.io
+`rmcp = "=2.2.0"`. rmcp default features are disabled; only `client` and
+`transport-async-rw` are enabled. The adapter owns direct-child construction
+instead of enabling rmcp's child-process transport, so it can retain a
+runtime-independent lifecycle guard. Server macros, HTTP transports, OAuth, and
+credential handling are not compiled in. Core, Model, and Tool do not depend on
+MCP; Core appears only in MCP examples and integration tests.
+
+`McpClientSession` performs one initialize handshake and shares the resulting
+rmcp peer and owned service lifecycle through `Arc`. Calls reuse that session;
+the adapter never reconnects, creates a Runtime, or adds a per-call forwarding
+task or channel. `connect_stdio` builds `std::process::Command` from a separate
+executable and argument vector without shell parsing, retains the direct child,
+and gives its pipes to rmcp's async-read/write transport. Explicit `shutdown`
+atomically stops new calls, closes and joins rmcp, waits a configured grace
+period for the child, then kills and waits again when necessary. It is
+idempotent: one Session-owned cleanup task and completion are created, and all
+concurrent or repeated callers await the same stored result. Cancelling one
+shutdown Future cancels only that waiter, not rmcp close or child cleanup.
+Service close and direct-child cleanup run in independent tasks that the
+supervisor always awaits. Both success and failure are published only after the
+direct child has exited and been reaped; the final result is stored, `CLOSED` is
+published, and only then are completion waiters woken. Both an outer rmcp task
+JoinError and `QuitReason::JoinError` are source-preserving `ShutdownFailed`;
+service or child worker panic is also `ShutdownFailed` and cannot skip child
+cleanup. If service close and child cleanup both fail, the service failure is
+the primary returned source; the child path has nevertheless completed. rmcp
+2.2.0 logs but does not return errors from its internal `transport.close()`
+call, so Group cannot promise to surface those errors. Zero grace means one
+non-blocking child exit check followed by immediate kill and wait/reap when it
+is still running. A child that ignores stdin EOF is therefore still reaped.
+
+Drop is deliberately different: it does not run graceful async close, wait for
+the Session completion, or report a result. It synchronously requests direct
+child termination and tries to hand reap to a standard thread, so the usual
+fallback does not depend on a surviving Tokio runtime. If thread creation fails
+because of resource exhaustion or an OS error, the direct-child kill has still
+been attempted, but the current process cannot guarantee wait/reap and may
+temporarily retain a zombie until parent exit or another OS cleanup mechanism.
+Drop does not perform an unbounded synchronous wait and is only a best-effort
+safety net; explicit `shutdown()` is the reliable and recommended lifecycle
+path. When explicit cleanup already owns the child, Drop cannot take or
+terminate it a second time. Only the direct child is covered, not its process
+tree. Dropping one call Future promises only local ownership release—not
+immediate remote termination or side-effect rollback.
+
+Discovery first checks the initialized server's tools capability, then runs an
+adapter-owned `tools/list` state machine. It tracks every returned cursor,
+rejects same-cursor and longer cycles, and enforces configurable non-zero page
+and accumulated-tool limits with checked arithmetic. Pages remain private until
+the traversal reaches `nextCursor = null`; a later protocol failure, disconnect,
+cycle, limit, duplicate Tool, name conflict, or invalid Schema publishes no
+partial snapshot. Only the complete result is mapped into `ToolDefinition`,
+sorted by local Tool name, registered through `ToolRegistry`, and frozen as
+`McpToolSet`. Registry registration compiles each input Schema exactly once. A
+later refresh is an explicit new `discover` call that produces another
+snapshot; `tools/list_changed` never mutates an active Registry.
+
+A single server may preserve remote names. `ServerNamespace` or an explicit
+stable prefix supports multiple servers using `prefix__remote`; the frozen
+`McpToolMapping` retains the exact local/server/remote tuple, so execution sends
+the original remote name without parsing a prefix or modifying arguments.
+Collisions and invalid local definitions fail structurally and never overwrite.
+
+Every remote Tool defaults to `NonIdempotentWrite`, sequential execution, and
+no retry. MCP annotations remain untrusted hints. Applications may explicitly
+override one exact remote name during discovery; unknown or inconsistent
+overrides fail before the snapshot is published. Duplicate entries are rejected
+even when their behavior values match; configuration never uses
+last-write-wins.
+
+```text
+ToolRuntime identity/schema/policy validation
+-> MCP Tool
+-> rmcp call_tool(original remote name, structured JSON arguments)
+-> content mapping
+-> ToolResult
+-> ToolMessage(original ToolCallId)
+```
+
+Text blocks retain wire order. `structuredContent` is serialized once as one
+JSON text part after ordinary text blocks. `isError = true` remains a business
+`ToolResult`, not `CallFailed`. Image, audio, embedded resource, resource link,
+and unknown future content fail closed as `UnsupportedContent`; nothing is
+downloaded, discarded, or replaced with placeholder text. Transport,
+JSON-RPC, discovery, process, and serialization failures retain concrete
+sources. rmcp `ServiceError::McpError` and JSON-RPC MCP error responses are
+classified exactly as `Protocol`, while I/O, connection closure, and transport
+send failures are `Transport`. Default Debug/Display never print environment
+values, arguments, output, raw protocol payloads, source messages, or
+`McpToolSet` local-to-remote name mappings; original names remain available only
+through explicit mapping accessors. Explicit source traversal may expose
+upstream details and remains the caller's logging responsibility.
+
+See the fully offline [`mcp_stdio`](crates/group-agent-mcp/examples/mcp_stdio.rs)
+and [`mcp_tool_node`](crates/group-agent-mcp/examples/mcp_tool_node.rs)
+examples. The first starts a local stdio fixture, discovers and executes a Tool,
+builds a correctly paired Tool message, and shuts down. The second performs the
+same call through an ordinary Group Node without changing Core.
+
 ### Stage 16.2 migration from Stage 16.1
 
 - Change `ChatModelAdapter::{complete_raw, stream_raw}` parameters from
@@ -363,18 +584,25 @@ Group uses a layered minimum supported Rust version (MSRV):
 | --- | --- |
 | `group-agent-core` | Rust 1.85 |
 | `group-agent-model` | Rust 1.85 |
+| `group-agent-tool` | Rust 1.85 |
 | SQLite and observability adapters | Rust 1.85 |
+| `group-agent-mcp` | Rust 1.88 |
 | `group-agent-genai` | Rust 1.88 |
 | Full workspace | Rust 1.88+ |
 
-The workspace package default remains Rust 1.85. Only
-`group-agent-genai` overrides that default because the published crates.io
+The workspace package default remains Rust 1.85. `group-agent-mcp` independently
+declares Rust 1.88 because rmcp 2.2.0's published source uses let-chain syntax
+that is not accepted by Rust 1.87. Stage 19.1 does not enable rmcp's
+child-process feature; the adapter owns direct-child construction and uses
+rmcp's async-read/write transport.
+`group-agent-genai` independently declares Rust 1.88 because the published crates.io
 source for genai 0.6.5 uses let-chain syntax, which became stable in Rust 1.88.
 This is an effective MSRV inferred from the release's actual source, not an
 explicit `rust-version = "1.88"` declaration by genai. Group's Runtime and
-provider-neutral Model crates have not raised their MSRV. Applications that do
-not select the optional provider adapter can continue to use those layers with
-Rust 1.85; building the complete workspace requires Rust 1.88 or newer.
+provider-neutral Model and Tool crates have not raised their MSRV. Applications
+that do not select the optional provider adapter can continue to use those
+layers with Rust 1.85; building the complete workspace requires Rust 1.88 or
+newer.
 
 ## Shared-state subgraphs and execution namespaces
 
@@ -1461,7 +1689,16 @@ preconstructed 100 and 1,000 text-delta streams, eight interleaved fragmented
 tool calls, atomic ToolCall delta merge, extension merge/round-trip, atomic
 extension conflict validation, merging one new Usage extension into 256
 existing entries, and one validated-facade mock completion. Benchmark setup is
-kept outside measured iterations. Criterion
+kept outside measured iterations. Stage 18 adds registry lookup at 1, 100, and
+1,000 tools, simple and complex cached-schema validation through `ToolRuntime`,
+immediate dispatch, an eight-call batch, and a stable result-order baseline
+whose Tool futures intentionally complete in reverse-ready order. Registry,
+schemas, and inputs are constructed outside measured iterations, and large
+batch-report destruction is excluded from timed regions. Stage 19 adds offline
+mapping baselines for 100 discovered MCP tools, stable namespace conversion,
+text and structured results, and dispatch through a reusable in-process MCP
+session. It intentionally excludes process startup, network access, and sleeps.
+Criterion
 uses explicit warm-up, measurement, sample-size, and noise-threshold settings.
 Results are local regression baselines only; short-run variation is not a
 reason to redesign the runtime.
@@ -1558,6 +1795,40 @@ reason to redesign the runtime.
     │       ├── support
     │       │   └── mod.rs
     │       └── tools.rs
+    ├── group-agent-mcp
+    │   ├── Cargo.toml
+    │   ├── benches
+    │   │   └── mapping.rs
+    │   ├── examples
+    │   │   ├── mcp_stdio.rs
+    │   │   └── mcp_tool_node.rs
+    │   ├── src
+    │   │   ├── config.rs
+    │   │   ├── discovery.rs
+    │   │   ├── error.rs
+    │   │   ├── lib.rs
+    │   │   ├── mapping.rs
+    │   │   ├── session.rs
+    │   │   └── tool.rs
+    │   └── tests
+    │       ├── group_integration.rs
+    │       └── mcp_adapter.rs
+    ├── group-agent-tool
+    │   ├── Cargo.toml
+    │   ├── benches
+    │   │   └── runtime.rs
+    │   ├── examples
+    │   │   ├── tool_node.rs
+    │   │   └── tool_runtime.rs
+    │   ├── src
+    │   │   ├── error.rs
+    │   │   ├── event.rs
+    │   │   ├── lib.rs
+    │   │   ├── registry.rs
+    │   │   ├── runtime.rs
+    │   │   └── tool.rs
+    │   └── tests
+    │       └── tool_runtime.rs
     └── group-agent-core
         ├── Cargo.toml
         ├── benches
@@ -1620,15 +1891,24 @@ cargo run -p group-agent-core --example interrupt
 cargo run -p group-agent-model --example model_node
 cargo run -p group-agent-genai --example genai_model
 cargo check -p group-agent-genai --example genai_node
+cargo run -p group-agent-tool --example tool_runtime
+cargo run -p group-agent-tool --example tool_node
+cargo test -p group-agent-tool --doc
+cargo run -p group-agent-mcp --example mcp_stdio
+cargo run -p group-agent-mcp --example mcp_tool_node
+cargo test -p group-agent-mcp --doc
 cargo bench --workspace --no-run
 ```
 
 The stable toolchain always validates the full workspace. MSRV validation is
-split between the Runtime/Model workspace and the optional provider adapter:
+split between the Rust 1.85 foundation and the independently versioned
+adapters:
 
 ```bash
-cargo +1.85.0 check --workspace --exclude group-agent-genai --all-targets --all-features
-cargo +1.85.0 test --workspace --exclude group-agent-genai
+cargo +1.85.0 check --workspace --exclude group-agent-genai --exclude group-agent-mcp --all-targets --all-features
+cargo +1.85.0 test --workspace --exclude group-agent-genai --exclude group-agent-mcp
+cargo +1.88.0 check -p group-agent-mcp --all-targets --all-features
+cargo +1.88.0 test -p group-agent-mcp
 cargo +1.88.0 check -p group-agent-genai --all-targets --all-features
 cargo +1.88.0 test -p group-agent-genai
 cargo +1.88.0 test -p group-agent-genai --doc
@@ -1646,14 +1926,21 @@ Travel, PostgreSQL, built-in Serde codecs, arbitrary Node Command or Send APIs,
 conditional fan-out into subgraph mounts, custom asynchronous backpressure,
 disk event queues, OpenTelemetry exporters, metrics exporters, WebSocket or SSE
 servers, network event proxies, standalone reducer registration, provider
-fallback or retry, tool execution APIs, MCP, RAG, Tower middleware, Axum, HTTP
-services, distributed workers, macro DSLs, or visualization. SQLite is the only
+fallback or retry, automatic Tool retry, exactly-once Tool execution, durable
+Tool idempotency storage, Tool sandboxing, RAG, Tower middleware, Axum,
+HTTP services, distributed workers, macro DSLs, or visualization. SQLite is the only
 reference database backend; the bounded Tokio stream adapter is process-local
 and intentionally lossy. `group-agent-model` remains provider-neutral.
 `group-agent-genai` is the sole real chat provider adapter and is fixed to
 genai 0.6.5; it excludes credential storage, `.env` loading, retries, rate
-limiters, fallback, tool execution and registries, MCP, embeddings, RAG, agent
-memory, ReAct, and prebuilt agents.
+limiters, fallback, direct Tool Runtime integration, MCP, embeddings, RAG,
+agent memory, ReAct, and prebuilt agents. `group-agent-tool` executes only
+application-provided local Tool implementations and provides no provider,
+credential, network, sandbox, or persistence layer. `group-agent-mcp` is the
+sole MCP client adapter and supports production child-process stdio only. It
+does not implement HTTP, OAuth, credential storage, automatic
+`tools/list_changed` refresh, Resources, Prompts, Sampling, Roots, server
+hosting, retry, remote rollback, or an Agent loop.
 
 ## Architecture review cadence
 
@@ -1669,4 +1956,26 @@ changing Core or its durable APIs. Stage 16.1 hardens that boundary with a
 validated facade, partial usage, redacted Debug, and continuation Extensions.
 Stage 16.2 makes raw validation non-bypassable and stream/Usage merging atomic.
 Stage 17 adds the separate genai 0.6.5 adapter without changing Core or Model
-dependency direction.
+dependency direction. Stage 18 adds the independent local Tool Runtime over
+Model data, with Core remaining unchanged and used only for Tool crate
+dev-integration coverage.
+Stage 18.1 retains concrete JSON Schema sources, corrects fail-fast outcome
+reporting, makes before/after observer semantics panic-safe, and adds
+ToolCallId-paired message helpers without changing Core or Model domains.
+Stage 19 adds the separate client-only MCP Tool backend with immutable discovery
+snapshots, reusable stdio sessions, conservative remote behavior, fail-closed
+content mapping, offline lifecycle coverage, and no Core, Model, or Tool reverse
+dependency.
+Stage 19.1 replaces unbounded upstream discovery aggregation with adapter-owned
+cursor-cycle and traversal-limit enforcement, rejects duplicate behavior
+overrides, classifies MCP error responses as Protocol, redacts Tool-set Debug,
+and gives stdio explicit close/kill/wait plus a Tokio-runtime-independent
+direct-child Drop fallback.
+Stage 19.2 makes explicit shutdown a Session-owned shared completion, preserves
+both outer and `QuitReason` JoinErrors as `ShutdownFailed`, keeps cleanup alive
+when one waiter is cancelled, defines zero grace as immediate kill/wait after
+one exit check, and documents rmcp 2.2.0's unobservable transport-close errors.
+Stage 19.3 separates service and child cleanup tasks so a worker panic cannot
+skip direct-child reap, publishes `CLOSED` before waking shared completion
+waiters, and narrows the Drop reaper to a best-effort fallback when standard
+thread creation fails.
