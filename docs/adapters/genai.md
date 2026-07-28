@@ -1,5 +1,8 @@
 # Genai Adapter
 
+> Status: experimental adapter over the compatibility-first Model API. See the
+> [documentation index](../index.md) and [architecture](../../ARCHITECTURE.md).
+
 `group-agent-genai` is an application-layer bridge between
 `group-agent-model` and exactly `genai` 0.6.5. The design was originally
 introduced in Stage 17, but this document describes the current adapter
@@ -276,19 +279,9 @@ prebuilt Agent. Upgrading to genai 0.7 is a separate migration.
 
 ## Compiler support policy
 
-Group uses a layered minimum supported Rust version:
-
-| Crate / layer | MSRV |
-| --- | --- |
-| `group-agent-core` | Rust 1.85 |
-| `group-agent-model` | Rust 1.85 |
-| `group-agent-checkpoint-sqlite` and `group-agent-observability-tokio` | Rust 1.85 |
-| `group-agent-genai` | Rust 1.88 |
-| Full workspace | Rust 1.88+ |
-
-The workspace package default remains Rust 1.85, and the Runtime, Model,
-SQLite, and observability crates continue to inherit it. Only
-`group-agent-genai` declares `rust-version = "1.88"`.
+`group-agent-genai` requires Rust 1.88. The MCP adapter also requires Rust
+1.88, so the full workspace requires Rust 1.88 or newer. Core, Model, Tool,
+SQLite, and Observability retain Rust 1.85.
 
 The published crates.io source for genai 0.6.5 uses let-chain syntax. Rust 1.85
 reports that syntax as unstable, while it became stable in Rust 1.88. The
@@ -298,34 +291,12 @@ this is a source-derived compatibility requirement, not a claim about its
 manifest. Group's own adapter code did not cause the increase, and Group's
 Runtime and provider-neutral domain model did not raise their MSRV.
 
-Users who do not build `group-agent-genai` can continue to use the Runtime and
-Model abstraction with Rust 1.85. The default stable build still validates the
-entire workspace, while the explicit MSRV gates are:
-
-```bash
-# Rust 1.85: Runtime, Model, SQLite, observability, and every non-genai crate.
-cargo +1.85.0 check \
-  --workspace \
-  --exclude group-agent-genai \
-  --all-targets \
-  --all-features
-cargo +1.85.0 test \
-  --workspace \
-  --exclude group-agent-genai
-
-# Rust 1.88: optional provider adapter, including examples and benchmarks.
-cargo +1.88.0 check \
-  -p group-agent-genai \
-  --all-targets \
-  --all-features
-cargo +1.88.0 test -p group-agent-genai
-cargo +1.88.0 test -p group-agent-genai --doc
-
-# Stable: no workspace exclusions.
-cargo check --workspace --all-targets --all-features
-cargo test --workspace
-cargo bench --workspace --no-run
-```
+Users who build only the Rust 1.85 foundation layer can omit both higher-MSRV
+adapters. The authoritative complete matrix lives in
+[Architecture: MSRV layering](../../ARCHITECTURE.md#msrv-layering),
+[ADR-011](../adr/011-layered-msrv.md), and the executable
+`./scripts/verify msrv` gate; this adapter document does not duplicate that
+workspace matrix.
 
 Group does not vendor or patch genai, use a Git or path override, set
 `RUSTC_BOOTSTRAP`, enable nightly features, downgrade the verified SDK, or move
