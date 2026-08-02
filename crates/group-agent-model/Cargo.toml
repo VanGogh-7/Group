@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -16,7 +19,7 @@ thiserror.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 futures-executor.workspace = true
-group-agent-core = { path = "../group-agent-core" }
+group-agent-core = { version = "0.1.0", path = "../group-agent-core" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util.workspace = true
 

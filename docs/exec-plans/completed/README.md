@@ -24,3 +24,7 @@ code, tests, architecture, or quality documentation.
 - [Stage 21 - Prebuilt Tool-calling Agent](021-prebuilt-tool-calling-agent.md) -
   added the experimental provider-neutral Prebuilt Agent composition, offline
   evidence, Rust 1.85 gates, and accepted independent review.
+- [022 v0.1.0 Local Release Preparation](022-v0.1.0-release-readiness.md) -
+  completed bounded local release preparation with accepted independent review;
+  hosted CI, a clean committed candidate, and remote release gates remain
+  blocked.

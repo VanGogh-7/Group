@@ -264,7 +264,11 @@ When genai itself fails to parse a Provider response, its concrete
 chain traversal can therefore reach upstream error data even though Group's
 default `ModelError`, Node, and Graph formatting is redacted. Applications
 that log complete source chains must perform their own sensitive-data
-filtering.
+filtering. Keep the upstream `genai` tracing target disabled unless the exact
+deployed source and every sink have been audited; see the authoritative
+[Production tracing policy](../design/error-cancellation-observability.md#production-tracing-policy)
+for a copyable least-privilege filter and audit checklist.
+
 Group does not trace raw SSE data. The known unsafe genai Responses streaming
 path may be constructed by genai during resolution but is never polled or
 dispatched through this adapter; direct application calls to genai are outside

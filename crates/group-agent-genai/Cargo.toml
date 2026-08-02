@@ -5,20 +5,23 @@ version.workspace = true
 edition.workspace = true
 rust-version = "1.88"
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 genai.workspace = true
-group-agent-model = { path = "../group-agent-model" }
+group-agent-model = { version = "0.1.0", path = "../group-agent-model" }
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 futures-executor.workspace = true
-group-agent-core = { path = "../group-agent-core" }
+group-agent-core = { version = "0.1.0", path = "../group-agent-core" }
 tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
 tokio-util.workspace = true
 

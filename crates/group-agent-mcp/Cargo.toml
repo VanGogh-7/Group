@@ -5,11 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version = "1.88"
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-group-agent-model = { path = "../group-agent-model" }
-group-agent-tool = { path = "../group-agent-tool" }
+group-agent-model = { version = "0.1.0", path = "../group-agent-model" }
+group-agent-tool = { version = "0.1.0", path = "../group-agent-tool" }
 rmcp.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,7 +21,7 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-group-agent-core = { path = "../group-agent-core" }
+group-agent-core = { version = "0.1.0", path = "../group-agent-core" }
 jsonschema.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

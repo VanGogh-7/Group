@@ -78,9 +78,89 @@ Group-owned default Debug, Display, events, and observer records do not include:
 - concrete source messages.
 
 Explicit source-chain traversal can expose upstream details. Applications must
-filter before logging a complete chain. The same rule applies to upstream
-dependency targets: production configurations should not enable unfiltered
-`genai=trace` or `rmcp=debug`.
+filter before logging a complete chain. Group cannot redact a source chain
+after an application or formatter has rendered it.
+
+## Production tracing policy
+
+Treat Group-owned formatting, explicit source traversal, and upstream tracing
+as three separate data paths:
+
+1. Group-owned default `Debug`, `Display`, `GraphEvent`, and Tool observer
+   formatting contains lifecycle classifications and identifiers but excludes
+   payload and concrete source messages as described above.
+2. Calling `Error::source()`, downcasting a source, or formatting a complete
+   source chain is an explicit application diagnostic operation. A concrete
+   provider, transport, JSON, I/O, or process source may contain sensitive
+   data. Group preserves those sources for diagnosis; it cannot sanitize an
+   already-formatted chain.
+3. Events emitted directly by dependencies bypass Group formatting. In the
+   pinned source, `genai` 0.6.5 can trace complete response bodies. The enabled
+   `rmcp` 2.2.0 async-read/write codec debug-logs the raw incoming line when
+   parsing fails, and its client service Debug-formats an unexpected complete
+   protocol-message value at `warn`. Group cannot redact those upstream
+   events, and applications must not assume that upstream error or message
+   formatting is payload-safe across paths or upgrades.
+
+For a production application using `tracing-subscriber` with its `env-filter`
+feature, this is a conservative copyable starting point:
+
+```rust
+use tracing_subscriber::EnvFilter;
+
+fn init_group_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let filter = EnvFilter::try_new(concat!(
+        "off,",
+        "group_agent_core=debug,",
+        "group_agent_model=info,",
+        "group_agent_tool=info,",
+        "group_agent_checkpoint_sqlite=info,",
+        "group_agent_observability_tokio=info,",
+        "group_agent_prebuilt=info,",
+        "group_agent_genai=info,",
+        "group_agent_mcp=info,",
+        "genai=off,",
+        "rmcp=off"
+    ))?;
+
+    tracing_subscriber::fmt().with_env_filter(filter).try_init()?;
+    Ok(())
+}
+```
+
+`tracing` target names use Rust module spelling, so Group package dashes become
+underscores. `EnvFilter` target directives use raw target-string prefix
+matching, without a Rust module-boundary check. For example,
+`group_agent_core=debug` covers `group_agent_core::runtime`, while `genai=off`
+covers `genai`, `genai::webc`, and conservatively also a collateral target such
+as `genai_extra`. The leading `off` denies every unlisted target; applications
+should add their own audited targets explicitly. The final `genai=off` and
+`rmcp=off` directives make the upstream boundary visible and fail closed even
+while the Group adapter targets remain enabled. Group currently emits its Core
+lifecycle diagnostics at `debug`; enabling an upstream target is not required
+to obtain them.
+
+Before raising either upstream target from `off`, audit the exact deployed
+versions, enabled features, transports, provider/server behavior, subscriber
+formatters, exporters, retention, and access controls. Exercise both success
+and malformed/error paths with synthetic secrets and verify every sink. Filter
+or transform events before they leave the process, and keep the opt-in scoped
+to the audited environment. Re-audit after any dependency or feature change.
+
+At minimum, treat these as sensitive payload classes:
+
+- prompts, messages, reasoning, and model or MCP content;
+- Tool definitions, schemas, arguments, results, and outputs;
+- raw HTTP bodies, SSE data, MCP/JSON-RPC frames, and error bodies;
+- request/response headers, URLs or endpoints carrying parameters, and
+  response, request, session, or event identifiers;
+- executable arguments, environment names and values, and local paths; and
+- API keys, bearer tokens, cookies, credentials, secret prefixes, and any
+  derived authentication material.
+
+This is a least-privilege baseline, not a universal redaction guarantee. The
+application remains responsible for every additional target, source-chain
+formatter, sink, and exporter.
 
 ## Core EventSink
 
@@ -168,5 +248,6 @@ shutdown and cannot guarantee wait/reap when thread creation fails.
 Related documents:
 
 - [Core Runtime Design](core-runtime.md)
+- [Genai Adapter](../adapters/genai.md)
 - [MCP Adapter](../adapters/mcp.md)
 - [Development Runbook](../runbooks/development.md)

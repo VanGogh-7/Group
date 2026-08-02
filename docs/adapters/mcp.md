@@ -113,7 +113,11 @@ identifiers, not command arguments, environment values, Tool arguments,
 results, protocol payloads, panic payloads, or source messages.
 
 Applications that log complete source chains or enable upstream rmcp targets
-must apply sensitive-data filtering.
+must apply sensitive-data filtering. Keep the upstream `rmcp` tracing target
+disabled unless the exact deployed source and every sink have been audited;
+see the authoritative
+[Production tracing policy](../design/error-cancellation-observability.md#production-tracing-policy)
+for a copyable least-privilege filter and audit checklist.
 
 ## Explicit shutdown
 

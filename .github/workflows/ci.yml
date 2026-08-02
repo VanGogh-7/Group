@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    name: Full workspace (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
+          rustc --version --verbose
+          cargo --version
+
+      - name: Run full verification
+        run: ./scripts/verify full
+
+  msrv:
+    name: Layered MSRV (Rust 1.85 and 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install layered Rust toolchains
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain list
+
+      - name: Run layered MSRV verification
+        run: ./scripts/verify msrv

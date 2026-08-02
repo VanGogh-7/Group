@@ -86,7 +86,7 @@ fn branch_restart_benchmark(criterion: &mut Criterion) {
     criterion.bench_function(
         "sqlite_restart_branch_resume_one_immediate_node",
         |bencher| {
-            bencher.iter_batched(
+            bencher.iter_batched_ref(
                 || {
                     let directory = tempfile::tempdir().expect("temporary database");
                     let path = directory.path().join("branch.sqlite3");
@@ -138,7 +138,7 @@ fn branch_restart_benchmark(criterion: &mut Criterion) {
                     });
                     (directory, database_url, branch_id)
                 },
-                |(directory, database_url, branch_id): (TempDir, String, _)| {
+                |(_directory, database_url, branch_id): &mut (TempDir, String, _)| {
                     let steps = runtime.block_on(async {
                         let store = Arc::new(
                             SqliteCheckpointStore::connect(database_url)
@@ -148,21 +148,26 @@ fn branch_restart_benchmark(criterion: &mut Criterion) {
                         store.migrate().await.expect("restart migrate");
                         let checkpointer: Arc<dyn Checkpointer<u64>> =
                             Arc::new(RecordCheckpointer::new(
-                                store as Arc<dyn CheckpointStore>,
+                                Arc::clone(&store) as Arc<dyn CheckpointStore>,
                                 Arc::new(Codec),
                             ));
-                        graph
+                        let steps = graph
                             .resume(
-                                ResumeConfig::new("sqlite-branch-benchmark", checkpointer)
-                                    .with_branch_id(branch_id)
-                                    .with_run_config(RunConfig::new(1)),
+                                ResumeConfig::new(
+                                    "sqlite-branch-benchmark",
+                                    Arc::clone(&checkpointer),
+                                )
+                                .with_branch_id(*branch_id)
+                                .with_run_config(RunConfig::new(1)),
                             )
                             .await
                             .expect("restart branch resume")
-                            .steps()
+                            .steps();
+                        drop(checkpointer);
+                        drop(store);
+                        steps
                     });
                     black_box(steps);
-                    drop(directory);
                 },
                 BatchSize::SmallInput,
             );

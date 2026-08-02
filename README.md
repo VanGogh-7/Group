@@ -301,10 +301,12 @@ releases. Foundation-only users should not inherit that restriction.
 - [Durable Execution Design](docs/design/durable-execution.md)
 - [Model and Tools Design](docs/design/model-and-tools.md)
 - [Error, Cancellation, and Observability](docs/design/error-cancellation-observability.md)
+- [Production Tracing Policy](docs/design/error-cancellation-observability.md#production-tracing-policy)
 - [Architecture Decision Records](docs/adr/README.md)
 - [Execution Plans](docs/exec-plans/README.md)
 - [Development Runbook](docs/runbooks/development.md)
 - [Independent Review Runbook](docs/runbooks/review.md)
+- [Release Runbook](docs/runbooks/release.md)
 - [Quality and Release Status](docs/quality.md)
 - [Stages 01-20 History](docs/history/stages-01-20.md)
 
@@ -350,16 +352,30 @@ or panic payloads.
 Concrete source errors remain available for deliberate diagnostics. An
 application that traverses full source chains or enables upstream `genai` or
 `rmcp` logging targets must perform its own sensitive-data filtering.
+Start from the copyable least-privilege
+[Production Tracing Policy](docs/design/error-cancellation-observability.md#production-tracing-policy),
+which keeps those upstream targets disabled by default.
 
 No layer performs hidden retry. Future drop releases local ownership but does
 not roll back external side effects.
 
 ## License and release status
 
-Workspace manifests declare `MIT OR Apache-2.0`, but checked-in license files
-and complete package metadata are not yet present. Internal path dependencies
-also require publishable versions and all crates require final `cargo package`
-validation before a public release.
+Workspace manifests declare `MIT OR Apache-2.0`; canonical and package-local
+license texts, release metadata, and registry-usable internal version
+requirements are prepared locally. The CI workflow source, benchmark timing
+boundary, production tracing guidance, and manual release procedure are also
+locally prepared.
+
+The diagnostic dirty-tree preflight passed for all eight local package
+archives. That evidence remains bound to the recorded local dirty inputs and
+non-persistent command-line Cargo patches; it is not a clean release-candidate
+or crates.io-resolution result. A later clean committed-candidate package
+gate, the first successful hosted CI run, tag preparation, ordered crates.io
+publication/index verification, and a fresh exact-version registry consumer
+all remain blocked behind their required authorization and evidence. See the
+[Release Runbook](docs/runbooks/release.md) for the distinct phases and stop
+conditions.
 
 The manifest version must not be interpreted as evidence that v0.1.0 has been
 published or is ready.

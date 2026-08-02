@@ -17,6 +17,7 @@ Code and executable tests remain the final source of truth.
 - [Durable Execution](design/durable-execution.md)
 - [Model and Tools](design/model-and-tools.md)
 - [Error, Cancellation, and Observability](design/error-cancellation-observability.md)
+- [Production Tracing Policy](design/error-cancellation-observability.md#production-tracing-policy)
 
 These documents describe current behavior. They do not replace direct tests.
 
@@ -57,9 +58,11 @@ multi-session work must be driven by a tracked active plan.
 
 - [Development](runbooks/development.md)
 - [Independent Review](runbooks/review.md)
+- [Release](runbooks/release.md)
 
 The runbooks define how implementation and independent review exchange
-evidence.
+evidence and how local package inspection remains separated from later
+authorized release operations.
 
 ## History
 
