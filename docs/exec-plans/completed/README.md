@@ -21,3 +21,6 @@ code, tests, architecture, or quality documentation.
 - [H-001.1 Repository Harness Corrections](001-repository-harness-corrections.md)
   - corrected MSRV guidance, verification portability, and the independent
     review lifecycle.
+- [Stage 21 - Prebuilt Tool-calling Agent](021-prebuilt-tool-calling-agent.md) -
+  added the experimental provider-neutral Prebuilt Agent composition, offline
+  evidence, Rust 1.85 gates, and accepted independent review.

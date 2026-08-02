@@ -130,9 +130,37 @@ Genai maps Model data to one provider SDK. MCP maps remote tools into the Tool
 trait. Neither adapter reimplements Tool Registry, validation, timeout, batch,
 fail-fast, or ToolMessage pairing.
 
-The application owns the Agent loop that sends assistant ToolCalls to
-ToolRuntime, appends ToolMessages, and asks ChatModel for the next response.
-That orchestration is not currently a prebuilt Group component.
+## Experimental prebuilt Tool-calling Agent
+
+`group-agent-prebuilt` provides a provider-neutral, non-streaming
+`ToolCallingAgent` above the stable Core, Model, and Tool layers. The
+application injects an already constructed `ChatModel`, an already constructed
+`ToolRuntime`, and caller-owned messages. A private Core graph then repeats
+Model -> Tool -> Model until a response has no ToolCalls (`FinalAnswer`) or the
+configured committed-model-round limit ends after a complete Tool batch
+(`MaxRounds`).
+
+Each Model request owns the current canonical transcript and the complete
+immutable ToolDefinition snapshot. ToolCalls, rather than provider-specific
+finish-reason conventions, control routing. ToolRuntime remains the only
+scheduler and provides schema validation, timeout, bounded batching,
+fail-fast/side-effect policy, ToolMessage identity, and the shared execution
+boundary for local and MCP-backed Tools. A business Tool error becomes a real
+model-visible ToolMessage; batch or per-call infrastructure failure stops the
+Agent and exposes the complete current batch report when available.
+
+Construction compiles the private graph once. Invocation creates fresh State,
+does not spawn one task per call, and performs no hidden retry. Per-round usage
+remains aligned rather than merged as though independent responses were one
+cumulative stream.
+
+The Prebuilt API is experimental. Private State, Update, Nodes, routers,
+topology, and `CompiledGraph` are not public extension points. Streaming,
+built-in durable codecs or resume/replay/fork, provider construction, MCP
+lifecycle, fallback/retry, rollback, exactly-once, approval, structured output,
+Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not implemented here.
+Provider adapters, MCP session setup and Tool registration, persistence,
+product prompts/policy, RAG, Memory, and UI remain application-owned.
 
 ## Direct evidence
 
@@ -145,9 +173,10 @@ That orchestration is not currently a prebuilt Group component.
 - `crates/group-agent-tool/src/runtime.rs`
 - `crates/group-agent-tool/src/event.rs`
 - `crates/group-agent-tool/tests/tool_runtime.rs`
+- `crates/group-agent-prebuilt/src/`
+- `crates/group-agent-prebuilt/examples/tool_calling_agent.rs`
 
 Related decisions:
 
 - [ADR-005](../adr/005-validated-model-facade.md)
 - [ADR-006](../adr/006-tool-runtime-policy.md)
-

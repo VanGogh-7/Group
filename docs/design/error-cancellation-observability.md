@@ -11,6 +11,7 @@ string-only diagnostics. Each layer controls only its own in-flight work.
 | Model / Genai | returned completion Future or stream ownership | Graph deadlines; hidden runtime; automatic fallback |
 | Tool | per-call timeout; single and batch Future drop; fail-fast drain | Graph run timeout; durable deduplication; exactly-once |
 | MCP | local request ownership; explicit Session shutdown; direct stdio child lifecycle | remote rollback; process-tree cleanup; automatic retry |
+| Prebuilt | forwarding Core run/Node control; current Model or Tool Future ownership | remote cancellation proof; rollback; retry; durability |
 
 No layer automatically retries. Cancellation and timeout release local
 ownership but cannot preempt synchronous callbacks or reverse external effects.
@@ -57,6 +58,12 @@ Framework errors retain concrete lower-level sources where useful:
 
 Sources are not prematurely stringified. Application code may use
 `Error::source()` and downcasting for diagnostics.
+
+`AgentError` keeps `GraphRunError` as its immediate source. Deliberate traversal
+can therefore reach the concrete Model or Tool chain. Its default formatting
+does not traverse that chain. For a Tool infrastructure failure,
+`tool_batch_report()` borrows the complete current batch report when one was
+produced; it does not clone results or expose internal committed State.
 
 ## Default redaction
 
@@ -115,6 +122,21 @@ Runtime catches callback panic:
 This prevents observability failure from falsely claiming that a
 non-idempotent action did or did not run.
 
+## Prebuilt invocation effects and events
+
+The experimental Agent forwards `RunControl` and `EventConfig` unchanged to
+Core. Cancellation, run timeout, and Model/Tool node timeout therefore retain
+Core classifications and precedence, and observers receive one Core graph
+lifecycle rather than a duplicate Agent event protocol. Default lifecycle
+events contain node metadata, not transcript or payload content.
+
+An error may follow earlier successfully committed Tool rounds. Those Tools
+may already have produced external side effects, while `AgentError` does not
+return the internal committed transcript. Dropping the top-level Future drops
+locally owned graph, Model, and Tool Futures but does not prove a remote
+operation stopped. Prebuilt provides no rollback, exactly-once, durability,
+automatic retry, or safe-blind-retry guarantee.
+
 ## MCP Session shutdown
 
 Explicit shutdown is lifecycle control, separate from dropping an individual
@@ -140,6 +162,8 @@ shutdown and cannot guarantee wait/reap when thread creation fails.
 - `crates/group-agent-tool/src/event.rs`
 - `crates/group-agent-mcp/src/error.rs`
 - `crates/group-agent-mcp/src/session.rs`
+- `crates/group-agent-prebuilt/src/error.rs`
+- `crates/group-agent-prebuilt/src/agent_tests.rs`
 
 Related documents:
 

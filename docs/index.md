@@ -20,6 +20,14 @@ Code and executable tests remain the final source of truth.
 
 These documents describe current behavior. They do not replace direct tests.
 
+## Experimental composition
+
+- [`group-agent-prebuilt` Tool-calling Agent](design/model-and-tools.md#experimental-prebuilt-tool-calling-agent)
+
+Prebuilt composes stable Core, Model, and Tool boundaries but does not make its
+private graph topology a public extension point. Its current public API remains
+experimental.
+
 ## Adapters
 
 - [Genai Adapter](adapters/genai.md)
@@ -59,4 +67,3 @@ evidence.
 
 History preserves the major capability and correction sequence. Current
 contracts belong in Architecture, design, adapter, and ADR documents.
-

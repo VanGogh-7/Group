@@ -57,6 +57,9 @@ run_full() {
     step "MCP doctests"
     cargo test --locked -p group-agent-mcp --doc
 
+    step "Prebuilt doctests"
+    cargo test --locked -p group-agent-prebuilt --doc
+
     step "compile workspace benchmarks"
     cargo bench --locked --workspace --no-run
 

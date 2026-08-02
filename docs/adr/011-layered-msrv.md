@@ -12,9 +12,9 @@ users who do not select those adapters.
 
 ## Decision
 
-Keep Core, Model, Tool, SQLite, and Observability at Rust 1.85. Declare Genai
-and MCP at Rust 1.88 and validate both layers independently. The full workspace
-therefore requires Rust 1.88 or newer.
+Keep Core, Model, Tool, Prebuilt, SQLite, and Observability at Rust 1.85.
+Declare Genai and MCP at Rust 1.88 and validate both layers independently. The
+full workspace therefore requires Rust 1.88 or newer.
 
 ## Alternatives
 

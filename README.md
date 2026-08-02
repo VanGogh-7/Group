@@ -16,9 +16,10 @@ evolution.
 Genai and MCP adapter configuration surfaces remain experimental because they
 are coupled to fixed upstream releases and evolving protocol behavior.
 
-The repository has the components for a lower-level model/Tool round trip, but
-it does **not** yet contain a prebuilt Agent loop. It is not ready for a public
-v0.1.0 release; see [Quality and Release Status](docs/quality.md).
+The repository now also contains the experimental `group-agent-prebuilt`
+non-streaming Tool-calling loop. Its public API is not yet a stable
+compatibility commitment. The repository is not ready for a public v0.1.0
+release; see [Quality and Release Status](docs/quality.md).
 
 ## Core capabilities
 
@@ -38,6 +39,8 @@ v0.1.0 release; see [Quality and Release Status](docs/quality.md).
 - validated `ChatModel` facade and atomic stream collector;
 - immutable Tool Registry, precompiled JSON Schema, timeout, batching,
   fail-fast drain, observers, and call-ID-safe ToolMessages;
+- an experimental provider-neutral `ToolCallingAgent` that alternates Model
+  and ToolRuntime rounds and returns `FinalAnswer` or `MaxRounds`;
 - Genai 0.6.5 adapter with evidence-based fail-closed compatibility;
 - MCP 2.2.0 client adapter with bounded discovery and reusable stdio sessions.
 
@@ -45,7 +48,8 @@ v0.1.0 release; see [Quality and Release Status](docs/quality.md).
 
 ```mermaid
 flowchart TB
-    App[Application or prebuilt layer]
+    App[Application]
+    Prebuilt[group-agent-prebuilt experimental]
     Core[group-agent-core]
     SQLite[group-agent-checkpoint-sqlite]
     Obs[group-agent-observability-tokio]
@@ -54,6 +58,10 @@ flowchart TB
     Genai[group-agent-genai]
     MCP[group-agent-mcp]
 
+    App --> Prebuilt
+    Prebuilt --> Core
+    Prebuilt --> Model
+    Prebuilt --> Tool
     App --> Core
     App --> SQLite
     App --> Obs
@@ -70,7 +78,9 @@ flowchart TB
 ```
 
 Core does not depend on Model, Tool, Provider, MCP, SQLx, or adapters. The
-application is the composition root.
+application is the composition root: it creates provider adapters, MCP
+sessions and Tool registration, persistence adapters, and product policy,
+then injects only `ChatModel` and `ToolRuntime` into Prebuilt.
 
 For the complete current contract, read
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -172,9 +182,9 @@ snapshot and interrupt Codec.
 
 See [Durable Execution Design](docs/design/durable-execution.md).
 
-## Model, Tool, and MCP loop
+## Experimental prebuilt Tool-calling Agent
 
-The current components can be composed as:
+The experimental Prebuilt crate composes the current components as:
 
 ```text
 User Message
@@ -187,9 +197,26 @@ User Message
   -> Final Assistant Answer
 ```
 
-The application still owns conversation accumulation, maximum rounds,
-ToolCall dispatch, final-answer detection, Agent-facing error policy, and
-observability policy.
+`ToolCallingAgent` owns the non-streaming multi-round loop, returns
+`FinalAnswer` or `MaxRounds`, forwards optional Core control/events, continues
+after business Tool errors, and stops on Tool infrastructure errors without
+hidden retry. Local and MCP-backed Tools use the same ToolRuntime boundary.
+
+```rust
+let agent = ToolCallingAgent::new(model, tools, AgentConfig::new(4)?)?;
+let outcome = agent.invoke(messages).await?;
+println!("{:?}", outcome.stop_reason());
+```
+
+Run the complete offline example with:
+
+```bash
+cargo run --locked -p group-agent-prebuilt --example tool_calling_agent
+```
+
+The application still owns provider construction, MCP lifecycle and Tool
+registration, persistence adapters, product prompts/policy, RAG, Memory, and
+UI. Prebuilt's public API remains experimental.
 
 See:
 
@@ -206,6 +233,7 @@ See:
 | `group-agent-observability-tokio` | bounded Tokio broadcast over `EventSink` | adapter over stable event port |
 | `group-agent-model` | provider-neutral messages, chat, Tool data, streams, errors | compatibility-first base |
 | `group-agent-tool` | Tool Registry, validation, execution, batch, observer | compatibility-first base |
+| `group-agent-prebuilt` | provider-neutral non-streaming Tool-calling orchestration | experimental |
 | `group-agent-genai` | `genai` 0.6.5 chat adapter | experimental |
 | `group-agent-mcp` | `rmcp` 2.2.0 client Tool backend | experimental |
 
@@ -224,13 +252,14 @@ Group currently supports:
 - audited Genai text streaming paths and non-streaming ToolCalls under the
   documented target policy;
 - local Tool execution and MCP stdio-backed Tools;
+- experimental Model -> Tool -> Model orchestration with `FinalAnswer` and
+  `MaxRounds` outcomes;
 - offline tests and local fixtures.
 
 ## Deliberate exclusions
 
 Group does not currently provide:
 
-- a prebuilt Agent;
 - RAG, embeddings, vector stores, PDF/OCR, or product memory;
 - UI, product authorization, tenancy, or prompt policy;
 - provider fallback, load balancing, or hidden retry;
@@ -245,13 +274,18 @@ Group does not currently provide:
 Unsupported provider or MCP content fails closed rather than being silently
 dropped.
 
+Prebuilt does not provide streaming orchestration, a built-in durability codec
+or resume/replay/fork API, provider client construction, MCP lifecycle
+ownership, retry/fallback, Tool rollback, exactly-once, human approval,
+structured output, Multi-Agent, or middleware.
+
 ## MSRV
 
 Group uses a layered minimum supported Rust version:
 
 | Layer | MSRV |
 | --- | --- |
-| Core, Model, Tool, SQLite, Observability | Rust 1.85 |
+| Core, Model, Tool, Prebuilt, SQLite, Observability | Rust 1.85 |
 | Genai adapter | Rust 1.88 |
 | MCP adapter | Rust 1.88 |
 | Complete workspace | Rust 1.88+ |

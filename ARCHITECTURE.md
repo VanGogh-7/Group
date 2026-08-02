@@ -8,18 +8,20 @@ implemented. Code and executable tests take precedence if this document drifts.
 
 Group is a strongly typed, asynchronous state-graph runtime for Rust agents. It
 provides deterministic graph execution, durable execution ports, provider-
-neutral model types, local Tool execution, and adapters for SQLite,
-observability, Genai, and MCP.
+neutral model types, local Tool execution, an experimental prebuilt
+Tool-calling Agent, and adapters for SQLite, observability, Genai, and MCP.
 
-Group is a foundation, not a complete Agent product. It does not contain a
-prebuilt Agent loop, RAG, embeddings, PDF/OCR ingestion, product memory
-extraction, user interfaces, or product authorization and prompt policy.
+Group is a foundation, not a complete Agent product. Its prebuilt loop is
+experimental and does not add RAG, embeddings, PDF/OCR ingestion, product
+memory extraction, user interfaces, or product authorization and prompt
+policy.
 
 ## Workspace dependency direction
 
 ```mermaid
 flowchart TB
-    App[Application or prebuilt layer]
+    App[Application]
+    Prebuilt[group-agent-prebuilt]
     Core[group-agent-core]
     SQLite[group-agent-checkpoint-sqlite]
     Obs[group-agent-observability-tokio]
@@ -30,6 +32,10 @@ flowchart TB
     GenaiSDK[genai 0.6.5]
     Rmcp[rmcp 2.2.0]
 
+    App --> Prebuilt
+    Prebuilt --> Core
+    Prebuilt --> Model
+    Prebuilt --> Tool
     App --> Core
     App --> SQLite
     App --> Obs
@@ -54,6 +60,7 @@ Normal dependencies are one-way:
 - Tool depends on Model. Core is only a development integration dependency.
 - Genai depends on Model and the fixed `genai` adapter dependency.
 - MCP depends on Model, Tool, and the fixed `rmcp` client dependency.
+- Prebuilt depends on Core, Model, and Tool, and remains provider-neutral.
 - SQLite and Tokio observability are external adapters over Core ports.
 - The application is the composition root.
 
@@ -194,6 +201,7 @@ subscriber failure can fail graph execution.
 | Model / Genai | Caller-owned model Future or stream drop | Validation, capability, protocol, decode, transport, and provider source |
 | Tool | Per-call timeout; single and batch Future drop; drain already-started calls during fail-fast | Business `ToolResult` versus typed runtime failure |
 | MCP | Local call ownership; independent explicit Session shutdown | Protocol, transport, session, discovery, content, and shutdown failures |
+| Prebuilt | Forwarded Core run/Node control; current Model or Tool Future ownership | `AgentError` with immediate `GraphRunError` source and optional current batch report |
 
 No layer performs hidden retry. Dropping a Future releases local ownership but
 does not roll back external side effects or prove a remote operation stopped.
@@ -211,7 +219,7 @@ See [Error, Cancellation, and Observability Design](docs/design/error-cancellati
 
 | Crate or layer | MSRV |
 | --- | --- |
-| Core, Model, Tool, SQLite, Observability | Rust 1.85 |
+| Core, Model, Tool, Prebuilt, SQLite, Observability | Rust 1.85 |
 | Genai adapter | Rust 1.88 |
 | MCP adapter | Rust 1.88 |
 | Full workspace | Rust 1.88+ |
@@ -233,13 +241,16 @@ and should evolve compatibly:
 `Stable` means compatibility-first additive evolution, not `never changes`.
 
 Genai provider configuration, extension keys, stable-target policy, MCP
-transport constructors, MCP discovery configuration, and future HTTP/OAuth
-surfaces remain experimental. Upstream SDK evolution may require adapter-level
-migration without changing the stable base layers.
+transport constructors, MCP discovery configuration, future HTTP/OAuth
+surfaces, and the Prebuilt public API remain experimental. Prebuilt's private
+State, Update, Nodes, router, topology, and `CompiledGraph` are not public
+extension points or permanent compatibility promises. Upstream SDK evolution
+may require adapter-level migration without changing the stable base layers.
 
-## Lower-level Agent loop and application boundary
+## Experimental prebuilt Agent and application boundary
 
-The existing components support a lower-level technical loop:
+`group-agent-prebuilt` composes the existing components into this
+non-streaming technical loop:
 
 ```mermaid
 flowchart LR
@@ -255,14 +266,21 @@ flowchart LR
     User --> ChatA --> Call --> Runtime --> Backend --> Result --> ChatB --> Final
 ```
 
-The repository does not yet provide the prebuilt orchestration around that
-loop: conversation accumulation, maximum rounds, ToolCall dispatch, final-
-answer detection, Agent-facing error policy, and application observability
-policy.
+The experimental `ToolCallingAgent` owns a private constructor-compiled Core
+graph, one canonical per-invocation transcript, maximum committed model rounds,
+ToolCall dispatch through `ToolRuntime`, and ordinary `FinalAnswer` or
+`MaxRounds` outcomes. It forwards Core `RunControl` and `EventConfig`, reuses
+Core `EventSink`, continues after business Tool errors, stops on Tool
+infrastructure errors, and exposes the complete current failing batch report
+when one exists. There is no hidden retry.
 
-Applications such as PLA may reuse Model, Genai, ToolRuntime, local/MCP Tools,
-and optionally Core graphs and durability. PDF ingestion, OCR, embeddings,
-pgvector, RAG, repository selection, citation rendering, memory extraction,
+Applications create provider adapters, own MCP sessions and Tool registration,
+select persistence adapters, and supply product prompts and policy. Local and
+MCP-backed Tools enter the Agent through the same ToolRuntime boundary. A
+built-in durability codec or resume/replay/fork API, streaming orchestration,
+provider construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
+exactly-once, approval, structured output, Memory, RAG, PDF/OCR, Multi-Agent,
+and middleware are not provided. Repository selection, citation rendering,
 product permissions, UI, and prompt policy remain application-owned.
 
 ## Further reading

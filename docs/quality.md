@@ -23,10 +23,12 @@ Experimental surfaces:
 - Genai provider-specific configuration and extension keys;
 - stable-target policy and provider compatibility mapping;
 - MCP transport constructors and discovery configuration;
-- any future MCP HTTP or OAuth interface.
+- any future MCP HTTP or OAuth interface;
+- the `group-agent-prebuilt` public API and its current private graph topology.
 
-The repository has the components for a lower-level model/Tool round trip. It
-does not yet contain a prebuilt Agent loop.
+The repository contains an experimental non-streaming prebuilt Tool-calling
+loop over the stable Core, Model, and Tool boundaries. This capability does not
+make Prebuilt stable or make the repository production-ready.
 
 ## Release blockers
 
@@ -48,13 +50,11 @@ benchmark code because those are outside this documentation migration.
 
 ## Stage 21 relationship
 
-The release blockers do not require changing the reviewed Core, Durable,
-Model, or Tool contracts before planning Stage 21. Stage 21 must receive its
-own Execution Plan only after this Harness migration passes independent
-review.
-
-This is not a statement that Stage 21 already exists or that the repository is
-production-ready.
+Stage 21 is active and In Progress. Its implementation slices provide the
+experimental Prebuilt Agent, offline example and doctests, and benchmark-build
+coverage without changing the reviewed stable Core, Durable, Model, or Tool
+contracts. Final independent review and Plan closure remain outstanding; this
+is not a production-readiness claim.
 
 ## Validation expectations
 

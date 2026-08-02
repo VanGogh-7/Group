@@ -1074,6 +1074,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "group-agent-prebuilt"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "criterion",
+ "group-agent-core",
+ "group-agent-model",
+ "group-agent-tool",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "group-agent-tool"
 version = "0.1.0"
 dependencies = [

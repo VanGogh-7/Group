@@ -6,6 +6,7 @@ members = [
     "crates/group-agent-mcp",
     "crates/group-agent-model",
     "crates/group-agent-observability-tokio",
+    "crates/group-agent-prebuilt",
     "crates/group-agent-tool",
 ]
 resolver = "3"
