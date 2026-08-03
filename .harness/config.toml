@@ -1,5 +1,5 @@
 config_version = 1
-harness_version = "0.2.0"
+harness_version = "0.3.0"
 project_name = "Group"
 project_type = "rust-workspace"
 context_files = ["AGENTS.md", "ARCHITECTURE.md", "README.md", "docs/quality.md", "docs/exec-plans/README.md"]
@@ -7,7 +7,7 @@ ci_files = [".github/workflows/ci.yml"]
 detected_files = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"]
 workspace_members = ["crates/group-agent-checkpoint-sqlite", "crates/group-agent-core", "crates/group-agent-genai", "crates/group-agent-mcp", "crates/group-agent-model", "crates/group-agent-observability-tokio", "crates/group-agent-prebuilt", "crates/group-agent-tool"]
 build_entrypoints = ["scripts/verify"]
-protected_paths = [".git/", ".env", ".env.*", ".harness/config.toml", ".harness/state.json", ".harness/runtime/", "AGENTS.md", "ARCHITECTURE.md"]
+protected_paths = [".git/", ".env", ".env.*", ".harness/config.toml", ".harness/state.json", ".harness/runtime/", "AGENTS.md", "ARCHITECTURE.md", "PROJECT_BRIEF.md", "HARNESS_ADOPTION_REPORT.md"]
 max_slice_attempts = 3
 error_excerpt_limit = 1200
 worker_timeout_seconds = 3600
@@ -33,6 +33,14 @@ command = ["codex"]
 implementer_sandbox = "workspace-write"
 reviewer_sandbox = "read-only"
 ephemeral = true
+
+[language]
+internal_language = "en"
+repository_language = "en"
+agent_instruction_language = "en"
+agent_report_language = "en"
+operator_language = "auto"
+correct_operator_grammar = false
 
 [context_maintenance]
 enabled = true

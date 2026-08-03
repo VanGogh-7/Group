@@ -63,12 +63,28 @@ impl ChatModelAdapter for ScriptedModel {
         let message = match self.script {
             Script::ModelOnly => AssistantMessage::text("Offline model-only answer."),
             Script::OneToolRound if has_tool_message => {
+                let tool_call = request
+                    .messages()
+                    .iter()
+                    .find_map(Message::as_assistant)
+                    .and_then(|message| message.tool_calls().first())
+                    .expect("the scripted second request contains the original ToolCall");
+                assert_eq!(tool_call.id().as_str(), "offline-call-1");
+                assert_eq!(tool_call.name().as_str(), "lookup_label");
+                assert_eq!(tool_call.arguments(), &json!({"item": "sample"}));
+
                 let tool_message = request
                     .messages()
                     .iter()
                     .find_map(Message::as_tool)
                     .expect("the scripted second request contains a ToolMessage");
                 assert_eq!(tool_message.tool_call_id().as_str(), "offline-call-1");
+                assert!(!tool_message.result().is_error());
+                assert_eq!(tool_message.result().content().len(), 1);
+                assert_eq!(
+                    tool_message.result().content()[0].as_text(),
+                    Some("offline-label")
+                );
                 AssistantMessage::text("Offline tool-assisted answer.")
             }
             Script::OneToolRound => AssistantMessage::new(
