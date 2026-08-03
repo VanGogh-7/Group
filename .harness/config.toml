@@ -1,0 +1,42 @@
+config_version = 1
+harness_version = "0.2.0"
+project_name = "Group"
+project_type = "rust-workspace"
+context_files = ["AGENTS.md", "ARCHITECTURE.md", "README.md", "docs/quality.md", "docs/exec-plans/README.md"]
+ci_files = [".github/workflows/ci.yml"]
+detected_files = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml"]
+workspace_members = ["crates/group-agent-checkpoint-sqlite", "crates/group-agent-core", "crates/group-agent-genai", "crates/group-agent-mcp", "crates/group-agent-model", "crates/group-agent-observability-tokio", "crates/group-agent-prebuilt", "crates/group-agent-tool"]
+build_entrypoints = ["scripts/verify"]
+protected_paths = [".git/", ".env", ".env.*", ".harness/config.toml", ".harness/state.json", ".harness/runtime/", "AGENTS.md", "ARCHITECTURE.md"]
+max_slice_attempts = 3
+error_excerpt_limit = 1200
+worker_timeout_seconds = 3600
+gate_timeout_seconds = 1800
+
+[commands]
+formatter = ["cargo", "fmt", "--all", "--check"]
+lint = ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+check = ["cargo", "check", "--locked", "--workspace", "--all-targets", "--all-features"]
+unit_test = ["cargo", "test", "--locked", "--workspace"]
+integration_test = []
+
+[gates]
+fast = [["harness", "_rust-affected-check"]]
+slice = [
+  ["./scripts/verify", "fast"],
+  ["cargo", "test", "--locked", "--workspace"],
+]
+stage = [["./scripts/verify", "full"]]
+
+[codex]
+command = ["codex"]
+implementer_sandbox = "workspace-write"
+reviewer_sandbox = "read-only"
+ephemeral = true
+
+[context_maintenance]
+enabled = true
+idle_compaction_threshold = 0.45
+max_compactions_per_worker_run = 1
+min_tokens_since_last_compaction = 20000
+rehydrate_after_compaction = true
