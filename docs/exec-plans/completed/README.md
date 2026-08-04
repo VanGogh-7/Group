@@ -28,3 +28,7 @@ code, tests, architecture, or quality documentation.
   completed bounded local release preparation with accepted independent review;
   hosted CI, a clean committed candidate, and remote release gates remain
   blocked.
+- [023 Clean v0.1.0 Release-Candidate Verification](023-clean-v0.1.0-release-candidate-verification.md)
+  - verified the exact clean candidate, successful hosted CI, full local gates,
+    and all eight package archives with accepted independent review; tag,
+    publication/index, and fresh-consumer gates remain separately authorized.

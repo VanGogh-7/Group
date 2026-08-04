@@ -12,4 +12,4 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 ## Plans
 
-There are currently no active Execution Plans.
+No active Plans.

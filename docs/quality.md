@@ -32,34 +32,37 @@ make Prebuilt stable or make the repository production-ready.
 
 ## Release blockers
 
-The diagnostic dirty-tree preflight passed for all eight local archives:
-generation, package lists, safe extraction, normalized manifests, internal
-edges, byte-identical licenses, intended contents, and filename-only secret
-screening were inspected. This evidence is bound to the recorded dirty inputs
-and local command-line dependency patches; it is not a clean-candidate or
-crates.io-resolution result.
+The exact clean candidate
+`9b069d430cae02e74134f37edb8d05b83c2cc6c7` passed `./scripts/verify all` and
+the eight-archive Phase 2 package audit. All archives were generated without
+`--allow-dirty` in dependency order and passed package-list, safe-extraction,
+regular-file, normalized-manifest, internal-edge, README, byte-identical
+license, intended-content, and filename-only secret-indicator checks. The one
+indicator hit, `group-agent-genai/src/error.rs`, contains expected
+authentication error identifiers and no credential value. The candidate
+remained clean; non-persistent command-line patches were not written to any
+manifest.
+
+GitHub Actions run `30848946632` completed successfully for that exact SHA.
+Both `Full workspace (Rust 1.88)` and `Layered MSRV (Rust 1.85 and 1.88)`
+succeeded. This establishes hosted CI for the bounded candidate, not a release
+or crates.io-resolution result.
 
 The following still block a responsible public v0.1.0 release:
 
-- a clean committed release candidate has not passed its package and
-  verification gate;
-- CI is not established because the workflow has not completed its first
-  successful GitHub-hosted full-workspace and layered-MSRV run;
 - no v0.1.0 release tag has been separately authorized or prepared;
 - the eight crates have not been published in dependency order or verified in
   the crates.io index; and
 - no fresh consumer has resolved and built all eight exact `0.1.0` versions
   from crates.io.
 
-Plan 022 has locally resolved the metadata, portable license, internal
-path-plus-version, SQLite benchmark teardown, production logging guidance,
-manual release procedure, and diagnostic eight-archive preflight items. Its
-strict full and layered-MSRV gates passed, and its GitHub Actions workflow
-source is locally validated, but that is not hosted CI evidence. Plan 022 is
-completed and has moved to [completed plans](exec-plans/completed/022-v0.1.0-release-readiness.md)
-after accepted independent review; it is not in review. See the
-[Release Runbook](runbooks/release.md) for the pending clean committed
-candidate, hosted CI, tag, publication/index, and fresh-consumer gates.
+Plan 022 completed the metadata, portable license, internal path-plus-version,
+SQLite benchmark teardown, production logging guidance, release procedure, and
+diagnostic dirty-tree preflight work. Plan 023 records the clean candidate,
+hosted CI, full verification, and clean eight-archive evidence. Neither Plan
+authorizes a tag, GitHub Release, `cargo publish`, or registry credential use.
+See the [Release Runbook](runbooks/release.md) for the separately authorized
+tag, publication/index, and fresh-consumer gates.
 
 ## Stage 21 relationship
 
