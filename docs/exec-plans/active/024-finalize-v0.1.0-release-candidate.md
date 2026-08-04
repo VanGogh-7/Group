@@ -135,8 +135,8 @@ implementation blockers.
 
 ### Slice T3.2: Cut and verify the immutable final candidate
 
-- [ ] After explicit authorization, create and push one candidate commit from the
-  accepted T3.1 worktree and record its exact SHA.
+- [ ] After explicit authorization, create and push the corrected candidate commit
+  from the accepted T3.1 worktree and record its exact SHA.
 - [ ] Create a fresh detached external checkout at that SHA and prove clean status
   before and after every accepted gate.
 - [ ] Run `./scripts/verify all` for the exact candidate and retain bounded raw
@@ -217,11 +217,20 @@ Stop and request direction if:
 | 2026-08-04 | Synchronize protected `PROJECT_STATE.md` prose through `harness sync-project-state`. | The approved T3.1 criterion must be satisfied without manual writes or weakening the protected-state baseline. |
 | 2026-08-04 | Treat pending gates and review as post-handoff work, not Implementer blockers. | Harness runs those steps only after accepting a completed Implementer handoff. |
 | 2026-08-04 | Keep T2 evidence SHA-bound. | README is a package input. |
+| 2026-08-05 | Bind T3.2 verification to candidate `512c187e2c08a78d39a35e623fa0df8e2d66f3f2`. | `HEAD` and `origin/master` match the explicitly authorized candidate commit; all later verification and future tag-target evidence must use this SHA. |
+| 2026-08-05 | Supersede `512c187e2c08a78d39a35e623fa0df8e2d66f3f2` before tagging. | Final review found that its release-facing README and quality ledger still described the final candidate as pending; its evidence remains historical and cannot authorize a tag. |
 
 ## Review findings
 
-No independent review has occurred for this Stage. Codex B must emit a
-standalone read-only report after the required deterministic gates pass.
+The first final independent review requested four evidence corrections: retain
+the successful host `verify all` result, the complete eight-archive audit, exact-
+SHA hosted-CI JSON, and a temporally accurate checkout-cleanliness statement.
+The evidence and prose corrections below address those findings. Final rereview
+after refreshed deterministic gates remains pending. A later rereview accepted
+the host verification, package audit, and hosted-CI evidence but rejected
+`512c187e2c08a78d39a35e623fa0df8e2d66f3f2` because its release-facing status
+remained stale and external no-release-side-effect evidence was incomplete. The
+User authorized a corrected candidate commit and complete evidence rebinding.
 
 ## Completion evidence
 
@@ -250,3 +259,99 @@ Stage completion evidence remains pending. Record the final candidate SHA,
 before/after worktree state, actual commands and outcomes, retained evidence
 path and checksum manifest, hosted-CI source JSON, review disposition, skipped
 checks, and remaining Phase 3 risks.
+
+Slice T3.2 attempt 2 confirmed that the Orchestrator-created and pushed
+candidate commit is
+`512c187e2c08a78d39a35e623fa0df8e2d66f3f2`: primary-worktree `HEAD`,
+`origin/master`, detached-checkout `HEAD`, and detached-checkout
+`origin/master` all resolved to that exact SHA. The primary worktree already
+contained an unrelated protected `.harness/state.json` modification, which the
+Implementer preserved without reading or editing. A fresh owner-only standalone
+local clone was detached at the candidate under
+`/home/van-gogh/project/Rust_code/Group/target/t3-release-artifacts/candidate.fCWkU2`.
+The retained status captures prove that the checkout was clean before and after
+the `./scripts/verify all` attempt and after the later package-list checks. The
+failed package-audit path did not retain an immediate post-failure status
+capture, so no stronger per-command cleanliness claim is made for that attempt.
+
+Bounded evidence is retained owner-only at
+`/home/van-gogh/project/Rust_code/Group/target/t3-release-artifacts/evidence.sHbvPD`
+through final Harness gates and independent review; the Orchestrator may remove
+only these exact candidate and evidence directories after Stage disposition.
+`TMPDIR=/tmp ./scripts/verify all` reached the offline Genai continuation test
+and exited `101` only because the Codex sandbox denied loopback server creation
+with `Operation not permitted`. Clean package generation without
+`--allow-dirty` then exited `101` because the network-isolated sandbox could not
+resolve `index.crates.io`; no archive result is accepted from that attempt.
+These execution-boundary results require the Plan-assigned Orchestrator host
+reruns and are not classified as candidate failures or passing evidence. All
+eight `cargo package --locked -p <crate> --list` commands passed in fixed order,
+focused Markdown lint reported zero issues, `git diff --check` passed, and
+`./scripts/verify fast` passed. The retained final status capture was clean.
+The Implementer retained command logs, exit codes, identity, the available
+bounded status captures, the adapted package-audit script, and all eight
+package lists. The diagnostic evidence inventory and its checksum manifest
+passed `sha256sum -c`; their final inventory contains 48 files, and the
+manifest SHA-256 is
+`0d6f57205d6af40d65b2f63afb694ddd3932fe01f40657ea20a91b552048061a`.
+The successful host `./scripts/verify all`, complete eight-archive audit,
+archive hashes and complete accepted-evidence checksum manifest,
+original-source hosted-CI JSON for the exact candidate, Harness gates, and
+independent review remain Orchestrator-owned post-handoff work and must be
+added before Stage completion.
+
+Slice T3.2 attempt 3 resolved the reviewer's medium evidence-overstatement
+finding by narrowing the checkout-cleanliness prose to the retained status
+captures and explicitly recording the missing immediate post-failure capture.
+The detached checkout was still clean at the candidate SHA, all 48 retained
+diagnostic files again passed `sha256sum -c evidence.sha256`, focused Markdown
+lint reported zero issues, `git diff --check` passed, and
+`./scripts/verify fast` passed. No candidate, archive, hosted-CI, tag, or
+publication identity was changed.
+
+The Orchestrator then completed and retained the host-owned acceptance evidence
+at `/tmp/group-t3.2-evidence.FoKnCx`, an owner-only mode-0700 directory retained
+by the local `van-gogh` user through Stage approval and closure reporting. Its
+final root manifest covers 262 files, passes `sha256sum -c evidence.sha256`, and
+has SHA-256
+`733d3648a45472c3a831f86f6e4e1607a3e6fe5828857b2c599bec9fba05f2d3`.
+The nested package-audit manifest also passes independently.
+
+In a fresh detached checkout at
+`512c187e2c08a78d39a35e623fa0df8e2d66f3f2`, the host reran
+`./scripts/verify all` with `CARGO_BUILD_JOBS=2` and a disk-backed `TMPDIR`; the
+accepted rerun exited 0 and ended with `verification mode 'all' passed`. Raw
+output, exit status, candidate identity, empty post-run `git status --short`,
+and passing post-run `git diff --check` are retained. An earlier host attempt is
+retained only as diagnostic evidence: it failed when the linker received
+`SIGBUS` while tmpfs and swap were exhausted. After disposable candidate build
+directories were removed and `TMPDIR` moved to disk, the focused MCP doctest and
+the complete rerun passed. The failure is not accepted as product evidence.
+
+The accepted package audit contains all eight clean archives built without
+`--allow-dirty`, their SHA-256 hashes, extracted trees, package lists,
+normalized-manifest and internal-dependency checks, README and license checks,
+intended-content checks, safe-path and regular-file checks, and filename-only
+secret-indicator results. The only indicator was the expected
+`group-agent-genai/src/error.rs` identifier and has a retained safe disposition.
+The audit report records `status = passed`, candidate-clean before and after,
+and candidate SHA
+`512c187e2c08a78d39a35e623fa0df8e2d66f3f2`.
+
+Original-source GitHub Actions JSON is retained as
+`hosted-ci-30935008094.json`. Run
+`https://github.com/VanGogh-7/Group/actions/runs/30935008094` completed
+successfully for the exact candidate SHA. Both required jobs passed:
+`Full workspace (Rust 1.88)` and
+`Layered MSRV (Rust 1.85 and 1.88)`. For the superseded candidate, Git identity,
+archive source, and hosted CI all bound to
+`512c187e2c08a78d39a35e623fa0df8e2d66f3f2`. Final review rejected that SHA
+as the future tag target because its own release-facing status was stale. Its
+evidence remains historical and must not be reused for the corrected candidate.
+
+After the Human Checkpoint, the User explicitly authorized corrections to
+`README.md` and `docs/quality.md`, creation and push of a new candidate commit,
+and complete T3.2 rebinding. Before that operation, the Orchestrator retained
+raw remote-tag, GitHub Release, and crates.io sparse-index state in the
+owner-only `/tmp/group-t3.2-evidence-v2.G90zjS` directory. Corrected-candidate
+identity and all acceptance evidence remain pending.

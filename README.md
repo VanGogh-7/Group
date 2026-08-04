@@ -23,12 +23,13 @@ compatibility commitment.
 Phase 2 release preparation was completed for the historical clean candidate
 `9b069d430cae02e74134f37edb8d05b83c2cc6c7`: the full local verification
 matrix, all eight clean package-archive audits, and both required hosted CI jobs
-passed for that exact commit. This README changed afterward, so that evidence
-is not evidence for the future final candidate. A new exact-SHA candidate must
-repeat those gates before it can become the sole proposed `v0.1.0` tag target.
-The tag, dependency-ordered crates.io publication and index checks, and fresh
-exact-version consumer verification also remain pending and separately
-authorized. See [Quality and Release Status](docs/quality.md).
+passed for that exact commit. For any later candidate containing this README,
+acceptance requires those same gates to bind Git identity, archive source,
+hosted CI, and the proposed tag target to one exact SHA. Plan 024 records whether
+that condition has been met and identifies the sole proposed `v0.1.0` tag
+target. The tag, dependency-ordered crates.io publication and index checks, and
+fresh exact-version consumer verification remain separately authorized. See
+[Quality and Release Status](docs/quality.md).
 
 ## Core capabilities
 
@@ -379,10 +380,11 @@ locally prepared.
 The diagnostic dirty-tree preflight passed for all eight local package
 archives. Phase 2 then passed the full local matrix, all eight clean archive
 audits, and both required hosted CI jobs for historical candidate `9b069d4`.
-Because this release-facing README changed afterward, a new exact-SHA final
-candidate must repeat those gates. Tag preparation, ordered crates.io
-publication/index verification, and a fresh exact-version registry consumer
-also remain pending and separately authorized. See the
+Every later candidate containing this README must bind the same gates to its own
+exact SHA; Plan 024 is the authoritative record of the accepted candidate and
+its evidence. Tag preparation, ordered crates.io publication/index
+verification, and a fresh exact-version registry consumer remain pending and
+separately authorized. See the
 [Release Runbook](docs/runbooks/release.md) for the distinct evidence boundaries,
 phases, and stop conditions.
 

@@ -49,15 +49,15 @@ succeeded. This establishes hosted CI for that bounded historical candidate,
 not for a later commit, a release, or a crates.io-resolution result.
 
 The release-facing README changed after that evidence was recorded. Under the
-Release Runbook's identity rule, the future final candidate must therefore be a
-new commit and must repeat the full local matrix, eight-archive clean audit,
-and both hosted CI jobs for its exact SHA. Until those T3.2 gates pass, no SHA
-is the sole proposed `v0.1.0` tag target.
+Release Runbook's identity rule, any later final candidate must repeat the full
+local matrix, eight-archive clean audit, and both hosted CI jobs for its exact
+SHA. Plan 024 is the authoritative record of whether those T3.2 gates passed and
+which SHA is the sole proposed `v0.1.0` tag target.
 
-The following still block a responsible public v0.1.0 release:
+The following conditions are required for a responsible public v0.1.0 release:
 
-- no immutable final candidate has yet bound Git identity, archive source,
-  full local verification, hosted CI, and the proposed tag target to one SHA;
+- Plan 024 must bind one immutable candidate's Git identity, archive source,
+  full local verification, hosted CI, and proposed tag target to one SHA;
 - no v0.1.0 release tag has been separately authorized or prepared;
 - the eight crates have not been published in dependency order or verified in
   the crates.io index; and
@@ -68,8 +68,8 @@ Plan 022 completed the metadata, portable license, internal path-plus-version,
 SQLite benchmark teardown, production logging guidance, release procedure, and
 diagnostic dirty-tree preflight work. Plan 023 records the clean candidate,
 hosted CI, full verification, and clean eight-archive evidence for `9b069d4`.
-Plan 024 prepares and re-verifies the later final candidate without relabeling
-the Plan 023 evidence. None of these Plans authorizes a tag, GitHub Release,
+Plan 024 prepares and verifies the later final candidate without relabeling the
+Plan 023 evidence. None of these Plans authorizes a tag, GitHub Release,
 `cargo publish`, or registry credential use. See the
 [Release Runbook](runbooks/release.md) for the exact-candidate rule and the
 separately authorized tag, publication/index, and fresh-consumer gates.
