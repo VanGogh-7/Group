@@ -30,9 +30,9 @@ The repository contains an experimental non-streaming prebuilt Tool-calling
 loop over the stable Core, Model, and Tool boundaries. This capability does not
 make Prebuilt stable or make the repository production-ready.
 
-## Release blockers
+## Release evidence and blockers
 
-The exact clean candidate
+The historical Phase 2 clean candidate
 `9b069d430cae02e74134f37edb8d05b83c2cc6c7` passed `./scripts/verify all` and
 the eight-archive Phase 2 package audit. All archives were generated without
 `--allow-dirty` in dependency order and passed package-list, safe-extraction,
@@ -45,11 +45,19 @@ manifest.
 
 GitHub Actions run `30848946632` completed successfully for that exact SHA.
 Both `Full workspace (Rust 1.88)` and `Layered MSRV (Rust 1.85 and 1.88)`
-succeeded. This establishes hosted CI for the bounded candidate, not a release
-or crates.io-resolution result.
+succeeded. This establishes hosted CI for that bounded historical candidate,
+not for a later commit, a release, or a crates.io-resolution result.
+
+The release-facing README changed after that evidence was recorded. Under the
+Release Runbook's identity rule, the future final candidate must therefore be a
+new commit and must repeat the full local matrix, eight-archive clean audit,
+and both hosted CI jobs for its exact SHA. Until those T3.2 gates pass, no SHA
+is the sole proposed `v0.1.0` tag target.
 
 The following still block a responsible public v0.1.0 release:
 
+- no immutable final candidate has yet bound Git identity, archive source,
+  full local verification, hosted CI, and the proposed tag target to one SHA;
 - no v0.1.0 release tag has been separately authorized or prepared;
 - the eight crates have not been published in dependency order or verified in
   the crates.io index; and
@@ -59,10 +67,12 @@ The following still block a responsible public v0.1.0 release:
 Plan 022 completed the metadata, portable license, internal path-plus-version,
 SQLite benchmark teardown, production logging guidance, release procedure, and
 diagnostic dirty-tree preflight work. Plan 023 records the clean candidate,
-hosted CI, full verification, and clean eight-archive evidence. Neither Plan
-authorizes a tag, GitHub Release, `cargo publish`, or registry credential use.
-See the [Release Runbook](runbooks/release.md) for the separately authorized
-tag, publication/index, and fresh-consumer gates.
+hosted CI, full verification, and clean eight-archive evidence for `9b069d4`.
+Plan 024 prepares and re-verifies the later final candidate without relabeling
+the Plan 023 evidence. None of these Plans authorizes a tag, GitHub Release,
+`cargo publish`, or registry credential use. See the
+[Release Runbook](runbooks/release.md) for the exact-candidate rule and the
+separately authorized tag, publication/index, and fresh-consumer gates.
 
 ## Stage 21 relationship
 

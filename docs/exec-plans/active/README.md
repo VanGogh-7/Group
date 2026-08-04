@@ -12,4 +12,7 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 ## Plans
 
-No active Plans.
+- [024 Finalize v0.1.0 Release Content and Candidate Identity](024-finalize-v0.1.0-release-candidate.md)
+  - reconciles release-facing documentation, selects one immutable candidate,
+    and binds clean local, package, hosted-CI, and review evidence to its exact
+    SHA without performing release-side effects.

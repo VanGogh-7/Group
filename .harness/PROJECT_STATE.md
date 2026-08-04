@@ -6,7 +6,7 @@ Initialized: 2026-08-03T06:10:07+00:00
 
 ## Current status
 
-Harness initialized; no Stage approved.
+Active Stage T3 / Slice T3.2: Finalize v0.1.0 Release Content and Candidate Identity.
 
 ## Completed Stage T1
 

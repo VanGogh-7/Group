@@ -1,12 +1,3 @@
-# Current Stage
-
-- Stage: T3
-- Title: Finalize v0.1.0 Release Content and Candidate Identity
-- Current Slice: T3.2
-- Approved: 2026-08-04T11:15:02+00:00
-
-## Plan and acceptance criteria
-
 # 024 Finalize v0.1.0 Release Content and Candidate Identity
 
 ## Status

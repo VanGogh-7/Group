@@ -18,8 +18,17 @@ are coupled to fixed upstream releases and evolving protocol behavior.
 
 The repository now also contains the experimental `group-agent-prebuilt`
 non-streaming Tool-calling loop. Its public API is not yet a stable
-compatibility commitment. The repository is not ready for a public v0.1.0
-release; see [Quality and Release Status](docs/quality.md).
+compatibility commitment.
+
+Phase 2 release preparation was completed for the historical clean candidate
+`9b069d430cae02e74134f37edb8d05b83c2cc6c7`: the full local verification
+matrix, all eight clean package-archive audits, and both required hosted CI jobs
+passed for that exact commit. This README changed afterward, so that evidence
+is not evidence for the future final candidate. A new exact-SHA candidate must
+repeat those gates before it can become the sole proposed `v0.1.0` tag target.
+The tag, dependency-ordered crates.io publication and index checks, and fresh
+exact-version consumer verification also remain pending and separately
+authorized. See [Quality and Release Status](docs/quality.md).
 
 ## Core capabilities
 
@@ -368,14 +377,14 @@ boundary, production tracing guidance, and manual release procedure are also
 locally prepared.
 
 The diagnostic dirty-tree preflight passed for all eight local package
-archives. That evidence remains bound to the recorded local dirty inputs and
-non-persistent command-line Cargo patches; it is not a clean release-candidate
-or crates.io-resolution result. A later clean committed-candidate package
-gate, the first successful hosted CI run, tag preparation, ordered crates.io
+archives. Phase 2 then passed the full local matrix, all eight clean archive
+audits, and both required hosted CI jobs for historical candidate `9b069d4`.
+Because this release-facing README changed afterward, a new exact-SHA final
+candidate must repeat those gates. Tag preparation, ordered crates.io
 publication/index verification, and a fresh exact-version registry consumer
-all remain blocked behind their required authorization and evidence. See the
-[Release Runbook](docs/runbooks/release.md) for the distinct phases and stop
-conditions.
+also remain pending and separately authorized. See the
+[Release Runbook](docs/runbooks/release.md) for the distinct evidence boundaries,
+phases, and stop conditions.
 
 The manifest version must not be interpreted as evidence that v0.1.0 has been
 published or is ready.

@@ -28,6 +28,12 @@ Release Runbook. It does not authorize or perform a tag, GitHub Release,
 crates.io publication, registry ownership operation, or fresh registry consumer
 verification.
 
+This evidence remains historically valid only for
+`9b069d430cae02e74134f37edb8d05b83c2cc6c7`. The release-facing README changed
+after this Plan completed, so Plan 024 must select and repeat Phase 2 for a new
+exact-SHA final candidate. Nothing in this Plan establishes a later commit as
+the proposed tag target.
+
 ## Non-goals
 
 - Change production code, tests, public APIs, dependency versions, features,

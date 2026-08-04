@@ -13,6 +13,17 @@ diff, shell history, log, archive, or report. Authentication belongs in the
 operator's preconfigured credential store and is not exercised by the current
 Plan.
 
+## Current evidence boundary
+
+Plan 023 completed Phase 2 for commit
+`9b069d430cae02e74134f37edb8d05b83c2cc6c7`: the full local matrix, eight clean
+archives, and both required hosted CI jobs passed for that exact SHA. Later
+release-facing README changes are package-input changes, so that evidence must
+remain historical and cannot establish the final candidate. Plan 024 must bind
+a new immutable candidate commit, archive source, local verification, hosted
+CI, and sole proposed `v0.1.0` tag target to one identical SHA before Phase 3
+can be considered. Phase 3 remains separately authorized and unperformed.
+
 ## Fixed crate order
 
 Use this exact order, including between crates that could otherwise be
