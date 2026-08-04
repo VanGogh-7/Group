@@ -135,22 +135,22 @@ implementation blockers.
 
 ### Slice T3.2: Cut and verify the immutable final candidate
 
-- [ ] After explicit authorization, create and push the corrected candidate commit
+- [x] After explicit authorization, create and push the corrected candidate commit
   from the accepted T3.1 worktree and record its exact SHA.
-- [ ] Create a fresh detached external checkout at that SHA and prove clean status
+- [x] Create a fresh detached external checkout at that SHA and prove clean status
   before and after every accepted gate.
-- [ ] Run `./scripts/verify all` for the exact candidate and retain bounded raw
+- [x] Run `./scripts/verify all` for the exact candidate and retain bounded raw
   evidence.
-- [ ] Repeat all eight clean package-list, archive, extraction,
+- [x] Repeat all eight clean package-list, archive, extraction,
   normalized-manifest, dependency-edge, README, license, intended-content, and
   filename-only secret-indicator checks without `--allow-dirty`.
-- [ ] Record archive hashes and a complete checksum manifest in an owner-only
+- [x] Record archive hashes and a complete checksum manifest in an owner-only
   evidence directory with an explicit retention disposition.
-- [ ] Require successful hosted full-workspace and layered-MSRV jobs for the
+- [x] Require successful hosted full-workspace and layered-MSRV jobs for the
   exact candidate SHA.
 - [ ] Run Harness fast, Slice, and Stage gates and obtain final independent
   read-only review.
-- [ ] Record the immutable candidate SHA as the sole future `v0.1.0` tag target;
+- [x] Record the immutable candidate SHA as the sole future `v0.1.0` tag target;
   perform no tag, publication, GitHub Release, credential use, or registry
   consumer operation.
 
@@ -158,16 +158,16 @@ implementation blockers.
 
 - [x] README, quality ledger, completed Plans, and Release Runbook accurately
   distinguish completed Phase 2 evidence from pending Phase 3 work.
-- [ ] One exact immutable candidate SHA is recorded as the sole future tag target.
-- [ ] Candidate SHA, archive source, hosted CI, and proposed tag target match.
-- [ ] `./scripts/verify all` passes for the exact final candidate.
-- [ ] Both required hosted CI jobs pass for the exact final candidate.
-- [ ] All eight clean archives pass the complete release audit and have retained
+- [x] One exact immutable candidate SHA is recorded as the sole future tag target.
+- [x] Candidate SHA, archive source, hosted CI, and proposed tag target match.
+- [x] `./scripts/verify all` passes for the exact final candidate.
+- [x] Both required hosted CI jobs pass for the exact final candidate.
+- [x] All eight clean archives pass the complete release audit and have retained
   hashes and checksummed evidence.
-- [ ] Candidate checkout remains clean before and after all accepted commands.
-- [ ] No production code, tests, APIs, manifests, dependencies, lockfile, or
+- [x] Candidate checkout remains clean before and after all accepted commands.
+- [x] No production code, tests, APIs, manifests, dependencies, lockfile, or
   package behavior changes are introduced.
-- [ ] No tag, GitHub Release, crates.io publication, registry authentication, or
+- [x] No tag, GitHub Release, crates.io publication, registry authentication, or
   fresh registry consumer operation occurs.
 - [ ] Harness Stage gates and independent review pass with no unresolved finding.
 
@@ -219,6 +219,7 @@ Stop and request direction if:
 | 2026-08-04 | Keep T2 evidence SHA-bound. | README is a package input. |
 | 2026-08-05 | Bind T3.2 verification to candidate `512c187e2c08a78d39a35e623fa0df8e2d66f3f2`. | `HEAD` and `origin/master` match the explicitly authorized candidate commit; all later verification and future tag-target evidence must use this SHA. |
 | 2026-08-05 | Supersede `512c187e2c08a78d39a35e623fa0df8e2d66f3f2` before tagging. | Final review found that its release-facing README and quality ledger still described the final candidate as pending; its evidence remains historical and cannot authorize a tag. |
+| 2026-08-05 | Select corrected candidate `0cb9b9c334320c6e39881d5b14b7ca2122021d81` as the sole future `v0.1.0` tag target. | The explicitly authorized commit contains time-stable release status, is pushed as `origin/master`, and has complete SHA-bound local, archive, hosted-CI, and external-state evidence. |
 
 ## Review findings
 
@@ -353,5 +354,33 @@ After the Human Checkpoint, the User explicitly authorized corrections to
 `README.md` and `docs/quality.md`, creation and push of a new candidate commit,
 and complete T3.2 rebinding. Before that operation, the Orchestrator retained
 raw remote-tag, GitHub Release, and crates.io sparse-index state in the
-owner-only `/tmp/group-t3.2-evidence-v2.G90zjS` directory. Corrected-candidate
-identity and all acceptance evidence remain pending.
+owner-only `/tmp/group-t3.2-evidence-v2.G90zjS` directory. The resulting
+corrected-candidate identity and acceptance evidence are recorded below.
+
+The corrected and pushed candidate is
+`0cb9b9c334320c6e39881d5b14b7ca2122021d81`; candidate `HEAD`, candidate
+`origin/master`, primary `HEAD`, and primary `origin/master` all resolved to
+that SHA. A fresh detached checkout at
+`/tmp/group-t3.2-candidate-v2.btgqdU` remained clean before and after every
+accepted operation.
+
+With `CARGO_BUILD_JOBS=2`, target directory
+`/home/van-gogh/project/Rust_code/Group/target/t3-2-0cb9b9c`, and disk-backed
+`TMPDIR=/home/van-gogh/.cache/group-t3-host-tmp`, `./scripts/verify all` exited
+0 and ended with `verification mode 'all' passed`. The complete eight-package
+audit then passed without `--allow-dirty`; all archives bind to the corrected
+candidate and the only filename indicator remains the expected
+`group-agent-genai/src/error.rs` authentication identifier.
+
+GitHub Actions run `30943603111` completed successfully for the exact corrected
+candidate. Its required `Full workspace (Rust 1.88)` and
+`Layered MSRV (Rust 1.85 and 1.88)` jobs both passed. Original-source before and
+after evidence also records no remote tags, no GitHub Releases, and HTTP 404
+from the crates.io sparse index for all eight package names. No tag, release,
+publication, registry authentication, or fresh consumer operation occurred.
+
+All corrected-candidate evidence is retained owner-only at
+`/tmp/group-t3.2-evidence-v2.G90zjS`. The root checksum manifest covers 320
+files, passes `sha256sum -c`, and has SHA-256
+`c078cf0f1cdedb04b6a254959763c1a7a1fe5d263c6c68da6957439158ec266b`.
+Harness gates and final independent review remain pending.
