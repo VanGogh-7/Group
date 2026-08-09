@@ -33,6 +33,32 @@ adapter_argv = ["python3", "{skill_root}/adapters/codex_cli.py"]
 ephemeral = true
 
 [agent_runtime.models]
+implementer = "gpt-5.6-terra"
+reviewer = "gpt-5.6-sol"
+tester = "gpt-5.6-terra"
+security_reviewer = "gpt-5.6-sol"
+verifier = "gpt-5.6-sol"
+explorer = "gpt-5.6-luna"
+researcher = "gpt-5.6-terra"
+test_triage = "gpt-5.6-luna"
+log_triage = "gpt-5.6-luna"
+architecture_analyst = "gpt-5.6-terra"
+auditor = "gpt-5.6-sol"
+final_lifecycle_reviewer = "gpt-5.6-sol"
+
+[agent_runtime.reasoning_efforts]
+implementer = "xhigh"
+reviewer = "medium"
+tester = "xhigh"
+security_reviewer = "medium"
+verifier = "medium"
+explorer = "xhigh"
+researcher = "xhigh"
+test_triage = "xhigh"
+log_triage = "xhigh"
+architecture_analyst = "xhigh"
+auditor = "medium"
+final_lifecycle_reviewer = "medium"
 
 [language]
 internal_language = "en"
