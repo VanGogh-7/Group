@@ -31,6 +31,8 @@ stage = [["./scripts/verify", "full"]]
 [agent_runtime]
 adapter_argv = ["python3", "{skill_root}/adapters/codex_cli.py"]
 ephemeral = true
+preflight_argv = []
+preflight_timeout_seconds = 60
 
 [agent_runtime.models]
 implementer = "gpt-5.6-terra"
@@ -47,7 +49,7 @@ auditor = "gpt-5.6-sol"
 final_lifecycle_reviewer = "gpt-5.6-sol"
 
 [agent_runtime.reasoning_efforts]
-implementer = "xhigh"
+implementer = "ultra"
 reviewer = "medium"
 tester = "xhigh"
 security_reviewer = "medium"

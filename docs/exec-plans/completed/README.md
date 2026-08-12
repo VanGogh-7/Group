@@ -32,3 +32,7 @@ code, tests, architecture, or quality documentation.
   - verified the exact clean candidate, successful hosted CI, full local gates,
     and all eight package archives with accepted independent review; tag,
     publication/index, and fresh-consumer gates remain separately authorized.
+- [024 Finalize v0.1.0 Release Content and Candidate Identity](024-finalize-v0.1.0-release-candidate.md)
+  - finalized the immutable release candidate, completed migrated Harness 1.0
+    gates and independent review, and retained tag and publication as separately
+    authorized operations.

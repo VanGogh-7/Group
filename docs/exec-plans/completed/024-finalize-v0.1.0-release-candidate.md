@@ -2,15 +2,15 @@
 
 ## Status
 
-Approved by the User on 2026-08-04. In Progress.
+Approved by the User on 2026-08-04. Completed on 2026-08-12.
 
 - [x] Baseline recorded.
 - [x] Design reviewed and approved by the User.
-- [ ] Slices implemented.
-- [ ] Verification passed.
-- [ ] Independent review completed.
-- [ ] Review accepted and written back by a write-authorized role.
-- [ ] Completion evidence recorded.
+- [x] Slices implemented.
+- [x] Verification passed.
+- [x] Independent review completed.
+- [x] Review accepted and written back by a write-authorized role.
+- [x] Completion evidence recorded.
 
 ## Goal
 
@@ -122,8 +122,8 @@ target as the immutable verified candidate SHA.
 - [x] Keep changes documentation-only; do not alter package inputs other than the
   root README that is intentionally release-facing.
 - [x] Run focused documentation checks.
-- [ ] Run configured Harness fast and Slice gates.
-- [ ] Obtain independent read-only review with no unresolved finding.
+- [x] Run configured Harness fast and Slice gates.
+- [x] Obtain independent read-only review with no unresolved finding.
 - [x] Stop before commit or push unless the User separately authorizes both.
 
 Configured gates and independent review are Orchestrator-owned post-handoff
@@ -148,7 +148,7 @@ implementation blockers.
   evidence directory with an explicit retention disposition.
 - [x] Require successful hosted full-workspace and layered-MSRV jobs for the
   exact candidate SHA.
-- [ ] Run Harness fast, Slice, and Stage gates and obtain final independent
+- [x] Run Harness fast, Slice, and Stage gates and obtain final independent
   read-only review.
 - [x] Record the immutable candidate SHA as the sole future `v0.1.0` tag target;
   perform no tag, publication, GitHub Release, credential use, or registry
@@ -169,7 +169,7 @@ implementation blockers.
   package behavior changes are introduced.
 - [x] No tag, GitHub Release, crates.io publication, registry authentication, or
   fresh registry consumer operation occurs.
-- [ ] Harness Stage gates and independent review pass with no unresolved finding.
+- [x] Harness Stage gates and independent review pass with no unresolved finding.
 
 ## Verification
 
@@ -383,4 +383,21 @@ All corrected-candidate evidence is retained owner-only at
 `/tmp/group-t3.2-evidence-v2.G90zjS`. The root checksum manifest covers 320
 files, passes `sha256sum -c`, and has SHA-256
 `c078cf0f1cdedb04b6a254959763c1a7a1fe5d263c6c68da6957439158ec266b`.
-Harness gates and final independent review remain pending.
+The migrated Harness 1.0 closure run used base
+`022728914dec268abc3b5f0e94a12d9f8eab94d4` and candidate
+`candidate-v1:25bcb77d2a45c70782dd76cbd4ffd0ed71417ec7e66130f63271c13bbb9a8c93`.
+The Implementer completed without product-code changes. The configured Stage
+gate (`./scripts/verify full`) passed with `CARGO_BUILD_JOBS=2` and a disk-backed
+`TMPDIR`. The independent Correctness Reviewer raised three candidate-boundary
+hypotheses; the independent Tester raised no finding. The Verifier rejected all
+three reviewer hypotheses because they conflated the current Harness migration
+candidate with the separately immutable release target and treated canonical
+Harness control-file mutations as release-content mutations. It recorded zero
+confirmed, inconclusive, or flaky/infra findings and approved the candidate.
+`harness approve-slice --complete-stage` then transitioned the Stage to
+`STAGE_COMPLETED` on 2026-08-12.
+
+This closure does not alter the sole future `v0.1.0` tag target:
+`0cb9b9c334320c6e39881d5b14b7ca2122021d81`. It performed no tag, GitHub
+Release, crates.io publication, registry authentication, or fresh-consumer
+operation. Those release-side effects remain separately authorized work.

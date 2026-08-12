@@ -1,28 +1,247 @@
 {
-  "attempt": 0,
-  "base_sha": null,
-  "candidate_id": null,
+  "assessor_findings": {
+    "reviewer": [
+      {
+        "blocking_recommendation": true,
+        "category": "candidate_identity",
+        "confidence": "high",
+        "evidence": "Read-only Git inspection returned HEAD/base 022728914dec268abc3b5f0e94a12d9f8eab94d4 and origin/master 930f94263a8412c8410e0c6fe904f3bdf117127d. The active Plan instead records 0cb9b9c334320c6e39881d5b14b7ca2122021d81 as the sole future v0.1.0 tag target and binds its accepted local/archive/CI evidence to that SHA. The log shows two later local commits after origin/master (e1b67c2 and 0227289), and origin/master itself is later than 0cb9b9c. Therefore, the current worktree/base named by this review is not the SHA whose T3.2 evidence is asserted, and it is not cleanly aligned with origin/master either. The exact-SHA invariant and acceptance evidence cannot be applied to candidate-v1 without a separately demonstrated binding.",
+        "id": "T3.2-CR-001",
+        "location": "Git identity and docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md:220-222,361-380",
+        "reproduction": [
+          "cd /home/van-gogh/project/Rust_code/Group",
+          "git rev-parse HEAD",
+          "git rev-parse origin/master",
+          "git log --oneline --decorate -6",
+          "rg -n \"sole future|0cb9b9c|corrected candidate\" docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md"
+        ],
+        "severity": "high",
+        "trigger": "Verify that the current reviewed candidate, archive source, hosted CI SHA, and sole proposed tag target are one exact immutable SHA."
+      },
+      {
+        "blocking_recommendation": true,
+        "category": "scope_and_cleanliness",
+        "confidence": "high",
+        "evidence": "`git status --short` reports four modified protected files: .harness/CURRENT_STAGE.md, .harness/PROJECT_STATE.md, .harness/config.toml, and .harness/state.json. `git diff --name-status 0227289` confirms all four differ from the stated base. The approved Slice requires a clean immutable candidate and lists these paths as protected. Even if these are expected Orchestrator runtime mutations, the supplied candidate represents the current worktree and no evidence in the candidate identity separates or excludes these modifications. Thus current-worktree cleanliness and candidate scope are not established.",
+        "id": "T3.2-CR-002",
+        "location": ".harness/CURRENT_STAGE.md, .harness/PROJECT_STATE.md, .harness/config.toml, .harness/state.json",
+        "reproduction": [
+          "cd /home/van-gogh/project/Rust_code/Group",
+          "git status --short",
+          "git diff --name-status 022728914dec268abc3b5f0e94a12d9f8eab94d4",
+          "git diff --stat 022728914dec268abc3b5f0e94a12d9f8eab94d4"
+        ],
+        "severity": "high",
+        "trigger": "Check the approved T3.2 requirement that the candidate checkout remain clean and that protected Harness state not be part of unauthorized candidate-content changes."
+      },
+      {
+        "blocking_recommendation": true,
+        "category": "evidence_provenance",
+        "confidence": "high",
+        "evidence": "The Plan claims hosted CI run 30943603111, complete accepted evidence under /tmp/group-t3.2-evidence-v2.G90zjS, no tags/releases/publications, and a checksum manifest for 0cb9b9c. This review could not corroborate the remote tag state live because `git ls-remote --tags origin refs/tags/v0.1.0` failed with DNS resolution disabled. More importantly, those assertions are explicitly bound to 0cb9b9c, not the supplied base/current HEAD 0227289 or candidate-v1 digest. Consequently they do not establish the external-state and CI acceptance criteria for the candidate under review.",
+        "id": "T3.2-CR-003",
+        "location": "docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md:355-380",
+        "reproduction": [
+          "cd /home/van-gogh/project/Rust_code/Group",
+          "git ls-remote --tags origin 'refs/tags/v0.1.0'",
+          "sed -n '355,390p' docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md",
+          "git rev-parse HEAD"
+        ],
+        "severity": "medium",
+        "trigger": "Validate external release-state and hosted-CI claims from evidence bound to the exact candidate under review, rather than accepting Plan prose."
+      }
+    ],
+    "tester": []
+  },
+  "attempt": 1,
+  "base_sha": "022728914dec268abc3b5f0e94a12d9f8eab94d4",
+  "candidate_id": "candidate-v1:25bcb77d2a45c70782dd76cbd4ffd0ed71417ec7e66130f63271c13bbb9a8c93",
   "checkpoint_epoch": 0,
-  "completed_assessments": [],
+  "completed_assessments": [
+    "reviewer",
+    "tester"
+  ],
   "created_at": "2026-08-09T05:16:44+00:00",
-  "evidence_counters": {},
-  "gate_level": null,
-  "gates_passed": false,
+  "evidence_counters": {
+    "confirmed": 0,
+    "flaky_or_infra": 0,
+    "inconclusive": 0,
+    "rejected": 3,
+    "reviewer_findings": 3,
+    "tester_findings": 0
+  },
+  "gate_level": "stage",
+  "gates_passed": true,
   "harness_version": "1.0.0",
-  "owner": null,
-  "recent_transitions": [],
-  "required_assessments": [],
-  "slice_id": null,
-  "stage_id": null,
-  "stage_title": null,
-  "state_revision": 0,
+  "owner": {
+    "claimed_at": "2026-08-12T10:18:32+00:00",
+    "generation": "987d9c97d4570ca9b4d4f8069f9d9713",
+    "identity": {
+      "executable": "/home/van-gogh/miniconda3/bin/python3.13",
+      "session_id": 91304,
+      "start_time": "206557"
+    },
+    "pid": 91304
+  },
+  "protected_baseline": {
+    "files": {
+      ".harness/CURRENT_STAGE.md": {
+        "digest": "ac65d0482b981776d5e85e862c9db6b385573bcef9f45ab3666de58651b95c57",
+        "kind": "sha256"
+      },
+      ".harness/PROJECT_STATE.md": {
+        "digest": "559d5981d04ee2da92862cde99a9719ab0460a29e09364dd7c2b350f9f8f5832",
+        "kind": "sha256"
+      },
+      ".harness/config.toml": {
+        "digest": "78beb674aebca76bd3e7e6edf7bcb9816719b8435e6fc21a52a50c0e3db2267e",
+        "kind": "sha256"
+      },
+      "AGENTS.md": {
+        "digest": "b4325df7f2f681321f66e82cc6b5cff53e05bfa65f6c11bfc57657ecc8c13b0e",
+        "kind": "sha256"
+      },
+      "ARCHITECTURE.md": {
+        "digest": "cc7c912b53bdb304f49005ed62479b56e463cbc0747d956b3fee6520a32ed6f2",
+        "kind": "sha256"
+      }
+    },
+    "git_head": "022728914dec268abc3b5f0e94a12d9f8eab94d4",
+    "git_metadata": {
+      "config": {
+        "digest": "80701a93af154f70b7c8c4e492f688d68eebfa45319e07859b6379efff63467a",
+        "kind": "sha256"
+      }
+    }
+  },
+  "recent_transitions": [
+    {
+      "at": "2026-08-12T09:56:13+00:00",
+      "from": "STAGE_DISCUSSION",
+      "reason": "user-approved Stage recorded",
+      "to": "STAGE_APPROVED"
+    },
+    {
+      "at": "2026-08-12T09:56:13+00:00",
+      "from": "STAGE_APPROVED",
+      "reason": "first approved Slice ready",
+      "to": "SLICE_READY"
+    },
+    {
+      "at": "2026-08-12T09:56:31+00:00",
+      "from": "SLICE_READY",
+      "reason": "Implementer launch",
+      "to": "IMPLEMENTING"
+    },
+    {
+      "at": "2026-08-12T10:02:31+00:00",
+      "from": "IMPLEMENTING",
+      "reason": "Implementer handoff accepted",
+      "to": "VALIDATING"
+    },
+    {
+      "at": "2026-08-12T10:13:24+00:00",
+      "from": "VALIDATING",
+      "reason": "independent Correctness Reviewer launch",
+      "to": "ASSESSING"
+    },
+    {
+      "at": "2026-08-12T10:18:32+00:00",
+      "from": "ASSESSING",
+      "reason": "independent Verifier launch",
+      "to": "VERIFYING"
+    },
+    {
+      "at": "2026-08-12T10:21:01+00:00",
+      "from": "VERIFYING",
+      "reason": "Verifier approved the complete evidence join",
+      "to": "APPROVED"
+    },
+    {
+      "at": "2026-08-12T10:21:11+00:00",
+      "from": "APPROVED",
+      "reason": "all Stage acceptance criteria satisfied",
+      "to": "STAGE_COMPLETED"
+    }
+  ],
+  "repair_context": [],
+  "required_assessments": [
+    "reviewer",
+    "tester"
+  ],
+  "slice_id": "T3.2",
+  "stage_id": "T3",
+  "stage_title": "Finalize v0.1.0 Release Content and Candidate Identity",
+  "state_revision": 19,
   "state_version": 1,
-  "tester_outcome": null,
-  "updated_at": "2026-08-09T05:16:44+00:00",
-  "validated_worktree": null,
-  "verifier_state": "not_required",
-  "worker": null,
-  "worker_run_seq": 0,
-  "workflow": null,
-  "workflow_state": "STAGE_DISCUSSION"
+  "tester_outcome": "passed",
+  "unresolved_findings": [
+    {
+      "blocking_recommendation": true,
+      "category": "candidate_identity",
+      "confidence": "high",
+      "evidence": "Read-only Git inspection returned HEAD/base 022728914dec268abc3b5f0e94a12d9f8eab94d4 and origin/master 930f94263a8412c8410e0c6fe904f3bdf117127d. The active Plan instead records 0cb9b9c334320c6e39881d5b14b7ca2122021d81 as the sole future v0.1.0 tag target and binds its accepted local/archive/CI evidence to that SHA. The log shows two later local commits after origin/master (e1b67c2 and 0227289), and origin/master itself is later than 0cb9b9c. Therefore, the current worktree/base named by this review is not the SHA whose T3.2 evidence is asserted, and it is not cleanly aligned with origin/master either. The exact-SHA invariant and acceptance evidence cannot be applied to candidate-v1 without a separately demonstrated binding.",
+      "id": "T3.2-CR-001",
+      "location": "Git identity and docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md:220-222,361-380",
+      "reproduction": [
+        "cd /home/van-gogh/project/Rust_code/Group",
+        "git rev-parse HEAD",
+        "git rev-parse origin/master",
+        "git log --oneline --decorate -6",
+        "rg -n \"sole future|0cb9b9c|corrected candidate\" docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md"
+      ],
+      "severity": "high",
+      "trigger": "Verify that the current reviewed candidate, archive source, hosted CI SHA, and sole proposed tag target are one exact immutable SHA."
+    },
+    {
+      "blocking_recommendation": true,
+      "category": "scope_and_cleanliness",
+      "confidence": "high",
+      "evidence": "`git status --short` reports four modified protected files: .harness/CURRENT_STAGE.md, .harness/PROJECT_STATE.md, .harness/config.toml, and .harness/state.json. `git diff --name-status 0227289` confirms all four differ from the stated base. The approved Slice requires a clean immutable candidate and lists these paths as protected. Even if these are expected Orchestrator runtime mutations, the supplied candidate represents the current worktree and no evidence in the candidate identity separates or excludes these modifications. Thus current-worktree cleanliness and candidate scope are not established.",
+      "id": "T3.2-CR-002",
+      "location": ".harness/CURRENT_STAGE.md, .harness/PROJECT_STATE.md, .harness/config.toml, .harness/state.json",
+      "reproduction": [
+        "cd /home/van-gogh/project/Rust_code/Group",
+        "git status --short",
+        "git diff --name-status 022728914dec268abc3b5f0e94a12d9f8eab94d4",
+        "git diff --stat 022728914dec268abc3b5f0e94a12d9f8eab94d4"
+      ],
+      "severity": "high",
+      "trigger": "Check the approved T3.2 requirement that the candidate checkout remain clean and that protected Harness state not be part of unauthorized candidate-content changes."
+    },
+    {
+      "blocking_recommendation": true,
+      "category": "evidence_provenance",
+      "confidence": "high",
+      "evidence": "The Plan claims hosted CI run 30943603111, complete accepted evidence under /tmp/group-t3.2-evidence-v2.G90zjS, no tags/releases/publications, and a checksum manifest for 0cb9b9c. This review could not corroborate the remote tag state live because `git ls-remote --tags origin refs/tags/v0.1.0` failed with DNS resolution disabled. More importantly, those assertions are explicitly bound to 0cb9b9c, not the supplied base/current HEAD 0227289 or candidate-v1 digest. Consequently they do not establish the external-state and CI acceptance criteria for the candidate under review.",
+      "id": "T3.2-CR-003",
+      "location": "docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md:355-380",
+      "reproduction": [
+        "cd /home/van-gogh/project/Rust_code/Group",
+        "git ls-remote --tags origin 'refs/tags/v0.1.0'",
+        "sed -n '355,390p' docs/exec-plans/active/024-finalize-v0.1.0-release-candidate.md",
+        "git rev-parse HEAD"
+      ],
+      "severity": "medium",
+      "trigger": "Validate external release-state and hosted-CI claims from evidence bound to the exact candidate under review, rather than accepting Plan prose."
+    }
+  ],
+  "updated_at": "2026-08-12T10:21:11+00:00",
+  "validated_worktree": "e599fdd09bbcdde2782071292bfad50c3721a1dd233a968d65ae31f209b5333c",
+  "verifier_state": "approved",
+  "worker": {
+    "attempt": 1,
+    "base_sha": "022728914dec268abc3b5f0e94a12d9f8eab94d4",
+    "candidate_id": "candidate-v1:25bcb77d2a45c70782dd76cbd4ffd0ed71417ec7e66130f63271c13bbb9a8c93",
+    "completed_at": "2026-08-12T10:21:01+00:00",
+    "expected_output": "/home/van-gogh/project/Rust_code/Group/.harness/runtime/verifier-987d9c97d4570ca9b4d4f8069f9d9713.json",
+    "generation": "987d9c97d4570ca9b4d4f8069f9d9713",
+    "role": "verifier",
+    "slice_id": "T3.2",
+    "stage_id": "T3",
+    "status": "completed"
+  },
+  "worker_run_seq": 3,
+  "workflow": "VERIFIED",
+  "workflow_state": "STAGE_COMPLETED"
 }
