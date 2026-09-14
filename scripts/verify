@@ -68,43 +68,11 @@ run_full() {
 }
 
 run_msrv() {
-    step "Rust 1.85 foundation check"
-    cargo +1.85.0 check --locked \
-        --workspace \
-        --exclude group-agent-genai \
-        --exclude group-agent-mcp \
-        --all-targets \
-        --all-features
+    step "Rust 1.88 workspace check"
+    cargo +1.88.0 check --locked --workspace --all-targets --all-features
 
-    step "Rust 1.85 foundation tests"
-    cargo +1.85.0 test --locked \
-        --workspace \
-        --exclude group-agent-genai \
-        --exclude group-agent-mcp
-
-    step "Rust 1.88 Genai check"
-    cargo +1.88.0 check --locked \
-        -p group-agent-genai \
-        --all-targets \
-        --all-features
-
-    step "Rust 1.88 Genai tests"
-    cargo +1.88.0 test --locked -p group-agent-genai
-
-    step "Rust 1.88 Genai doctests"
-    cargo +1.88.0 test --locked -p group-agent-genai --doc
-
-    step "Rust 1.88 MCP check"
-    cargo +1.88.0 check --locked \
-        -p group-agent-mcp \
-        --all-targets \
-        --all-features
-
-    step "Rust 1.88 MCP tests"
-    cargo +1.88.0 test --locked -p group-agent-mcp
-
-    step "Rust 1.88 MCP doctests"
-    cargo +1.88.0 test --locked -p group-agent-mcp --doc
+    step "Rust 1.88 workspace tests and doctests"
+    cargo +1.88.0 test --locked --workspace --all-features
 }
 
 case "$mode" in

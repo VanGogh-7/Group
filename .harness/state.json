@@ -18,7 +18,7 @@
         "kind": "sha256"
       },
       ".harness/PROJECT_STATE.md": {
-        "digest": "e24c458a70ef41637d80d76f3bcb04021683dc40061df7545c8260e11aff579e",
+        "digest": "e822dc74ea31b8a5e14af6a19a9ce1df792e50ce1e96d8b209fa4a0d07d83243",
         "kind": "sha256"
       },
       ".harness/config.toml": {
@@ -26,11 +26,11 @@
         "kind": "sha256"
       },
       "AGENTS.md": {
-        "digest": "b4325df7f2f681321f66e82cc6b5cff53e05bfa65f6c11bfc57657ecc8c13b0e",
+        "digest": "90f6c30ce5e65baa914748e2f4cbc4d21681e6e81780d0cdb02b98e6b70affec",
         "kind": "sha256"
       },
       "ARCHITECTURE.md": {
-        "digest": "cc7c912b53bdb304f49005ed62479b56e463cbc0747d956b3fee6520a32ed6f2",
+        "digest": "6d2cea610e2dcb3f3e970ab6013461a3d97a1293b95092ab32bb09997b8d6186",
         "kind": "sha256"
       }
     },
@@ -127,11 +127,11 @@
   "slice_id": null,
   "stage_id": null,
   "stage_title": null,
-  "state_revision": 93,
+  "state_revision": 95,
   "state_version": 1,
   "tester_outcome": null,
   "unresolved_findings": [],
-  "updated_at": "2026-09-14T18:55:59.199299+00:00",
+  "updated_at": "2026-09-14T19:12:55.210598+00:00",
   "validated_worktree": null,
   "verifier_state": "pending",
   "worker": null,

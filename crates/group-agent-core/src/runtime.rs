@@ -811,10 +811,10 @@ where
 
             next_frontier.sort_unstable_by_key(|index| index.index());
             next_frontier.dedup();
-            if next_frontier.is_empty() {
-                if let Some(exit) = self.scope_exits.get(&current_graph_path) {
-                    next_frontier.push(*exit);
-                }
+            if next_frontier.is_empty()
+                && let Some(exit) = self.scope_exits.get(&current_graph_path)
+            {
+                next_frontier.push(*exit);
             }
             let subgraph_boundaries = match self.normalize_frontier(
                 &mut next_frontier,
@@ -1108,19 +1108,19 @@ where
         };
         let checkpoint_step = checkpoint.step();
 
-        if let Some(requested) = requested_id {
-            if checkpoint.id() != requested {
-                return events.fail(GraphRunError::CheckpointIncompatible {
-                    run_id,
-                    thread_id,
-                    checkpoint_id: requested,
-                    step: checkpoint_step,
-                    reason: CheckpointIncompatibility::CheckpointIdMismatch {
-                        requested,
-                        actual: checkpoint.id(),
-                    },
-                });
-            }
+        if let Some(requested) = requested_id
+            && checkpoint.id() != requested
+        {
+            return events.fail(GraphRunError::CheckpointIncompatible {
+                run_id,
+                thread_id,
+                checkpoint_id: requested,
+                step: checkpoint_step,
+                reason: CheckpointIncompatibility::CheckpointIdMismatch {
+                    requested,
+                    actual: checkpoint.id(),
+                },
+            });
         }
 
         if checkpoint.thread_id() != &thread_id {
@@ -1152,15 +1152,15 @@ where
                 Ok(latest) => latest,
                 Err(error) => return events.fail(error),
             };
-            if latest.is_none() {
-                if let Some(branch_id) = branch_id {
-                    return events.fail(GraphRunError::BranchNotFound {
-                        run_id,
-                        thread_id,
-                        branch_id,
-                        step: checkpoint_step,
-                    });
-                }
+            if latest.is_none()
+                && let Some(branch_id) = branch_id
+            {
+                return events.fail(GraphRunError::BranchNotFound {
+                    run_id,
+                    thread_id,
+                    branch_id,
+                    step: checkpoint_step,
+                });
             }
             let latest_checkpoint_id = latest.as_ref().map(|checkpoint| checkpoint.id());
             if latest_checkpoint_id != Some(checkpoint.id()) {

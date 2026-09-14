@@ -351,7 +351,7 @@ available from crates.io. The clean gate proves archive contents for the
 committed candidate, not pre-publication crates.io resolution.
 
 Push only when separately authorized. Require a successful GitHub-hosted
-`full` job and layered `msrv` job for the same candidate commit. Local YAML
+`full` job and workspace `msrv` job for the same candidate commit. Local YAML
 parsing, local script passes, or a dirty preflight do not establish hosted CI.
 Any difference between the tested commit, packaged source, proposed tag, and
 hosted-CI commit invalidates the candidate and restarts this phase.

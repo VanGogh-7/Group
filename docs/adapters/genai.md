@@ -283,24 +283,18 @@ prebuilt Agent. Upgrading to genai 0.7 is a separate migration.
 
 ## Compiler support policy
 
-`group-agent-genai` requires Rust 1.88. The MCP adapter also requires Rust
-1.88, so the full workspace requires Rust 1.88 or newer. Core, Model, Tool,
-SQLite, and Observability retain Rust 1.85.
+`group-agent-genai` inherits the workspace-wide Rust 1.88 MSRV, as do all
+other Group crates.
 
-The published crates.io source for genai 0.6.5 uses let-chain syntax. Rust 1.85
-reports that syntax as unstable, while it became stable in Rust 1.88. The
-adapter's effective MSRV therefore follows the syntax required by the actual
-upstream release. genai 0.6.5 does not itself declare `rust-version = "1.88"`;
-this is a source-derived compatibility requirement, not a claim about its
-manifest. Group's own adapter code did not cause the increase, and Group's
-Runtime and provider-neutral domain model did not raise their MSRV.
+The published crates.io source for genai 0.6.5 uses let-chain syntax, which
+became stable in Rust 1.88. genai 0.6.5 does not itself declare
+`rust-version = "1.88"`; the adapter requirement is derived from its source.
+The workspace now deliberately uses the same minimum for foundation crates.
 
-Users who build only the Rust 1.85 foundation layer can omit both higher-MSRV
-adapters. The authoritative complete matrix lives in
-[Architecture: MSRV layering](../../ARCHITECTURE.md#msrv-layering),
-[ADR-011](../adr/011-layered-msrv.md), and the executable
-`./scripts/verify msrv` gate; this adapter document does not duplicate that
-workspace matrix.
+The authoritative policy lives in
+[Architecture: MSRV policy](../../ARCHITECTURE.md#msrv-policy),
+[ADR-012](../adr/012-unified-msrv.md), and the executable
+`./scripts/verify msrv` gate.
 
 Group does not vendor or patch genai, use a Git or path override, set
 `RUSTC_BOOTSTRAP`, enable nightly features, downgrade the verified SDK, or move

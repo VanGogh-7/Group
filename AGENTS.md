@@ -45,8 +45,7 @@ context lives in [`docs/history/`](docs/history/), not in this file.
 - No layer performs hidden retry or claims exactly-once execution.
 - Default Group error and event formatting does not expose payload or secret
   content.
-- Core, Model, Tool, SQLite, and Observability use Rust 1.85.
-- Genai and MCP adapters use Rust 1.88.
+- All workspace crates use Rust 1.88 as their minimum supported Rust version.
 
 Detailed rationale belongs in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) and

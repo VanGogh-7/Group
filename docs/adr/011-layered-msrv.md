@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Superseded on 2026-09-15 by [ADR-012](012-unified-msrv.md).
+The decision below records the former policy.
 
 ## Context
 
@@ -30,5 +31,5 @@ MSRV explicitly.
 
 ## Related documents
 
-- [Architecture MSRV layering](../../ARCHITECTURE.md#msrv-layering)
+- [Current architecture MSRV policy](../../ARCHITECTURE.md#msrv-policy)
 - [Development Runbook](../runbooks/development.md)

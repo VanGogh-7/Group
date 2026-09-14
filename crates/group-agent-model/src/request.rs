@@ -104,15 +104,15 @@ impl GenerationConfig {
     }
 
     fn validate(&self) -> Result<(), RequestValidationError> {
-        if let Some(value) = self.temperature {
-            if !value.is_finite() || value < 0.0 {
-                return Err(RequestValidationError::InvalidTemperature { value });
-            }
+        if let Some(value) = self.temperature
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(RequestValidationError::InvalidTemperature { value });
         }
-        if let Some(value) = self.top_p {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(RequestValidationError::InvalidTopP { value });
-            }
+        if let Some(value) = self.top_p
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(RequestValidationError::InvalidTopP { value });
         }
         if self.max_output_tokens == Some(0) {
             return Err(RequestValidationError::ZeroMaxOutputTokens);
@@ -246,10 +246,10 @@ impl ChatRequest {
             }
         }
 
-        if let ToolChoice::Named(name) = &self.tool_choice {
-            if !tool_names.contains(name) {
-                return Err(RequestValidationError::UnknownNamedTool { name: name.clone() });
-            }
+        if let ToolChoice::Named(name) = &self.tool_choice
+            && !tool_names.contains(name)
+        {
+            return Err(RequestValidationError::UnknownNamedTool { name: name.clone() });
         }
         if matches!(self.tool_choice, ToolChoice::Required) && self.tools.is_empty() {
             return Err(RequestValidationError::RequiredToolChoiceWithoutTools);

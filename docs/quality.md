@@ -30,6 +30,22 @@ The repository contains an experimental non-streaming prebuilt Tool-calling
 loop over the stable Core, Model, and Tool boundaries. This capability does not
 make Prebuilt stable or make the repository production-ready.
 
+## Current compiler policy
+
+All eight crates now share Rust 1.88 as the MSRV under
+[ADR-012](adr/012-unified-msrv.md). CI runs full quality gates on stable and
+whole-workspace compatibility checks/tests on Rust 1.88. The previous Rust
+1.85 foundation policy is discontinued. Compiler versions in the historical
+release and Plan 026 evidence below describe those earlier checks.
+
+[Plan 027](exec-plans/completed/027-unify-msrv.md) completed the migration.
+`./scripts/verify all` passed locally: full gates on Rust 1.98.1 and workspace
+MSRV gates on Rust 1.88.0, with 546 tests including doctests passing on each
+compiler, zero failures, and zero ignored tests. Independent review returned
+PASS. Hosted CI has not yet run for this uncommitted migration. Benchmark
+compilation retains a non-fatal host linker deprecation warning; no runtime
+performance measurement is claimed.
+
 ## Release evidence and blockers
 
 The historical Phase 2 clean candidate

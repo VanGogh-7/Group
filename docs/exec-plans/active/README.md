@@ -19,3 +19,6 @@ of Plan 025. It was removed, not completed. Historical preflight records remain
 under `docs/release/`; they do not authorize resuming publication. Code-review
 corrections were approved and completed on 2026-09-15 in
 [Plan 026](../completed/026-review-corrections.md).
+
+[Plan 027](../completed/027-unify-msrv.md) completed the unified Rust 1.88 MSRV
+on 2026-09-15.

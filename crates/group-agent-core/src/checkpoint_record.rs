@@ -135,14 +135,13 @@ impl CheckpointRecord {
         if parts.completed && parts.interrupt.is_some() {
             return Err(CheckpointRecordError::CompletedInterrupt);
         }
-        if let Some(interrupt) = &parts.interrupt {
-            if parts.next_frontier.len() != 1
-                || parts.next_frontier.first() != Some(interrupt.node_path())
-            {
-                return Err(CheckpointRecordError::InvalidInterruptFrontier {
-                    interrupt_node: interrupt.node_path().clone(),
-                });
-            }
+        if let Some(interrupt) = &parts.interrupt
+            && (parts.next_frontier.len() != 1
+                || parts.next_frontier.first() != Some(interrupt.node_path()))
+        {
+            return Err(CheckpointRecordError::InvalidInterruptFrontier {
+                interrupt_node: interrupt.node_path().clone(),
+            });
         }
         Ok(Self {
             format_version: parts.format_version,

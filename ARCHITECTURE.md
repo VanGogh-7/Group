@@ -215,17 +215,20 @@ upstream `genai` and `rmcp` targets.
 
 See [Error, Cancellation, and Observability Design](docs/design/error-cancellation-observability.md).
 
-## MSRV layering
+## MSRV policy
 
-| Crate or layer | MSRV |
-| --- | --- |
-| Core, Model, Tool, Prebuilt, SQLite, Observability | Rust 1.85 |
-| Genai adapter | Rust 1.88 |
-| MCP adapter | Rust 1.88 |
-| Full workspace | Rust 1.88+ |
+All eight crates and the complete workspace require Rust 1.88 or newer.
+Every crate inherits `rust-version` from `[workspace.package]`.
 
-The adapter MSRV follows syntax required by the fixed upstream releases. A
-user that selects only the foundation must not inherit that restriction.
+The common floor matches the already-required Genai and MCP syntax level and
+removes the separate foundation compatibility policy. Rust 1.85 through 1.87
+is no longer supported, including for foundation-only consumers. Runtime,
+provider, and storage dependency boundaries remain unchanged.
+
+CI runs whole-workspace checks and tests at Rust 1.88 and full quality gates
+on stable. Raising the floor requires an explicit compatibility decision;
+updating the development toolchain alone does not raise it. See
+[ADR-012](docs/adr/012-unified-msrv.md).
 
 ## Stability boundary
 

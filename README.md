@@ -291,17 +291,13 @@ structured output, Multi-Agent, or middleware.
 
 ## MSRV
 
-Group uses a layered minimum supported Rust version:
+All eight crates share a minimum supported Rust version of **Rust 1.88** and
+inherit it from the workspace manifest. Rust 1.85 through 1.87 is no longer a
+supported foundation-only configuration.
 
-| Layer | MSRV |
-| --- | --- |
-| Core, Model, Tool, Prebuilt, SQLite, Observability | Rust 1.85 |
-| Genai adapter | Rust 1.88 |
-| MCP adapter | Rust 1.88 |
-| Complete workspace | Rust 1.88+ |
-
-The higher adapter floor follows syntax required by the fixed upstream
-releases. Foundation-only users should not inherit that restriction.
+CI checks and tests the entire workspace on Rust 1.88 and runs full quality
+gates on stable Rust. Newer development toolchains do not automatically raise
+the MSRV. See [ADR-012](docs/adr/012-unified-msrv.md).
 
 ## Documentation
 

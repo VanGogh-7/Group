@@ -425,18 +425,19 @@ impl CheckpointStore for SqliteCheckpointStore {
                 })
                 .transpose()
                 .map_err(branch_write_corruption)?;
-            if let Some((stored_branch, stored_thread)) = &membership {
-                if *stored_branch == branch_id && stored_thread != record.thread_id() {
-                    let error = SqliteRecordError::BranchOwnership {
-                        relation: "membership",
-                        branch_id,
-                        checkpoint_id: record.id(),
-                        expected_thread: record.thread_id().clone(),
-                        actual_thread: stored_thread.clone(),
-                    };
-                    rollback(transaction).await.map_err(store_write_error)?;
-                    return Err(branch_write_corruption(error));
-                }
+            if let Some((stored_branch, stored_thread)) = &membership
+                && *stored_branch == branch_id
+                && stored_thread != record.thread_id()
+            {
+                let error = SqliteRecordError::BranchOwnership {
+                    relation: "membership",
+                    branch_id,
+                    checkpoint_id: record.id(),
+                    expected_thread: record.thread_id().clone(),
+                    actual_thread: stored_thread.clone(),
+                };
+                rollback(transaction).await.map_err(store_write_error)?;
+                return Err(branch_write_corruption(error));
             }
             let same_branch = membership
                 .as_ref()
@@ -808,15 +809,15 @@ async fn fetch_branch_history(
             validated_head = true;
             continue;
         }
-        if let Some(previous) = history.last() {
-            if record.parent_id() != Some(previous.id()) {
-                return Err(branch_corruption(SqliteRecordError::BranchParentMismatch {
-                    branch_id,
-                    checkpoint_id: record.id(),
-                    expected_parent: previous.id(),
-                    actual_parent: record.parent_id(),
-                }));
-            }
+        if let Some(previous) = history.last()
+            && record.parent_id() != Some(previous.id())
+        {
+            return Err(branch_corruption(SqliteRecordError::BranchParentMismatch {
+                branch_id,
+                checkpoint_id: record.id(),
+                expected_parent: previous.id(),
+                actual_parent: record.parent_id(),
+            }));
         }
         history.push(record);
     }

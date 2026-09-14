@@ -51,5 +51,5 @@ chronology.
 8. [Remote MCP Tools use conservative side-effect defaults](008-conservative-remote-tool-behavior.md)
 9. [MCP shutdown completion belongs to the Session](009-mcp-session-shutdown.md)
 10. [Base APIs are stable while edge adapters remain experimental](010-stable-base-experimental-adapters.md)
-11. [The workspace uses layered MSRV](011-layered-msrv.md)
-
+11. [The workspace uses layered MSRV](011-layered-msrv.md) — superseded by ADR-012.
+12. [All workspace crates share Rust 1.88 as their MSRV](012-unified-msrv.md)

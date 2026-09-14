@@ -19,8 +19,8 @@ The adapter normally depends on:
 Core is only a development integration dependency. Core, Model, and Tool do
 not depend back on MCP, and rmcp types do not enter their public APIs.
 
-The MCP crate declares Rust 1.88 because the fixed rmcp release requires syntax
-not accepted by the Rust 1.85 foundation toolchain.
+The MCP crate inherits the workspace-wide Rust 1.88 MSRV. The fixed rmcp
+release already requires that syntax level; see [ADR-012](../adr/012-unified-msrv.md).
 
 ## Session and stdio transport
 

@@ -5,6 +5,15 @@ may hold more than one non-review role when authority is explicit, but the
 Independent Reviewer remains separate from implementation reasoning and
 read-only by default.
 
+## Compiler policy
+
+All crates inherit the workspace MSRV of Rust 1.88. Use
+`rustup toolchain install 1.88.0 --profile minimal` before running
+`./scripts/verify msrv`; the gate checks every target and feature and runs
+workspace tests including doctests on that compiler. Development and the CI
+`full` job use newer stable Rust with rustfmt and Clippy. No additional 1.85
+compatibility layer is maintained. See [ADR-012](../adr/012-unified-msrv.md).
+
 ## Roles
 
 ### User / Product Owner

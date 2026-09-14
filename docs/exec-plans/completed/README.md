@@ -39,3 +39,5 @@ code, tests, architecture, or quality documentation.
 - [026 Review corrections](026-review-corrections.md) - fixed terminal stream
   behavior, rejected unsupported MCP key requirements, reclaimed weak cache
   entries, and passed full/MSRV verification with independent review.
+- [027 Unify the workspace MSRV](027-unify-msrv.md) - unified all crates at
+  Rust 1.88 with stable quality gates, complete MSRV verification, and review.
