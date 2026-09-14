@@ -5,24 +5,76 @@ family. It separates local preparation from a clean committed candidate and
 from irreversible registry work. Passing an earlier phase does not authorize
 or prove a later one.
 
-Group is currently unpublished. Do not create a commit, push, tag, GitHub
+Publication preparation was cancelled by the User on 2026-09-15. Plan 025 has
+been deleted. This Runbook remains a reference, not an active task or standing
+authorization. The local `v0.1.0` tag is retained; remote publication status was
+not rechecked during cancellation. A future release requires a new approved
+plan and fresh evidence.
+
+Do not create a commit, push, tag, GitHub
 Release, or crates.io publication unless the User / Product Owner separately
 authorizes that exact operation. Never place a crates.io token, provider key,
 MCP credential, or other secret in a command line, repository file, captured
 diff, shell history, log, archive, or report. Authentication belongs in the
-operator's preconfigured credential store and is not exercised by the current
-Plan.
+operator's preconfigured credential store. Its contents are never inspected or
+captured; a preflight may validate only owner, mode, file-kind, parent-directory,
+and credential-provider metadata. An authenticated publication command is
+permitted only after the User / Product Owner grants the separate crates.io
+Human Checkpoint.
 
-## Current evidence boundary
+## Historical T4.1 evidence boundary
 
-Plan 023 completed Phase 2 for commit
-`9b069d430cae02e74134f37edb8d05b83c2cc6c7`: the full local matrix, eight clean
-archives, and both required hosted CI jobs passed for that exact SHA. Later
-release-facing README changes are package-input changes, so that evidence must
-remain historical and cannot establish the final candidate. Plan 024 must bind
-a new immutable candidate commit, archive source, local verification, hosted
-CI, and sole proposed `v0.1.0` tag target to one identical SHA before Phase 3
-can be considered. Phase 3 remains separately authorized and unperformed.
+The following two sections preserve the former pre-tag procedure and its
+point-in-time observations. Their tag-absence expectations are historical:
+the local tag now exists. Do not execute these as a current release checklist;
+a future approved plan must account for existing tag identity.
+
+Plan 024 records the corrected candidate
+`0cb9b9c334320c6e39881d5b14b7ca2122021d81`, its accepted clean archive and
+local-verification evidence, and GitHub Actions run `30943603111` with both
+required jobs passing for that SHA. The current T4.1 host-side capture at
+`2026-08-14T20:22:34.334748+00:00` records the Actions run, remote-tag absence,
+GitHub Release absence, all eight sparse-index `404` results, and safe
+credential-store metadata. The detailed selected-field record and its SHA-256
+are in the [`v0.1.0 preflight record`](../release/v0.1.0-preflight.md) and
+[`host preflight evidence`](../release/v0.1.0-host-preflight-evidence.json).
+No historical or point-in-time observation is a standing reservation or
+authorization: every Human Checkpoint repeats the applicable external checks
+immediately before its irreversible operation. Phase 3 remains separately
+authorized and unperformed.
+
+## Historical T4.1 original-source capture
+
+The supplied host-side capture completes the current-original-source portion
+of T4.1. It is a credential-safe selected-field record, not a raw external
+payload, and it must not be relabeled as evidence for a later checkpoint. For
+each required recheck, the Orchestrator captures one short UTC observation
+window in an owner-only, mode-`0700`, ignored evidence directory. Use direct
+unauthenticated HTTPS reads with curl configuration, netrc, redirect following,
+retries, and insecure TLS disabled. Retain only canonical URLs, UTC start/end
+times, transport exits, HTTP classifications, selected non-secret result
+fields, and a verified `sha256sum` manifest. Do not retain request headers,
+cookies, authentication diagnostics, or credential content.
+
+The required original sources and results are:
+
+- `GET https://api.github.com/repos/VanGogh-7/Group/actions/runs/30943603111`
+  and its `jobs?filter=latest&per_page=100` resource: HTTP `200`, the approved
+  candidate SHA, completed/success run state, and both required successful jobs;
+- `GET https://api.github.com/repos/VanGogh-7/Group/git/ref/tags/v0.1.0`: HTTP
+  `404`, which proves no lightweight or annotated exact tag ref exists;
+- `GET https://api.github.com/repos/VanGogh-7/Group/releases/tags/v0.1.0`: HTTP
+  `404`;
+- exact `refs/tags/v0.1.0` local absence, with `git show-ref` exit `1` and an
+  empty exact-tag listing; and
+- HTTP `404` from each exact sparse path under
+  `https://index.crates.io/gr/ou/` for the eight fixed package names.
+
+Any transport failure, unexpected response, candidate mismatch, non-empty
+local-tag output, or unavailable credential metadata is a stop condition, not
+absence evidence. Summarize a successful capture in the T4.1 preflight record
+without copying raw external payloads. These checks are point-in-time only and
+must be repeated at the relevant tag and publication checkpoints.
 
 ## Fixed crate order
 
@@ -312,45 +364,120 @@ exact eight names. `cargo search` returning no exact match is only a hint: it
 does not reserve a name or guarantee publication rights.
 
 Prepare the authorized `v0.1.0` tag only on the exact clean candidate commit
-and verify the tag target before any publication. Then publish one crate at a
-time in the fixed order:
+and verify the tag target before any publication. For each eligible crate, run
+the following dry run only after every earlier dependency layer is indexed and
+resolvable from a fresh crates.io-only consumer:
 
 ```bash
-cargo publish --locked -p group-agent-core
-cargo publish --locked -p group-agent-model
-cargo publish --locked -p group-agent-tool
-cargo publish --locked -p group-agent-checkpoint-sqlite
-cargo publish --locked -p group-agent-observability-tokio
-cargo publish --locked -p group-agent-genai
-cargo publish --locked -p group-agent-mcp
-cargo publish --locked -p group-agent-prebuilt
+cargo publish --registry crates-io --locked --dry-run -p <crate>
 ```
 
-Do not run these commands as one unattended script. After each successful
-publication, wait for crates.io/index visibility and prove exact-version
-resolution from a fresh temporary consumer before proceeding to the next
-crate. A minimal check for the just-published crate is:
+The explicit registry selection is mandatory. A dry run must never use a
+default registry selected by inherited Cargo configuration. Do not run dry
+runs or publication commands as one unattended script. After the dry run and
+all current checks pass, publish exactly one crate in the fixed order:
+
+```bash
+cargo publish --registry crates-io --locked -p group-agent-core
+cargo publish --registry crates-io --locked -p group-agent-model
+cargo publish --registry crates-io --locked -p group-agent-tool
+cargo publish --registry crates-io --locked -p group-agent-checkpoint-sqlite
+cargo publish --registry crates-io --locked -p group-agent-observability-tokio
+cargo publish --registry crates-io --locked -p group-agent-genai
+cargo publish --registry crates-io --locked -p group-agent-mcp
+cargo publish --registry crates-io --locked -p group-agent-prebuilt
+```
+
+After each successful publication, wait for crates.io/index visibility and
+prove exact-version resolution from a fresh isolated consumer before proceeding
+to the next crate. Each consumer gets a distinct, empty, audited Cargo home;
+creating only a new project directory is insufficient because Cargo can inherit
+source replacement, a non-crates.io default registry, or other configuration.
+
+Use this procedure for the just-published crate:
 
 ```bash
 registry_check_dir="$(mktemp -d /tmp/group-registry-check.XXXXXX)"
-cargo init --quiet --bin "$registry_check_dir/consumer"
+registry_cargo_home="$(mktemp -d /tmp/group-registry-cargo-home.XXXXXX)"
+
+test -d "$registry_check_dir"
+test ! -L "$registry_check_dir"
+test -d "$registry_cargo_home"
+test ! -L "$registry_cargo_home"
+test "$(stat -c '%u' "$registry_cargo_home")" = "$(id -u)"
+registry_cargo_home_mode="$(stat -c '%a' "$registry_cargo_home")"
+test $((8#$registry_cargo_home_mode & 8#077)) -eq 0
+
+for cargo_private_file in credentials credentials.toml config config.toml; do
+  test ! -e "$registry_cargo_home/$cargo_private_file"
+  test ! -L "$registry_cargo_home/$cargo_private_file"
+done
+
+assert_no_cargo_config() {
+  local config_root="$1"
+  while :; do
+    for cargo_config in "$config_root/.cargo/config" \
+      "$config_root/.cargo/config.toml"; do
+      test ! -e "$cargo_config"
+      test ! -L "$cargo_config"
+    done
+    if test "$config_root" = /; then
+      break
+    fi
+    config_root="$(dirname "$config_root")"
+  done
+}
+
+assert_no_cargo_config "$registry_check_dir"
+
+registry_consumer_env=(
+  env -i
+  "PATH=$PATH"
+  "HOME=$HOME"
+  "RUSTUP_HOME=$HOME/.rustup"
+  "CARGO_HOME=$registry_cargo_home"
+  "CARGO_BUILD_JOBS=2"
+)
+
+(
+  cd "$registry_check_dir"
+  "${registry_consumer_env[@]}" cargo init --quiet --bin consumer
+)
 cd "$registry_check_dir/consumer"
-cargo add --registry crates-io group-agent-core@=0.1.0
-cargo check
-cargo tree
+assert_no_cargo_config "$PWD"
+"${registry_consumer_env[@]}" cargo add --registry crates-io group-agent-core@=0.1.0
+"${registry_consumer_env[@]}" cargo metadata --locked --format-version 1 \
+  > metadata.json
+"${registry_consumer_env[@]}" cargo check --locked
+"${registry_consumer_env[@]}" cargo tree --locked
 ```
 
-Replace the crate name for each step and use a new directory each time. Confirm
-that Cargo resolved the exact crates.io version with no path, Git, patch, or
-local registry override. An index lookup alone is insufficient if the fresh
-consumer cannot resolve and build the exact version.
+`env -i` is deliberate: do not pass inherited `CARGO_REGISTRY_*`,
+`CARGO_REGISTRIES_*`, `CARGO_SOURCE_*`, `CARGO_CONFIG`, or other Cargo
+configuration variables into the consumer. The only Cargo variables passed are
+the newly created `CARGO_HOME` and the bounded build-job setting. The audit
+rejects both legacy `config` and `config.toml` in that Cargo home and in every
+consumer-directory ancestor, so a source replacement, path override, patch,
+local registry, or unexpected default registry cannot be inherited.
 
-After all eight crates are indexed, create one more fresh consumer, add all
-eight dependencies with `@=0.1.0` from `crates-io`, run `cargo tree` and
-`cargo check`, and retain the lockfile and command evidence. Only this final
-check supports the claim that a fresh consumer can use the complete published
-family. Tag push and GitHub Release creation remain separately authorized
-external operations; perform them only in the order approved by the User.
+Replace the crate name for each step and allocate a new project directory and
+Cargo home each time. Retain `metadata.json`, `Cargo.lock`, `cargo tree`, and
+the command outcomes. Confirm that every non-root resolved package has only the
+canonical crates.io registry source and that no path, Git, patch, local
+registry, source replacement, or unexpected registry-default configuration is
+present. A registry-looking lockfile alone is corroboration, not proof of this
+isolation; the configuration-origin audit and controlled environment are
+required. An index lookup alone is likewise insufficient if the fresh consumer
+cannot resolve and build the exact version.
+
+After all eight crates are indexed, repeat the complete preceding procedure
+with another new project directory and another new audited Cargo home. Add all
+eight dependencies with exact `@=0.1.0` versions using `cargo add --registry
+crates-io`, then run the same metadata, lockfile, tree, and check audits. Only
+this final isolated check supports the claim that a fresh consumer can use the
+complete published family. Tag push and GitHub Release creation remain
+separately authorized external operations; perform them only in the order
+approved by the User.
 
 ## Stop conditions
 
@@ -369,6 +496,11 @@ partial evidence when any of these occurs:
 - the candidate commit, hosted-CI commit, archive source, or tag target differs;
 - authorization, crates.io ownership, authentication, or exact-name
   availability is absent or ambiguous;
+- an exact sparse-index read cannot be completed with its expected response, or
+  the metadata-only credential-store audit cannot establish safe availability;
+- a fresh consumer's isolated Cargo-home or configuration-origin audit finds a
+  source replacement, patch, local registry, unexpected default registry, or
+  inherited Cargo configuration;
 - publication is rejected, a checksum differs, or a required exact `0.1.0`
   dependency is not indexed and resolvable before its dependent;
 - the index wait times out or a fresh exact-version consumer fails; or

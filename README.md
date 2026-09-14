@@ -382,9 +382,10 @@ archives. Phase 2 then passed the full local matrix, all eight clean archive
 audits, and both required hosted CI jobs for historical candidate `9b069d4`.
 Every later candidate containing this README must bind the same gates to its own
 exact SHA; Plan 024 is the authoritative record of the accepted candidate and
-its evidence. Tag preparation, ordered crates.io publication/index
-verification, and a fresh exact-version registry consumer remain pending and
-separately authorized. See the
+its historical evidence. The User cancelled publication preparation on
+2026-09-15 and Plan 025 was deleted. The existing local `v0.1.0` tag is retained;
+publication is not an active task. Any future release requires a new approved
+plan and fresh verification. See the
 [Release Runbook](docs/runbooks/release.md) for the distinct evidence boundaries,
 phases, and stop conditions.
 

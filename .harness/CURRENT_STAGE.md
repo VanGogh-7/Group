@@ -1,17 +1,15 @@
 # Current Stage
 
-- Stage: T3
-- Title: Finalize v0.1.0 Release Content and Candidate Identity
-- Final Slice: T3.2
-- Status: Completed
-- Completed: 2026-08-12T10:21:11+00:00
+No active Stage or Slice.
 
-## Canonical completion evidence
+## Publication cancellation
 
-- Implementer handoff: completed
-- Deterministic gate: passed (stage)
-- Required assessments: reviewer, tester
-- Independent verifier: approved
-- Candidate: candidate-v1:25bcb77d2a45c70782dd76cbd4ffd0ed71417ec7e66130f63271c13bbb9a8c93
+On 2026-09-15 the User cancelled publication preparation and requested deletion
+of Plan 025. Stage T4 and Slice T4.1 are cancelled, not completed. All previous
+publication authorization is superseded by this instruction.
 
-Detailed acceptance evidence remains in the repository Execution Plan history.
+The legacy Harness state is blocked with no active Stage, Slice, owner, or
+worker so it cannot resume the cancelled publication workflow. A future task
+requires fresh scope and authorization. The separately approved repository
+corrections in Plan 026 are complete with full/MSRV verification and independent
+review. They did not create or resume a product Stage.

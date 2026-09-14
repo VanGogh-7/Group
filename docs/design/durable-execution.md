@@ -17,6 +17,17 @@ Durability does not add Clone or Serde bounds to `GraphState`.
 Snapshot and codec work is synchronous, outside storage locks. Record queries
 return shared Arc values rather than deep copies.
 
+`RecordCheckpointer` holds weak decoded-checkpoint references. Repeated reads
+share a checkpoint while callers retain its handle; releasing all handles
+allows its snapshot to be reclaimed, and later reads decode from the Store.
+Expired cache entries, including their encoded records, are removed on later
+cache insertions. Cleanup runs after an insertion/replacement budget
+based on surviving handles, with a minimum interval of 64 operations, avoiding
+a full-cache scan on every save. Bucket capacity is reduced during cleanup. This is amortized cleanup, not immediate
+reclamation of all encoded bytes during idle periods or a byte-size limit.
+The Store remains responsible for durable content idempotency and lineage CAS;
+the cache compares complete record content for entries it still retains.
+
 ## Save boundary
 
 Checkpointing is opt-in. A normal invocation does not snapshot, call a Store,

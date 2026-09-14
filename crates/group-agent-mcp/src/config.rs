@@ -172,6 +172,9 @@ impl McpDiscoveryConfig {
 
     /// Freezes an explicit behavior override for one remote tool name.
     ///
+    /// Required application idempotency keys are rejected because this adapter
+    /// has no remote protocol mapping for `ToolInput::idempotency_key`.
+    ///
     /// A second entry for the same name is rejected even when both behavior
     /// values are equal, so merged configuration cannot silently use
     /// last-write-wins semantics.
@@ -182,6 +185,9 @@ impl McpDiscoveryConfig {
     ) -> Result<Self, McpConfigError> {
         let remote_name = remote_name.into();
         validate_remote_name(&remote_name)?;
+        if behavior.requires_idempotency_key() {
+            return Err(McpConfigError::UnsupportedIdempotencyKeyRequirement);
+        }
         if self.behavior_overrides.contains_key(&remote_name) {
             return Err(McpConfigError::DuplicateBehaviorOverride);
         }

@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "observed_at_utc": "2026-08-14T20:22:34.334748+00:00",
+  "candidate_sha": "0cb9b9c334320c6e39881d5b14b7ca2122021d81",
+  "github_actions": {
+    "exit_code": 0,
+    "selected": {
+      "conclusion": "success",
+      "databaseId": 30943603111,
+      "headSha": "0cb9b9c334320c6e39881d5b14b7ca2122021d81",
+      "status": "completed",
+      "url": "https://github.com/VanGogh-7/Group/actions/runs/30943603111"
+    }
+  },
+  "remote_tag": {
+    "exit_code": 0,
+    "exact_ref_count": 0
+  },
+  "github_release": {
+    "exit_code": 1,
+    "classification": "absent"
+  },
+  "crates_io_sparse": [
+    {
+      "package": "group-agent-core",
+      "url": "https://index.crates.io/gr/ou/group-agent-core",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-model",
+      "url": "https://index.crates.io/gr/ou/group-agent-model",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-tool",
+      "url": "https://index.crates.io/gr/ou/group-agent-tool",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-checkpoint-sqlite",
+      "url": "https://index.crates.io/gr/ou/group-agent-checkpoint-sqlite",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-observability-tokio",
+      "url": "https://index.crates.io/gr/ou/group-agent-observability-tokio",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-genai",
+      "url": "https://index.crates.io/gr/ou/group-agent-genai",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-mcp",
+      "url": "https://index.crates.io/gr/ou/group-agent-mcp",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    },
+    {
+      "package": "group-agent-prebuilt",
+      "url": "https://index.crates.io/gr/ou/group-agent-prebuilt",
+      "transport": "http",
+      "status": 404,
+      "exact_0_1_0_absent": true
+    }
+  ],
+  "cargo_credential_metadata": {
+    "present": true,
+    "kind": "regular",
+    "symlink": false,
+    "uid": 1000,
+    "gid": 1000,
+    "mode": "0600",
+    "parent_kind": "directory",
+    "parent_uid": 1000,
+    "parent_mode": "0755",
+    "config_toml_present": false,
+    "legacy_config_present": false
+  },
+  "all_preflight_checks_passed": true
+}

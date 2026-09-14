@@ -46,6 +46,10 @@ pub enum McpConfigError {
     InvalidToolPrefix,
     #[error("remote tool name must be canonical")]
     InvalidRemoteToolName,
+    #[error(
+        "MCP tools cannot require application idempotency keys without a remote protocol mapping"
+    )]
+    UnsupportedIdempotencyKeyRequirement,
     #[error("behavior override is duplicated")]
     DuplicateBehaviorOverride,
     #[error("behavior override does not match a discovered remote tool")]

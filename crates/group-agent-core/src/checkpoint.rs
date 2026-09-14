@@ -1,6 +1,6 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -1296,10 +1296,9 @@ where
 /// Adapts a storage-neutral record store to the typed Runtime checkpointer port.
 ///
 /// Encoding and decoding happen before or after store calls and never while the
-/// store's lock is held. Decoded checkpoints are cached by ID so repeated
-/// latest/get/history calls share their Snapshot `Arc`.
-type DecodedCheckpoints<T> = HashMap<CheckpointId, (CheckpointRecord, Arc<Checkpoint<T>>)>;
-
+/// store's lock is held. Decoded checkpoints are cached weakly by ID so
+/// latest/get/history calls share checkpoints while a caller retains a handle.
+/// Expired encoded records are reclaimed during subsequent cache insertions.
 pub struct RecordCheckpointer<T>
 where
     T: Send + Sync + 'static,
@@ -1307,6 +1306,35 @@ where
     store: Arc<dyn CheckpointStore>,
     codec: Arc<dyn CheckpointCodec<T>>,
     decoded: Mutex<DecodedCheckpoints<T>>,
+}
+
+type DecodedEntries<T> = HashMap<CheckpointId, (CheckpointRecord, Weak<Checkpoint<T>>)>;
+
+struct DecodedCheckpoints<T: Send + Sync + 'static> {
+    entries: DecodedEntries<T>,
+    insertions_until_cleanup: usize,
+}
+
+impl<T: Send + Sync + 'static> DecodedCheckpoints<T> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertions_until_cleanup: 64,
+        }
+    }
+
+    fn remove_expired(&mut self) {
+        self.insertions_until_cleanup -= 1;
+        if self.insertions_until_cleanup > 0 {
+            return;
+        }
+        self.entries
+            .retain(|_, (_, checkpoint)| checkpoint.strong_count() > 0);
+        // Reclaim bucket capacity after a large caller-owned history is released.
+        // Budget scans by surviving handles, including replacements of expired IDs.
+        self.entries.shrink_to(self.entries.len().max(64));
+        self.insertions_until_cleanup = self.entries.len().max(64);
+    }
 }
 
 impl<T> RecordCheckpointer<T>
@@ -1319,7 +1347,7 @@ where
         Self {
             store,
             codec,
-            decoded: Mutex::new(HashMap::new()),
+            decoded: Mutex::new(DecodedCheckpoints::new()),
         }
     }
 
@@ -1337,9 +1365,9 @@ where
             .decoded
             .lock()
             .map_err(|_| CheckpointerError::message("decoded checkpoint cache was poisoned"))?;
-        match cache.get(&record.id()) {
+        match cache.entries.get(&record.id()) {
             Some((cached_record, checkpoint)) if cached_record == record => {
-                Ok(Some(Arc::clone(checkpoint)))
+                Ok(checkpoint.upgrade())
             }
             Some(_) => Err(CheckpointerError::message(format!(
                 "checkpoint store returned conflicting content for id `{}`",
@@ -1358,12 +1386,20 @@ where
             .decoded
             .lock()
             .map_err(|_| CheckpointerError::message("decoded checkpoint cache was poisoned"))?;
-        match cache.entry(checkpoint.id()) {
+        cache.remove_expired();
+        match cache.entries.entry(checkpoint.id()) {
             Entry::Vacant(entry) => {
-                entry.insert((record, Arc::clone(&checkpoint)));
+                entry.insert((record, Arc::downgrade(&checkpoint)));
                 Ok(checkpoint)
             }
-            Entry::Occupied(entry) if entry.get().0 == record => Ok(Arc::clone(&entry.get().1)),
+            Entry::Occupied(mut entry) if entry.get().0 == record => {
+                if let Some(existing) = entry.get().1.upgrade() {
+                    Ok(existing)
+                } else {
+                    entry.insert((record, Arc::downgrade(&checkpoint)));
+                    Ok(checkpoint)
+                }
+            }
             Entry::Occupied(entry) => Err(CheckpointerError::message(format!(
                 "checkpoint store returned conflicting content for id `{}`",
                 entry.key()
@@ -1829,7 +1865,7 @@ mod tests {
         );
         let first =
             Checkpoint::from_record(&first_record, &UsizeCodec).expect("record should decode");
-        adapter
+        let _first = adapter
             .cache(first_record, Arc::new(first))
             .expect("vacant cache entry should insert");
         let second =
@@ -1842,5 +1878,95 @@ mod tests {
                 .to_string()
                 .contains("returned conflicting content for id")
         );
+    }
+    #[test]
+    fn expired_cache_records_are_reclaimed_without_evicting_live_handles() {
+        let adapter = RecordCheckpointer::new(
+            Arc::new(InMemoryCheckpointStore::new()),
+            Arc::new(UsizeCodec),
+        );
+        let live_record = record(CheckpointId::next(), 1, 1);
+        let live = adapter.decode(&live_record).unwrap();
+        for value in 0..4096 {
+            let expired_record = record(CheckpointId::next(), 1, value);
+            let checkpoint = adapter.decode(&expired_record).unwrap();
+            let snapshot = Arc::downgrade(checkpoint.snapshot());
+            drop(checkpoint);
+            assert!(snapshot.upgrade().is_none());
+        }
+        assert!(Arc::ptr_eq(&live, &adapter.decode(&live_record).unwrap()));
+        assert!(
+            adapter.decoded.lock().unwrap().entries.len() <= 128,
+            "expired records must not accumulate with the number of saved checkpoints"
+        );
+        let conflicting = record(live_record.id(), 2, 2);
+        assert!(
+            adapter.decode(&conflicting).is_err(),
+            "live content conflict remains rejected"
+        );
+    }
+
+    #[test]
+    fn expired_history_is_reclaimed_when_only_existing_ids_are_reloaded() {
+        let adapter = RecordCheckpointer::new(
+            Arc::new(InMemoryCheckpointStore::new()),
+            Arc::new(UsizeCodec),
+        );
+        let records: Vec<_> = (0..200)
+            .map(|value| record(CheckpointId::next(), 1, value))
+            .collect();
+        let held: Vec<_> = records
+            .iter()
+            .map(|record| adapter.decode(record).unwrap())
+            .collect();
+        drop(held);
+        for _ in 0..1024 {
+            drop(adapter.decode(&records[0]).unwrap());
+        }
+        assert!(
+            adapter.decoded.lock().unwrap().entries.len() <= 128,
+            "reloading an existing ID must still reclaim expired historical records"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_public_gets_share_one_checkpoint_after_both_decode() {
+        struct BarrierCodec(std::sync::Barrier);
+        impl CheckpointCodec<usize> for BarrierCodec {
+            fn snapshot_descriptor(&self) -> crate::CodecDescriptor {
+                UsizeCodec.snapshot_descriptor()
+            }
+            fn encode_snapshot(
+                &self,
+                value: &usize,
+            ) -> Result<Vec<u8>, crate::CheckpointCodecError> {
+                UsizeCodec.encode_snapshot(value)
+            }
+            fn decode_snapshot(&self, bytes: &[u8]) -> Result<usize, crate::CheckpointCodecError> {
+                self.0.wait();
+                UsizeCodec.decode_snapshot(bytes)
+            }
+        }
+        let store = Arc::new(InMemoryCheckpointStore::new());
+        let id = CheckpointId::next();
+        store.save(record(id, 1, 7)).await.unwrap();
+        let adapter =
+            RecordCheckpointer::new(store, Arc::new(BarrierCodec(std::sync::Barrier::new(2))));
+        let read = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(adapter.get(&ThreadId::from("cache-thread"), id))
+                .unwrap()
+                .unwrap()
+        };
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(read);
+            let right = scope.spawn(read);
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert!(Arc::ptr_eq(&left, &right));
+        assert_eq!(**left.snapshot(), 7);
     }
 }

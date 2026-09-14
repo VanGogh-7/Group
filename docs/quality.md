@@ -54,15 +54,29 @@ local matrix, eight-archive clean audit, and both hosted CI jobs for its exact
 SHA. Plan 024 is the authoritative record of whether those T3.2 gates passed and
 which SHA is the sole proposed `v0.1.0` tag target.
 
-The following conditions are required for a responsible public v0.1.0 release:
+Publication preparation was cancelled by the User on 2026-09-15. Plan 025 was
+deleted, not completed, and there is no active publication plan. Earlier
+publication authorization is superseded. Any future release requires a new
+approved plan and fresh candidate, registry, and consumer verification.
 
-- Plan 024 must bind one immutable candidate's Git identity, archive source,
-  full local verification, hosted CI, and proposed tag target to one SHA;
-- no v0.1.0 release tag has been separately authorized or prepared;
-- the eight crates have not been published in dependency order or verified in
-  the crates.io index; and
-- no fresh consumer has resolved and built all eight exact `0.1.0` versions
-  from crates.io.
+The local annotated `v0.1.0` tag exists and points to candidate
+`0cb9b9c334320c6e39881d5b14b7ca2122021d81`. Historical preflight evidence is
+retained under `docs/release/`; remote tag, registry, and GitHub Release state
+were not rechecked during cancellation.
+
+The 2026-09-15 read-only review identified MCP idempotency-key forwarding,
+Genai post-error stream events, unbounded decoded checkpoint retention, and a
+strict Clippy failure under Rust 1.98.1. These findings were corrected in
+[Plan 026](exec-plans/completed/026-review-corrections.md): MCP rejects required
+keys without a protocol mapping, stream errors terminate permanently, decoded
+checkpoints are weakly cached with amortized expired-record cleanup, and the
+redundant import is removed. Independent review returned PASS. The corrected
+worktree passed `./scripts/verify full` on Rust 1.98.1 and
+`./scripts/verify msrv` on Rust 1.85/1.88, with 546 passing workspace tests
+including doctests and no failures or ignored tests. Benchmark compilation
+passed with a non-fatal host linker deprecation warning; no performance
+measurement or publication readiness is claimed. See Durable Execution Design
+for the cache's live-handle and delayed encoded-record cleanup limits.
 
 Plan 022 completed the metadata, portable license, internal path-plus-version,
 SQLite benchmark teardown, production logging guidance, release procedure, and

@@ -258,6 +258,9 @@ async fn create_middle_checkpoint_with_counter(
         .await
         .expect("latest should load")
         .expect("middle checkpoint should exist");
+    // Decoding may create a new snapshot after the Runtime releases its handle.
+    // Observe the snapshot that the next resume will actually restore.
+    let restore_calls = Arc::clone(&checkpoint.snapshot().restore_calls);
     (checkpoint, restore_calls)
 }
 
@@ -622,7 +625,7 @@ async fn graph_version_mismatch_and_unknown_frontier_are_incompatible() {
 async fn unversioned_checkpoint_is_incompatible_with_resume() {
     let graph = unversioned_linear_graph();
     let store = new_store();
-    let (_, restore_calls) =
+    let (_checkpoint, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "unversioned", &store, false).await;
     let error = graph
         .resume(ResumeConfig::new(
@@ -673,7 +676,7 @@ impl std::error::Error for RestoreLayerError {
 async fn restore_failure_preserves_source_chain_emits_once_and_graph_is_reusable() {
     let graph = linear_graph("restore-v1");
     let store = new_store();
-    let (_, restore_calls) =
+    let (_checkpoint, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "restore-failure", &store, true).await;
     let sink = Arc::new(RecordingSink::default());
     let error = graph
@@ -903,7 +906,7 @@ async fn run_timeout_remains_active_while_loading_resume_checkpoint() {
 async fn cancellation_during_checkpoint_load_is_observed_before_restore() {
     let graph = Arc::new(linear_graph("load-cancel-v1"));
     let inner = new_store();
-    let (_, restore_calls) =
+    let (_checkpoint, restore_calls) =
         create_middle_checkpoint_with_counter(&graph, "load-cancel", &inner, false).await;
     let checkpointer = Arc::new(BlockingLatestCheckpointer {
         inner,

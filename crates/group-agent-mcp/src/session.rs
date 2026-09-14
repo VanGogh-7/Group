@@ -587,7 +587,6 @@ pub(crate) fn service_error_kind(error: &ServiceError) -> McpAdapterErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::sync::atomic::{AtomicUsize, Ordering};

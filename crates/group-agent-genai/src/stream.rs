@@ -90,6 +90,7 @@ impl<S> GenaiEventStream<S> {
         error: GenaiMappingError,
     ) -> Poll<Option<Result<ChatStreamEvent, ModelError>>> {
         self.terminal = true;
+        self.pending.clear();
         let error = error.into_model_error(&self.provider, &self.model);
         Poll::Ready(Some(Err(error)))
     }
@@ -336,6 +337,10 @@ impl<S> GenaiEventStream<S> {
                 source,
             }
         })?;
+        let usage = map_usage(
+            end.captured_usage.unwrap_or_default(),
+            self.config.retain_usage_details(),
+        )?;
         self.pending.push_back(Ok(ChatStreamEvent::ResponseStarted {
             response_id,
             model: Some(model),
@@ -343,10 +348,7 @@ impl<S> GenaiEventStream<S> {
         }));
         self.pending
             .extend(terminal_tool_events.into_iter().map(Ok));
-        if let Some(usage) = map_usage(
-            end.captured_usage.unwrap_or_default(),
-            self.config.retain_usage_details(),
-        )? {
+        if let Some(usage) = usage {
             self.pending.push_back(Ok(ChatStreamEvent::Usage(usage)));
         }
         self.pending
@@ -394,14 +396,14 @@ where
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.terminal {
+            return Poll::Ready(None);
+        }
         if let Some(event) = this.pending.pop_front() {
             if this.saw_end && this.pending.is_empty() {
                 this.terminal = true;
             }
             return Poll::Ready(Some(event));
-        }
-        if this.terminal {
-            return Poll::Ready(None);
         }
 
         loop {

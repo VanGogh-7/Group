@@ -252,3 +252,29 @@ async fn dropping_group_stream_drops_the_underlying_http_stream() {
         .await
         .expect("dropping wrapper should release the genai response stream");
 }
+
+#[tokio::test]
+async fn invalid_terminal_usage_ends_stream_permanently() {
+    let server = MockServer::start(MockResponse::sse(concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":-1}}\n\n",
+        "data: [DONE]\n\n"
+    ))).await.expect("server");
+    let model = model(openai_client(server.base_url()), capabilities()).expect("model");
+    let mut stream = model
+        .stream(ChatRequest::new(vec![Message::user("hello")]))
+        .await
+        .expect("stream");
+    let error = stream
+        .next()
+        .await
+        .expect("error item")
+        .expect_err("invalid usage");
+    assert_eq!(error.kind(), &ModelErrorKind::Decode);
+    assert!(std::error::Error::source(&error).is_some());
+    for _ in 0..3 {
+        assert!(
+            stream.next().await.is_none(),
+            "stream emitted an event after terminal usage error"
+        );
+    }
+}

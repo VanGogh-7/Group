@@ -954,3 +954,51 @@ async fn descriptor_mismatches_fail_before_snapshot_decode_after_restart() {
         Some(group_agent_core::CheckpointReconstructionError::FormatVersion { .. })
     ));
 }
+
+#[tokio::test]
+async fn typed_cache_releases_snapshots_and_reloads_from_sqlite() {
+    let (_directory, database_url) = database();
+    let raw = raw_store(&database_url).await;
+    let typed = typed_store(Arc::clone(&raw));
+    let thread = ThreadId::from("cache-lifetime");
+    linear_graph()
+        .invoke_with_checkpoint(
+            DurableState::default(),
+            RunConfig::default(),
+            EventConfig::default(),
+            RunControl::default(),
+            CheckpointConfig::new(
+                thread.clone(),
+                typed.clone(),
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect("graph completes");
+    let first = typed.latest(&thread).await.unwrap().unwrap();
+    let id = first.id();
+    let weak_snapshot = Arc::downgrade(first.snapshot());
+    let (left, right) = tokio::join!(typed.get(&thread, id), typed.get(&thread, id));
+    let left = left.unwrap().unwrap();
+    let right = right.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &left));
+    assert!(Arc::ptr_eq(&left, &right));
+    drop((first, left, right));
+    assert!(
+        weak_snapshot.upgrade().is_none(),
+        "cache must not retain released snapshots"
+    );
+
+    let (left, right) = tokio::join!(typed.get(&thread, id), typed.get(&thread, id));
+    let left = left.unwrap().unwrap();
+    let right = right.unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&left, &right),
+        "concurrent cache misses share the live checkpoint"
+    );
+    assert_eq!(left.snapshot().value, 3);
+    let weak_snapshot = Arc::downgrade(left.snapshot());
+    drop((left, right));
+    assert!(weak_snapshot.upgrade().is_none());
+    assert_eq!(raw.history(&thread).await.unwrap().len(), 2);
+}

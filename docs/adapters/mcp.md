@@ -79,7 +79,13 @@ serial execution. Network completion, server annotations, timeout, and local
 Future drop cannot prove that a remote side effect did not occur.
 
 Applications may provide an exact server/Tool behavior override. Overrides are
-validated and frozen during discovery. The adapter never infers safe retry,
+validated and frozen during discovery. The configuration builder rejects
+`requires_idempotency_key = true` with
+`McpConfigError::UnsupportedIdempotencyKeyRequirement`: the adapter does not
+map `ToolInput::idempotency_key` into a remote protocol. Applications with an
+explicit idempotency protocol inside Tool arguments may use ordinary behavior
+overrides, but must supply and enforce those arguments themselves.
+The adapter never infers safe retry,
 exactly-once execution, rollback, or remote cancellation from an annotation.
 
 ## Call and result mapping

@@ -341,17 +341,13 @@ async fn behavior_overrides_are_validated_and_frozen_at_discovery() {
         .expect_err("unknown override is rejected");
     assert_eq!(error.kind(), McpAdapterErrorKind::InvalidConfig);
 
-    let inconsistent = McpDiscoveryConfig::new()
+    let error = McpDiscoveryConfig::new()
         .with_behavior_override(
             "echo",
             ToolBehavior::non_idempotent_write().with_required_idempotency_key(true),
         )
-        .expect("override key is valid");
-    let error = session
-        .discover(inconsistent)
-        .await
-        .expect_err("registry validates behavior");
-    assert_eq!(error.kind(), McpAdapterErrorKind::InvalidToolDefinition);
+        .expect_err("unsupported key requirement is rejected before discovery");
+    assert_eq!(error, McpConfigError::UnsupportedIdempotencyKeyRequirement);
 
     session.shutdown().await.expect("shutdown succeeds");
     server.await.expect("server joins");
@@ -1144,5 +1140,27 @@ fn remove_marker(marker: &Path) {
             std::io::ErrorKind::NotFound,
             "marker cleanup failed"
         );
+    }
+}
+
+#[test]
+fn required_idempotency_key_override_is_rejected_before_discovery() {
+    let result = McpDiscoveryConfig::new().with_behavior_override(
+        "remote-write",
+        ToolBehavior::idempotent_write().with_required_idempotency_key(true),
+    );
+    let error = result.expect_err("MCP cannot forward an application idempotency key");
+    assert_eq!(error, McpConfigError::UnsupportedIdempotencyKeyRequirement);
+    let adapter_error = McpAdapterError::from(error);
+    assert_eq!(adapter_error.kind(), McpAdapterErrorKind::InvalidConfig);
+    assert_eq!(source_of::<McpConfigError>(&adapter_error), Some(&error));
+    for behavior in [
+        ToolBehavior::read_only(),
+        ToolBehavior::idempotent_write(),
+        ToolBehavior::non_idempotent_write(),
+    ] {
+        McpDiscoveryConfig::new()
+            .with_behavior_override("remote-write", behavior)
+            .expect("behavior without required keys remains supported");
     }
 }

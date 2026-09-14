@@ -36,3 +36,6 @@ code, tests, architecture, or quality documentation.
   - finalized the immutable release candidate, completed migrated Harness 1.0
     gates and independent review, and retained tag and publication as separately
     authorized operations.
+- [026 Review corrections](026-review-corrections.md) - fixed terminal stream
+  behavior, rejected unsupported MCP key requirements, reclaimed weak cache
+  entries, and passed full/MSRV verification with independent review.
