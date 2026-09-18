@@ -28,7 +28,11 @@ Experimental surfaces:
 
 The repository contains an experimental non-streaming prebuilt Tool-calling
 loop over the stable Core, Model, and Tool boundaries. This capability does not
-make Prebuilt stable or make the repository production-ready.
+make Prebuilt stable or make the repository production-ready. Under Plan 028,
+Prebuilt gained opt-in durable execution (checkpointed invoke, latest-head
+Resume, read-only Replay, writable Fork) with a crate-owned canonical JSON
+`AgentSnapshotCodec`; the durable surface is experimental and is not a
+production-readiness claim.
 
 ## Current compiler policy
 

@@ -6,24 +6,36 @@ use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(test)]
+use group_agent_core::GraphVersion;
 use group_agent_core::{
-    CompiledGraph, END, EventConfig, Node, NodeContext, NodeError, NodeId, RouteError, RunConfig,
-    RunControl, START, StateGraph,
+    CheckpointConfig, CompiledGraph, END, EventConfig, ForkConfig, Node, NodeContext, NodeError,
+    NodeId, ReplayConfig, ResumeConfig, RouteError, RunConfig, RunControl, START, StateGraph,
 };
 use group_agent_model::{
     AssistantMessage, ChatModel, ChatRequest, Message, TokenUsage, ToolChoice, ToolMessage,
 };
 use group_agent_tool::{ToolBatchConfig, ToolRuntime};
+use serde::{Deserialize, Serialize};
 
 use crate::error::AgentToolBatchFailure;
+use crate::outcome::{AgentForkReport, AgentReplayReport, AgentRunOutcome};
+use crate::snapshot::AgentSnapshot;
 use crate::state::{AgentState, AgentUpdate};
 use crate::{AgentBuildError, AgentConfig, AgentError};
 
 const MODEL_NODE_ID: &str = "model";
 const TOOL_NODE_ID: &str = "tools";
 
+/// Durable compatibility identity of the private Tool-calling graph.
+///
+/// The version is recorded in every durable checkpoint written for this
+/// graph. It must change whenever node identifiers, node paths, or the graph
+/// topology change.
+const AGENT_GRAPH_VERSION: &str = "group-agent-prebuilt/tool-calling-agent/1";
+
 /// Experimental normal stop classification for a prebuilt Agent invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentStopReason {
     /// The model returned an assistant message containing no ToolCalls.
@@ -122,7 +134,7 @@ pub struct AgentOutcome {
 }
 
 impl AgentOutcome {
-    fn from_completed_state(state: AgentState) -> Self {
+    pub(crate) fn from_completed_state(state: AgentState) -> Self {
         let (messages, model_rounds, usage_by_round, stop_reason) = state.into_parts();
         let stop_reason = stop_reason.expect("a completed model graph commits a stop reason");
         Self {
@@ -302,9 +314,10 @@ impl ToolCallingAgent {
     /// Dropping the invocation Future releases local Model and Tool Futures but
     /// does not prove that a remote operation was cancelled or its effects were
     /// undone. Receiving `AgentError` does not prove that Tools did not execute
-    /// and must not be treated as permission to retry blindly. This Agent
-    /// provides no durability, rollback, exactly-once, or automatic-retry
-    /// guarantee.
+    /// and must not be treated as permission to retry blindly. This
+    /// non-durable path persists nothing; durability is opt-in through
+    /// [`Self::invoke_with_checkpoint`]. There is no rollback, exactly-once,
+    /// or automatic-retry guarantee.
     pub async fn invoke(&self, messages: Vec<Message>) -> Result<AgentOutcome, AgentError> {
         self.invoke_inner(messages, EventConfig::default(), RunControl::default())
             .await
@@ -330,8 +343,9 @@ impl ToolCallingAgent {
     /// Earlier Tools may already have produced external side effects before a
     /// later failure. Cancellation, timeout, or dropping this Future releases
     /// locally owned pending Futures; it does not prove that remote work was
-    /// cancelled or rolled back. There is no durability, exactly-once, hidden
-    /// retry, or rollback guarantee.
+    /// cancelled or rolled back. This non-durable path persists nothing;
+    /// durability is opt-in through [`Self::invoke_with_checkpoint_control`].
+    /// There is no exactly-once, hidden-retry, or rollback guarantee.
     pub async fn invoke_with_control(
         &self,
         messages: Vec<Message>,
@@ -362,9 +376,190 @@ impl ToolCallingAgent {
         ))
     }
 
+    /// Experimentally invokes one conversation with opt-in durable
+    /// checkpoints.
+    ///
+    /// Every committed super-step boundary is written to the configured
+    /// checkpointer under the configured logical thread, recorded with the
+    /// graph's stable compatibility version. The checkpoint configuration is
+    /// typed over the public opaque [`AgentSnapshot`]; the private Agent State
+    /// never appears in this API. The result converts eagerly into
+    /// [`AgentRunOutcome`].
+    ///
+    /// This variant uses Core's default event and execution-control
+    /// configuration and delegates to [`Self::invoke_with_checkpoint_control`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] for Model, Tool infrastructure, graph, State,
+    /// checkpoint load/store, cancellation, or timeout failure. Earlier
+    /// committed super-steps remain durably stored in the configured
+    /// checkpointer. The error does not expose the committed transcript.
+    ///
+    /// # Side effects
+    ///
+    /// Tools may produce external side effects before an error is returned.
+    /// Durable checkpoints record committed Agent State only; they do not roll
+    /// back Tool effects. This method performs no hidden retry and provides no
+    /// exactly-once guarantee.
+    pub async fn invoke_with_checkpoint(
+        &self,
+        messages: Vec<Message>,
+        checkpoint_config: CheckpointConfig<AgentSnapshot>,
+    ) -> Result<AgentRunOutcome, AgentError> {
+        self.invoke_with_checkpoint_control(
+            messages,
+            EventConfig::default(),
+            RunControl::default(),
+            checkpoint_config,
+        )
+        .await
+    }
+
+    /// Experimentally invokes one conversation with caller-supplied Core
+    /// events, execution controls, and opt-in durable checkpoints.
+    ///
+    /// Behaves like [`Self::invoke_with_checkpoint`], forwarding the supplied
+    /// [`EventConfig`] and [`RunControl`] unchanged to the Core graph
+    /// invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] for Model, Tool infrastructure, graph, State,
+    /// checkpoint load/store, cancellation, or timeout failure. The error does
+    /// not expose internal committed State or transcript. Earlier committed
+    /// super-steps remain durably stored.
+    ///
+    /// # Side effects
+    ///
+    /// Tools may produce external side effects before a later failure.
+    /// Durable checkpoints record committed Agent State only; they do not roll
+    /// back Tool effects. There is no hidden-retry, exactly-once, or rollback
+    /// guarantee.
+    pub async fn invoke_with_checkpoint_control(
+        &self,
+        messages: Vec<Message>,
+        event_config: EventConfig,
+        run_control: RunControl,
+        checkpoint_config: CheckpointConfig<AgentSnapshot>,
+    ) -> Result<AgentRunOutcome, AgentError> {
+        let outcome = self
+            .graph
+            .invoke_with_checkpoint(
+                AgentState::new(messages),
+                self.run_config.clone(),
+                event_config,
+                run_control,
+                checkpoint_config,
+            )
+            .await
+            .map_err(AgentError::from_graph)?;
+        AgentRunOutcome::from_execution(outcome)
+    }
+
+    /// Experimentally resumes the latest committed checkpoint of one logical
+    /// thread.
+    ///
+    /// Resume is latest-head-only: it loads the thread's current latest
+    /// checkpoint — or the explicitly targeted checkpoint when it is still the
+    /// latest — and continues execution from that committed boundary. Use
+    /// [`Self::replay`] for read-only historical re-execution or [`Self::fork`]
+    /// for a writable branch. New super-step boundaries commit back to the same
+    /// thread through the checkpointer in the resume configuration.
+    ///
+    /// The additional node budget comes from
+    /// [`ResumeConfig::with_run_config`]; when unset, Core's
+    /// [`RunConfig::default`] applies instead of this Agent's
+    /// construction-time step bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the thread has no checkpoint, when the
+    /// stored snapshot fails compatibility or codec validation, and for Model,
+    /// Tool infrastructure, graph, State, checkpoint load/store, cancellation,
+    /// or timeout failure. The error does not expose the committed transcript.
+    /// This method performs no hidden retry.
+    pub async fn resume(
+        &self,
+        resume_config: ResumeConfig<AgentSnapshot>,
+    ) -> Result<AgentRunOutcome, AgentError> {
+        let outcome = self
+            .graph
+            .resume(resume_config)
+            .await
+            .map_err(AgentError::from_graph)?;
+        AgentRunOutcome::from_execution(outcome)
+    }
+
+    /// Experimentally re-executes from one exact historical checkpoint without
+    /// writing lineage.
+    ///
+    /// Replay is exact and read-only: it never saves a checkpoint, advances a
+    /// thread head, or creates a branch. Nodes execute normally and therefore
+    /// may repeat external side effects, including Tool execution.
+    ///
+    /// The additional node budget comes from
+    /// [`ReplayConfig::with_run_config`]; when unset, Core's
+    /// [`RunConfig::default`] applies instead of this Agent's
+    /// construction-time step bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the checkpoint is missing or incompatible,
+    /// and for Model, Tool infrastructure, graph, State, cancellation, or
+    /// timeout failure. The error does not expose the committed transcript.
+    /// This method performs no hidden retry.
+    pub async fn replay(
+        &self,
+        replay_config: ReplayConfig<AgentSnapshot>,
+    ) -> Result<AgentReplayReport, AgentError> {
+        let report = self
+            .graph
+            .replay(replay_config)
+            .await
+            .map_err(AgentError::from_graph)?;
+        Ok(AgentReplayReport::from_replay(report))
+    }
+
+    /// Experimentally creates a writable branch from one exact historical
+    /// checkpoint and runs it.
+    ///
+    /// Fork is the only writable historical branch operation. The source
+    /// thread's head and history stay read-only; every checkpoint produced by
+    /// the branch run commits under the branch's independent head.
+    ///
+    /// The additional node budget comes from
+    /// [`ForkConfig::with_run_config`]; when unset, Core's
+    /// [`RunConfig::default`] applies instead of this Agent's
+    /// construction-time step bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the checkpoint is missing or incompatible,
+    /// when the branch identifier already exists, and for Model, Tool
+    /// infrastructure, graph, State, checkpoint load/store, cancellation, or
+    /// timeout failure. The error does not expose the committed transcript.
+    /// This method performs no hidden retry.
+    pub async fn fork(
+        &self,
+        fork_config: ForkConfig<AgentSnapshot>,
+    ) -> Result<AgentForkReport, AgentError> {
+        let report = self
+            .graph
+            .fork(fork_config)
+            .await
+            .map_err(AgentError::from_graph)?;
+        AgentForkReport::from_fork(report)
+    }
+
     #[cfg(test)]
     pub(crate) fn observed_graph_compiles(&self) -> usize {
         self.compile_probe.observed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_version(&self) -> Option<&GraphVersion> {
+        self.graph.version()
     }
 }
 
@@ -602,6 +797,7 @@ fn compile_agent_graph<C: ModelGraphCompiler>(
     compiler: &C,
 ) -> Result<CompiledGraph<AgentState>, AgentBuildError> {
     let mut graph = StateGraph::new();
+    graph.set_version(AGENT_GRAPH_VERSION);
     graph.add_node(
         MODEL_NODE_ID,
         ModelNode {
@@ -643,7 +839,7 @@ mod tests {
         usage_rounds: usize,
         stop_reason: Option<AgentStopReason>,
     ) -> AgentState {
-        AgentState::from_test_parts(
+        AgentState::from_parts(
             tail.into_iter().collect(),
             model_rounds,
             vec![None; usage_rounds],

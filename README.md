@@ -50,7 +50,9 @@ fresh exact-version consumer verification remain separately authorized. See
 - immutable Tool Registry, precompiled JSON Schema, timeout, batching,
   fail-fast drain, observers, and call-ID-safe ToolMessages;
 - an experimental provider-neutral `ToolCallingAgent` that alternates Model
-  and ToolRuntime rounds and returns `FinalAnswer` or `MaxRounds`;
+  and ToolRuntime rounds, returns `FinalAnswer` or `MaxRounds`, and offers
+  opt-in durable execution (checkpointed invoke, Resume, Replay, Fork) over
+  the Core durable ports;
 - Genai 0.6.5 adapter with evidence-based fail-closed compatibility;
 - MCP 2.2.0 client adapter with bounded discovery and reusable stdio sessions.
 
@@ -224,6 +226,13 @@ Run the complete offline example with:
 cargo run --locked -p group-agent-prebuilt --example tool_calling_agent
 ```
 
+The offline `durable_agent` example demonstrates a checkpointed invoke, a
+mid-run failure, and a latest-head Resume:
+
+```bash
+cargo run --locked -p group-agent-prebuilt --example durable_agent
+```
+
 The application still owns provider construction, MCP lifecycle and Tool
 registration, persistence adapters, product prompts/policy, RAG, Memory, and
 UI. Prebuilt's public API remains experimental.
@@ -264,6 +273,8 @@ Group currently supports:
 - local Tool execution and MCP stdio-backed Tools;
 - experimental Model -> Tool -> Model orchestration with `FinalAnswer` and
   `MaxRounds` outcomes;
+- experimental durable `ToolCallingAgent` execution over in-memory and
+  application-supplied checkpoint stores;
 - offline tests and local fixtures.
 
 ## Deliberate exclusions
@@ -284,10 +295,9 @@ Group does not currently provide:
 Unsupported provider or MCP content fails closed rather than being silently
 dropped.
 
-Prebuilt does not provide streaming orchestration, a built-in durability codec
-or resume/replay/fork API, provider client construction, MCP lifecycle
-ownership, retry/fallback, Tool rollback, exactly-once, human approval,
-structured output, Multi-Agent, or middleware.
+Prebuilt does not provide streaming orchestration, provider client
+construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
+exactly-once, human approval, structured output, Multi-Agent, or middleware.
 
 ## MSRV
 

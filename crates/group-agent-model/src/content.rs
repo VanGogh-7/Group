@@ -6,6 +6,7 @@
 use std::fmt;
 
 #[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum ContentPart {
     /// UTF-8 text in message order.

@@ -9,8 +9,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
 use group_agent_core::{
-    EventConfig, EventRetention, EventSink, GraphBuildError, GraphEvent, GraphRunError, NodeError,
-    NodeId, NodePath, RunControl, RunFailure,
+    EventConfig, EventRetention, EventSink, GraphBuildError, GraphEvent, GraphRunError,
+    GraphVersion, NodeError, NodeId, NodePath, RunControl, RunFailure,
 };
 use group_agent_model::{
     AssistantMessage, ChatModel, ChatModelAdapter, ChatRequest, ChatResponse, FinishReason,
@@ -2245,4 +2245,15 @@ fn agent_build_error_retains_core_source_without_default_source_formatting() {
     );
     assert!(!error.to_string().contains("SECRET_PRIVATE_NODE"));
     assert!(!format!("{error:?}").contains("SECRET_PRIVATE_NODE"));
+}
+
+#[test]
+fn compiled_graph_reports_the_stable_durable_agent_version() {
+    let adapter = ScriptedAdapter::new(ModelCapabilities::new(), vec![]);
+    let agent = agent(adapter.facade(), ToolRuntime::new(ToolRegistry::empty()));
+
+    assert_eq!(
+        agent.graph_version().map(GraphVersion::as_str),
+        Some("group-agent-prebuilt/tool-calling-agent/1"),
+    );
 }

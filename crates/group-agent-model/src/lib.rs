@@ -21,6 +21,11 @@
 //! execution, and provider authentication belong to callers or adapter crates.
 //! Content-bearing types use redacted `Debug` implementations.
 //!
+//! The optional `serde` feature derives `Serialize` and `Deserialize` on the
+//! snapshot-reachable types ([`Message`] and its content, tool-call, and
+//! extension types, plus [`TokenUsage`]) so downstream crates can persist them.
+//! It is disabled by default and changes no runtime behavior.
+//!
 //! ```
 //! use group_agent_model::{ChatModel, ChatRequest, Message};
 //!

@@ -11,6 +11,7 @@ use thiserror::Error;
 /// overwritten accidentally. Values are available through explicit accessors,
 /// while `Debug` reveals only keys.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Extensions(BTreeMap<String, Value>);
 
 impl Extensions {
@@ -125,6 +126,23 @@ impl fmt::Debug for Extensions {
             .debug_struct("Extensions")
             .field("keys", &self.0.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Extensions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entries = <BTreeMap<String, Value> as serde::Deserialize>::deserialize(deserializer)?;
+        let mut extensions = Self::new();
+        for (key, value) in entries {
+            extensions
+                .insert(key, value)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(extensions)
     }
 }
 

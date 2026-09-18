@@ -277,14 +277,23 @@ Core `EventSink`, continues after business Tool errors, stops on Tool
 infrastructure errors, and exposes the complete current failing batch report
 when one exists. There is no hidden retry.
 
+Durability is opt-in. The Agent checkpoints each committed super-step through
+Core's `CheckpointConfig<AgentSnapshot>` and `Checkpointer` ports, and
+`AgentSnapshotCodec` encodes the opaque public snapshot as canonical JSON
+(descriptor identity `group-agent-prebuilt-agent-state` version 1). Resume is
+latest-head-only, Replay is exact and read-only, and Fork is the only writable
+historical branch. The private graph carries the durable `GraphVersion`
+identity `group-agent-prebuilt/tool-calling-agent/1`, which must change with
+any node or topology change.
+
 Applications create provider adapters, own MCP sessions and Tool registration,
 select persistence adapters, and supply product prompts and policy. Local and
-MCP-backed Tools enter the Agent through the same ToolRuntime boundary. A
-built-in durability codec or resume/replay/fork API, streaming orchestration,
-provider construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
-exactly-once, approval, structured output, Memory, RAG, PDF/OCR, Multi-Agent,
-and middleware are not provided. Repository selection, citation rendering,
-product permissions, UI, and prompt policy remain application-owned.
+MCP-backed Tools enter the Agent through the same ToolRuntime boundary.
+Streaming orchestration, provider construction, MCP lifecycle ownership,
+retry/fallback, Tool rollback, exactly-once, approval, structured output,
+Memory, RAG, PDF/OCR, Multi-Agent, and middleware are not provided. Repository
+selection, citation rendering, product permissions, UI, and prompt policy
+remain application-owned.
 
 ## Further reading
 

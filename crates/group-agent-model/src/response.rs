@@ -90,6 +90,7 @@ impl fmt::Debug for FinishReason {
 /// cannot be smaller than a known component or the checked sum of both known
 /// components.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TokenUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -247,6 +248,27 @@ impl fmt::Debug for TokenUsage {
             .field("total_tokens", &self.total_tokens)
             .field("extensions", &self.extensions)
             .finish()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TokenUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct TokenUsageData {
+            input_tokens: Option<u64>,
+            output_tokens: Option<u64>,
+            total_tokens: Option<u64>,
+            extensions: Extensions,
+        }
+
+        let data = <TokenUsageData as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_parts(data.input_tokens, data.output_tokens, data.total_tokens)
+            .map_err(serde::de::Error::custom)
+            .map(|usage| usage.with_extensions(data.extensions))
     }
 }
 

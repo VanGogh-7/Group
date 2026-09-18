@@ -59,8 +59,11 @@ impl AgentState {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_test_parts(
+    pub(crate) fn usage_by_round(&self) -> &[Option<TokenUsage>] {
+        &self.usage_by_round
+    }
+
+    pub(crate) fn from_parts(
         messages: Vec<Message>,
         model_rounds: usize,
         usage_by_round: Vec<Option<TokenUsage>>,

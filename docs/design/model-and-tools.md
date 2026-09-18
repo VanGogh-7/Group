@@ -155,9 +155,10 @@ remains aligned rather than merged as though independent responses were one
 cumulative stream.
 
 The Prebuilt API is experimental. Private State, Update, Nodes, routers,
-topology, and `CompiledGraph` are not public extension points. Streaming,
-built-in durable codecs or resume/replay/fork, provider construction, MCP
-lifecycle, fallback/retry, rollback, exactly-once, approval, structured output,
+topology, and `CompiledGraph` are not public extension points. Durable
+execution is opt-in through Core checkpoint ports and the crate-owned canonical
+JSON `AgentSnapshotCodec`. Streaming, provider construction, MCP lifecycle,
+fallback/retry, rollback, exactly-once, approval, structured output,
 Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not implemented here.
 Provider adapters, MCP session setup and Tool registration, persistence,
 product prompts/policy, RAG, Memory, and UI remain application-owned.

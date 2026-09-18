@@ -13,8 +13,12 @@ readme.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+serde = { workspace = true, optional = true }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+serde = ["dep:serde"]
 
 [dev-dependencies]
 criterion.workspace = true

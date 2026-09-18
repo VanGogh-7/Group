@@ -9,6 +9,7 @@ macro_rules! tool_string_id {
     ($name:ident, $error:expr, $doc:literal) => {
         #[doc = $doc]
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize))]
         pub struct $name(Arc<str>);
 
         impl $name {
@@ -47,6 +48,17 @@ macro_rules! tool_string_id {
 
             fn try_from(value: String) -> Result<Self, Self::Error> {
                 Self::new(value)
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
             }
         }
     };
@@ -117,6 +129,7 @@ impl fmt::Debug for ToolDefinition {
 
 /// A complete tool call produced by a model.
 #[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolCall {
     id: ToolCallId,
     name: ToolName,
@@ -184,6 +197,7 @@ impl fmt::Debug for ToolCall {
 ///
 /// Tool execution itself is intentionally outside this crate.
 #[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolResult {
     content: Vec<ContentPart>,
     is_error: bool,

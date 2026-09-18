@@ -4,6 +4,7 @@ use crate::{ContentPart, Extensions, ToolCall, ToolCallId, ToolResult};
 
 /// A provider-neutral message role.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Role {
     /// Model behavior and context instructions.
@@ -18,6 +19,7 @@ pub enum Role {
 
 /// A system message.
 #[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SystemMessage {
     content: Vec<ContentPart>,
 }
@@ -44,6 +46,7 @@ impl SystemMessage {
 
 /// A user message.
 #[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UserMessage {
     content: Vec<ContentPart>,
 }
@@ -70,6 +73,7 @@ impl UserMessage {
 
 /// An assistant message containing text, tool calls, or both.
 #[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AssistantMessage {
     content: Vec<ContentPart>,
     tool_calls: Vec<ToolCall>,
@@ -167,6 +171,7 @@ impl fmt::Debug for AssistantMessage {
 
 /// A tool-result message linked to a prior assistant tool call.
 #[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolMessage {
     tool_call_id: ToolCallId,
     result: ToolResult,
@@ -207,6 +212,7 @@ impl ToolMessage {
 
 /// A strongly typed provider-neutral chat message.
 #[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Message {
     /// System instructions.

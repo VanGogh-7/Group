@@ -1,24 +1,45 @@
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use group_agent_model::{
     AssistantMessage, ChatModel, ChatModelAdapter, ChatResponse, FinishReason, Message,
-    ModelCapabilities, ModelError, ModelId, ModelMetadata, ProviderId, ToolCall, ToolCallId,
-    ToolDefinition, ToolName, ValidatedChatRequest,
+    ModelCapabilities, ModelError, ModelErrorKind, ModelId, ModelMetadata, ProviderId, ToolCall,
+    ToolCallId, ToolDefinition, ToolName, ValidatedChatRequest,
 };
 use group_agent_tool::{
     Tool, ToolBehavior, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRuntime,
 };
 use serde_json::json;
 
+#[derive(Clone, Copy)]
 pub enum Script {
     ModelOnly,
     OneToolRound,
 }
 
+/// Every transcript received by a scripted facade built with
+/// [`ScriptedModel::fail_once`], in call order.
+#[derive(Clone)]
+pub struct RecordedTranscripts {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+impl RecordedTranscripts {
+    /// Returns every received transcript in call order.
+    pub fn all(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
 pub struct ScriptedModel {
     metadata: ModelMetadata,
     script: Script,
+    fail_once_on_call: Option<usize>,
+    calls: AtomicUsize,
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
 }
 
 impl ScriptedModel {
@@ -30,7 +51,27 @@ impl ScriptedModel {
         Self::build(Script::OneToolRound)
     }
 
+    /// Builds a scripted facade that fails exactly once with an
+    /// infrastructure-style error on the 1-based `fail_on_call` call and then
+    /// follows `script`, alongside a recording of every received transcript.
+    pub fn fail_once(
+        script: Script,
+        fail_on_call: usize,
+    ) -> Result<(ChatModel, RecordedTranscripts), Box<dyn std::error::Error>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Self::facade(script, Some(fail_on_call), Arc::clone(&requests))?;
+        Ok((model, RecordedTranscripts { requests }))
+    }
+
     fn build(script: Script) -> Result<ChatModel, Box<dyn std::error::Error>> {
+        Self::facade(script, None, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn facade(
+        script: Script,
+        fail_once_on_call: Option<usize>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    ) -> Result<ChatModel, Box<dyn std::error::Error>> {
         let capabilities = match script {
             Script::ModelOnly => ModelCapabilities::new(),
             Script::OneToolRound => ModelCapabilities::new().with_tool_calling(true),
@@ -42,6 +83,9 @@ impl ScriptedModel {
                 capabilities,
             ),
             script,
+            fail_once_on_call,
+            calls: AtomicUsize::new(0),
+            requests,
         })?)
     }
 }
@@ -56,6 +100,17 @@ impl ChatModelAdapter for ScriptedModel {
         &self,
         request: ValidatedChatRequest,
     ) -> Result<ChatResponse, ModelError> {
+        let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push(request.messages().to_vec());
+        if self.fail_once_on_call == Some(call_number) {
+            return Err(ModelError::new(
+                ModelErrorKind::Other,
+                "scripted one-time infrastructure failure",
+            ));
+        }
         let has_tool_message = request
             .messages()
             .iter()

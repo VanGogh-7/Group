@@ -22,3 +22,8 @@ corrections were approved and completed on 2026-09-15 in
 
 [Plan 027](../completed/027-unify-msrv.md) completed the unified Rust 1.88 MSRV
 on 2026-09-15.
+
+[Plan 028](../completed/028-prebuilt-durability.md) completed opt-in durable
+execution (checkpointed invoke, Resume, Replay, Fork) for the experimental
+Prebuilt ToolCallingAgent on 2026-09-18, including the feature-gated Model
+serde surface and the review corrections for both Minor findings.

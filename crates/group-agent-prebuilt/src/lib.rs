@@ -11,13 +11,17 @@
 //! work ownership but does not prove remote cancellation or side-effect
 //! rollback, and the crate performs no automatic retry.
 //!
+//! Durable execution is opt-in. `invoke_with_checkpoint`, `resume`, `replay`,
+//! and `fork` accept Core checkpoint configuration typed over the public
+//! opaque [`AgentSnapshot`], and [`AgentSnapshotCodec`] encodes snapshots as
+//! canonical JSON. Plain `invoke` stays non-durable.
+//!
 //! Provider adapters, MCP lifecycle, persistence, observability adapters, and
-//! product policy stay outside this crate. Streaming orchestration, built-in
-//! durability codecs or resume/replay/fork, provider construction, MCP
-//! lifecycle ownership, retry/fallback, rollback, exactly-once, approval,
-//! structured output, Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not
-//! implemented. Local and MCP-backed Tools use the same injected ToolRuntime
-//! boundary.
+//! product policy stay outside this crate. Streaming orchestration, provider
+//! construction, MCP lifecycle ownership, retry/fallback, rollback,
+//! exactly-once, approval, structured output, Memory/RAG/PDF/OCR, Multi-Agent,
+//! and middleware are not implemented. Local and MCP-backed Tools use the same
+//! injected ToolRuntime boundary.
 //!
 //! Core, Model, and Tool retain their stable boundaries. This crate's public
 //! API remains experimental, and its private State, Update, Nodes, router,
@@ -60,11 +64,17 @@
 //! ```
 
 mod agent;
+mod codec;
 mod error;
+mod outcome;
+mod snapshot;
 mod state;
 
 pub use agent::{AgentOutcome, AgentStopReason, ToolCallingAgent};
+pub use codec::AgentSnapshotCodec;
 pub use error::{AgentBuildError, AgentError};
+pub use outcome::{AgentForkReport, AgentInterrupted, AgentReplayReport, AgentRunOutcome};
+pub use snapshot::AgentSnapshot;
 
 /// Experimental version-one configuration for a prebuilt Tool-calling Agent.
 ///
