@@ -27,3 +27,10 @@ on 2026-09-15.
 execution (checkpointed invoke, Resume, Replay, Fork) for the experimental
 Prebuilt ToolCallingAgent on 2026-09-18, including the feature-gated Model
 serde surface and the review corrections for both Minor findings.
+
+[Plan 029](../completed/029-prebuilt-tool-approval.md) completed opt-in
+durable human tool approval (InterruptibleNode suspension before Tool side
+effects, approve/reject Resume decisions, split approval GraphVersion) plus
+the additive Core `run_config()` config getters on 2026-09-18. Independent
+review returned PASS with no findings; the one accepted suggestion
+(cross-configuration resume tests) was implemented before closure.

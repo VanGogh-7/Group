@@ -2257,3 +2257,21 @@ fn compiled_graph_reports_the_stable_durable_agent_version() {
         Some("group-agent-prebuilt/tool-calling-agent/1"),
     );
 }
+
+#[test]
+fn approval_agent_compiles_and_reports_the_approval_graph_version() {
+    let adapter = ScriptedAdapter::new(ModelCapabilities::new(), vec![]);
+    let agent = ToolCallingAgent::new(
+        adapter.facade(),
+        ToolRuntime::new(ToolRegistry::empty()),
+        AgentConfig::new(1)
+            .expect("valid round config")
+            .with_tool_approval(true),
+    )
+    .expect("approval agent construction succeeds");
+
+    assert_eq!(
+        agent.graph_version().map(GraphVersion::as_str),
+        Some("group-agent-prebuilt/tool-calling-agent/approval/1"),
+    );
+}

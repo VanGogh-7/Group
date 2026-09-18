@@ -9,11 +9,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use group_agent_core::GraphVersion;
 use group_agent_core::{
-    CheckpointConfig, CompiledGraph, END, EventConfig, ForkConfig, Node, NodeContext, NodeError,
-    NodeId, ReplayConfig, ResumeConfig, RouteError, RunConfig, RunControl, START, StateGraph,
+    CheckpointConfig, CompiledGraph, END, EventConfig, ForkConfig, InterruptibleNode, Node,
+    NodeContext, NodeError, NodeId, NodeOutcome, ReplayConfig, ResumeConfig, RouteError, RunConfig,
+    RunControl, START, StateGraph,
 };
 use group_agent_model::{
-    AssistantMessage, ChatModel, ChatRequest, Message, TokenUsage, ToolChoice, ToolMessage,
+    AssistantMessage, ChatModel, ChatRequest, Message, TokenUsage, ToolCall, ToolChoice,
+    ToolMessage, ToolResult,
 };
 use group_agent_tool::{ToolBatchConfig, ToolRuntime};
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,9 @@ use crate::error::AgentToolBatchFailure;
 use crate::outcome::{AgentForkReport, AgentReplayReport, AgentRunOutcome};
 use crate::snapshot::AgentSnapshot;
 use crate::state::{AgentState, AgentUpdate};
-use crate::{AgentBuildError, AgentConfig, AgentError};
+use crate::{
+    AgentApprovalDecision, AgentApprovalRequest, AgentBuildError, AgentConfig, AgentError,
+};
 
 const MODEL_NODE_ID: &str = "model";
 const TOOL_NODE_ID: &str = "tools";
@@ -33,6 +37,14 @@ const TOOL_NODE_ID: &str = "tools";
 /// graph. It must change whenever node identifiers, node paths, or the graph
 /// topology change.
 const AGENT_GRAPH_VERSION: &str = "group-agent-prebuilt/tool-calling-agent/1";
+
+/// Durable compatibility identity of the approval-enabled Tool-calling graph.
+///
+/// Approval changes the Tool node's kind, so approval-enabled and base agents
+/// resume only from their own checkpoints; cross-configuration resume fails
+/// closed at this identity boundary. The version is pinned by tests and must
+/// change whenever node identifiers, node paths, or the topology change.
+const AGENT_APPROVAL_GRAPH_VERSION: &str = "group-agent-prebuilt/tool-calling-agent/approval/1";
 
 /// Experimental normal stop classification for a prebuilt Agent invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -275,10 +287,21 @@ impl ToolCallingAgent {
         #[cfg(test)]
         let compile_probe = CountingModelGraphCompiler::default();
         #[cfg(test)]
-        let graph = compile_agent_graph(model, tools, config.max_rounds(), &compile_probe)?;
+        let graph = compile_agent_graph(
+            model,
+            tools,
+            config.max_rounds(),
+            config.tool_approval(),
+            &compile_probe,
+        )?;
         #[cfg(not(test))]
-        let graph =
-            compile_agent_graph(model, tools, config.max_rounds(), &CoreModelGraphCompiler)?;
+        let graph = compile_agent_graph(
+            model,
+            tools,
+            config.max_rounds(),
+            config.tool_approval(),
+            &CoreModelGraphCompiler,
+        )?;
         Ok(Self {
             graph,
             run_config: RunConfig::new(max_steps),
@@ -468,9 +491,10 @@ impl ToolCallingAgent {
     /// thread through the checkpointer in the resume configuration.
     ///
     /// The additional node budget comes from
-    /// [`ResumeConfig::with_run_config`]; when unset, Core's
-    /// [`RunConfig::default`] applies instead of this Agent's
-    /// construction-time step bound.
+    /// [`ResumeConfig::with_run_config`]; when unset, this Agent's
+    /// construction-time step bound applies instead of Core's
+    /// [`RunConfig::default`]. An explicit caller-set value equal to the Core
+    /// default is treated as unset.
     ///
     /// # Errors
     ///
@@ -483,6 +507,11 @@ impl ToolCallingAgent {
         &self,
         resume_config: ResumeConfig<AgentSnapshot>,
     ) -> Result<AgentRunOutcome, AgentError> {
+        let resume_config = if *resume_config.run_config() == RunConfig::default() {
+            resume_config.with_run_config(self.run_config.clone())
+        } else {
+            resume_config
+        };
         let outcome = self
             .graph
             .resume(resume_config)
@@ -499,9 +528,10 @@ impl ToolCallingAgent {
     /// may repeat external side effects, including Tool execution.
     ///
     /// The additional node budget comes from
-    /// [`ReplayConfig::with_run_config`]; when unset, Core's
-    /// [`RunConfig::default`] applies instead of this Agent's
-    /// construction-time step bound.
+    /// [`ReplayConfig::with_run_config`]; when unset, this Agent's
+    /// construction-time step bound applies instead of Core's
+    /// [`RunConfig::default`]. An explicit caller-set value equal to the Core
+    /// default is treated as unset.
     ///
     /// # Errors
     ///
@@ -513,6 +543,11 @@ impl ToolCallingAgent {
         &self,
         replay_config: ReplayConfig<AgentSnapshot>,
     ) -> Result<AgentReplayReport, AgentError> {
+        let replay_config = if *replay_config.run_config() == RunConfig::default() {
+            replay_config.with_run_config(self.run_config.clone())
+        } else {
+            replay_config
+        };
         let report = self
             .graph
             .replay(replay_config)
@@ -529,9 +564,10 @@ impl ToolCallingAgent {
     /// the branch run commits under the branch's independent head.
     ///
     /// The additional node budget comes from
-    /// [`ForkConfig::with_run_config`]; when unset, Core's
-    /// [`RunConfig::default`] applies instead of this Agent's
-    /// construction-time step bound.
+    /// [`ForkConfig::with_run_config`]; when unset, this Agent's
+    /// construction-time step bound applies instead of Core's
+    /// [`RunConfig::default`]. An explicit caller-set value equal to the Core
+    /// default is treated as unset.
     ///
     /// # Errors
     ///
@@ -544,6 +580,11 @@ impl ToolCallingAgent {
         &self,
         fork_config: ForkConfig<AgentSnapshot>,
     ) -> Result<AgentForkReport, AgentError> {
+        let fork_config = if *fork_config.run_config() == RunConfig::default() {
+            fork_config.with_run_config(self.run_config.clone())
+        } else {
+            fork_config
+        };
         let report = self
             .graph
             .fork(fork_config)
@@ -614,6 +655,81 @@ struct ToolNode {
     max_rounds: usize,
 }
 
+/// Fixed payload-free ToolMessage content committed for a rejected call.
+const TOOL_REJECTION_NOTICE: &str = "tool call rejected by approval";
+
+impl ToolNode {
+    fn validated_pending_calls<'a>(
+        &self,
+        state: &'a AgentState,
+    ) -> Result<&'a [ToolCall], NodeError> {
+        let calls = state.pending_tool_calls().ok_or_else(|| {
+            NodeError::with_source("tool node invariant failed", ToolNodeInvariant)
+        })?;
+        if calls.is_empty() {
+            return Err(NodeError::with_source(
+                "tool node invariant failed",
+                ToolNodeInvariant,
+            ));
+        }
+        if state.model_rounds() > self.max_rounds {
+            return Err(NodeError::with_source(
+                "tool node invariant failed",
+                ToolNodeInvariant,
+            ));
+        }
+        Ok(calls)
+    }
+
+    async fn execute_pending(
+        &self,
+        state: &AgentState,
+        calls: &[ToolCall],
+    ) -> Result<AgentUpdate, NodeError> {
+        let report = self
+            .runtime
+            .execute_batch(calls.to_vec(), ToolBatchConfig::default())
+            .await
+            .map_err(|source| NodeError::with_source("tool batch rejected", source))?;
+        if report.results().iter().any(Result::is_err) {
+            return Err(NodeError::with_source(
+                "tool batch execution failed",
+                AgentToolBatchFailure::new(report),
+            ));
+        }
+
+        let messages = report
+            .into_tool_messages()
+            .into_iter()
+            .map(|message| match message {
+                Ok(Message::Tool(message)) => message,
+                Ok(_) | Err(_) => unreachable!("validated Tool batch message conversion"),
+            })
+            .collect::<Vec<ToolMessage>>();
+        Ok(self.tools_completed(state, messages))
+    }
+
+    fn rejected_update(&self, state: &AgentState, calls: &[ToolCall]) -> AgentUpdate {
+        let messages = calls
+            .iter()
+            .map(|call| {
+                ToolMessage::new(
+                    call.id().clone(),
+                    ToolResult::error_text(TOOL_REJECTION_NOTICE),
+                )
+            })
+            .collect();
+        self.tools_completed(state, messages)
+    }
+
+    fn tools_completed(&self, state: &AgentState, messages: Vec<ToolMessage>) -> AgentUpdate {
+        AgentUpdate::ToolsCompleted {
+            messages,
+            reached_max_rounds: state.model_rounds() == self.max_rounds,
+        }
+    }
+}
+
 impl Node<AgentState> for ToolNode {
     fn run<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
@@ -627,46 +743,47 @@ impl Node<AgentState> for ToolNode {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let calls = state.pending_tool_calls().ok_or_else(|| {
-                NodeError::with_source("tool node invariant failed", ToolNodeInvariant)
-            })?;
-            if calls.is_empty() {
-                return Err(NodeError::with_source(
-                    "tool node invariant failed",
-                    ToolNodeInvariant,
-                ));
-            }
-            if state.model_rounds() > self.max_rounds {
-                return Err(NodeError::with_source(
-                    "tool node invariant failed",
-                    ToolNodeInvariant,
-                ));
-            }
+            let calls = self.validated_pending_calls(state)?;
+            self.execute_pending(state, calls).await
+        })
+    }
+}
 
-            let report = self
-                .runtime
-                .execute_batch(calls.to_vec(), ToolBatchConfig::default())
-                .await
-                .map_err(|source| NodeError::with_source("tool batch rejected", source))?;
-            if report.results().iter().any(Result::is_err) {
-                return Err(NodeError::with_source(
-                    "tool batch execution failed",
-                    AgentToolBatchFailure::new(report),
-                ));
+impl InterruptibleNode<AgentState> for ToolNode {
+    fn run<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        state: &'life1 AgentState,
+        context: &'life2 NodeContext,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<NodeOutcome<AgentUpdate>, NodeError>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let calls = self.validated_pending_calls(state)?;
+            if !context.has_resume_value() {
+                return Ok(NodeOutcome::interrupt(AgentApprovalRequest::new(
+                    calls.to_vec(),
+                )));
             }
-
-            let messages = report
-                .into_tool_messages()
-                .into_iter()
-                .map(|message| match message {
-                    Ok(Message::Tool(message)) => message,
-                    Ok(_) | Err(_) => unreachable!("validated Tool batch message conversion"),
-                })
-                .collect::<Vec<ToolMessage>>();
-            Ok(AgentUpdate::ToolsCompleted {
-                messages,
-                reached_max_rounds: state.model_rounds() == self.max_rounds,
-            })
+            let decision = context
+                .require_resume_value::<AgentApprovalDecision>()
+                .map_err(|source| NodeError::with_source("invalid approval decision", source))?;
+            // Exhaustive on purpose: introducing a future decision variant
+            // fails this build instead of ever falling through to approval.
+            match decision {
+                AgentApprovalDecision::Approve => self
+                    .execute_pending(state, calls)
+                    .await
+                    .map(NodeOutcome::update),
+                AgentApprovalDecision::Reject => {
+                    Ok(NodeOutcome::update(self.rejected_update(state, calls)))
+                }
+            }
         })
     }
 }
@@ -794,10 +911,15 @@ fn compile_agent_graph<C: ModelGraphCompiler>(
     model: ChatModel,
     tools: ToolRuntime,
     max_rounds: usize,
+    tool_approval: bool,
     compiler: &C,
 ) -> Result<CompiledGraph<AgentState>, AgentBuildError> {
     let mut graph = StateGraph::new();
-    graph.set_version(AGENT_GRAPH_VERSION);
+    graph.set_version(if tool_approval {
+        AGENT_APPROVAL_GRAPH_VERSION
+    } else {
+        AGENT_GRAPH_VERSION
+    });
     graph.add_node(
         MODEL_NODE_ID,
         ModelNode {
@@ -805,13 +927,15 @@ fn compile_agent_graph<C: ModelGraphCompiler>(
             tools: tools.clone(),
         },
     )?;
-    graph.add_node(
-        TOOL_NODE_ID,
-        ToolNode {
-            runtime: tools,
-            max_rounds,
-        },
-    )?;
+    let tool_node = ToolNode {
+        runtime: tools,
+        max_rounds,
+    };
+    if tool_approval {
+        graph.add_interruptible_node(TOOL_NODE_ID, tool_node)?;
+    } else {
+        graph.add_node(TOOL_NODE_ID, tool_node)?;
+    }
     graph.add_edge(START, MODEL_NODE_ID);
     graph.add_conditional_edges(MODEL_NODE_ID, [END, TOOL_NODE_ID], route_after_model)?;
     graph.add_conditional_edges(TOOL_NODE_ID, [END, MODEL_NODE_ID], move |state| {

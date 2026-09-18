@@ -872,6 +872,12 @@ where
         self.target
     }
 
+    /// Returns the additional node budget for this resume call.
+    #[must_use]
+    pub const fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
     pub(crate) fn into_parts(self) -> ResumeParts<T> {
         ResumeParts {
             thread_id: self.thread_id,
@@ -1042,6 +1048,12 @@ where
         self.branch_id
     }
 
+    /// Returns the additional node budget for this fork call.
+    #[must_use]
+    pub const fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
     pub(crate) fn into_parts(self) -> ForkParts<T> {
         ForkParts {
             thread_id: self.thread_id,
@@ -1165,6 +1177,12 @@ where
     #[must_use]
     pub const fn checkpoint_id(&self) -> CheckpointId {
         self.checkpoint_id
+    }
+
+    /// Returns the additional node budget for this replay call.
+    #[must_use]
+    pub const fn run_config(&self) -> &RunConfig {
+        &self.run_config
     }
 
     pub(crate) fn into_parts(self) -> ReplayParts<T> {
@@ -1741,6 +1759,28 @@ mod tests {
             interrupt: None,
         })
         .expect("test record should be valid")
+    }
+
+    #[test]
+    fn run_config_getters_return_the_default_and_the_caller_override() {
+        let checkpointer =
+            Arc::new(InMemoryCheckpointer::new(UsizeCodec)) as Arc<dyn Checkpointer<usize>>;
+        let checkpoint_id = CheckpointId::next();
+
+        let resume = ResumeConfig::new("thread", Arc::clone(&checkpointer));
+        assert_eq!(resume.run_config(), &RunConfig::default());
+        let resume = resume.with_run_config(RunConfig::new(7));
+        assert_eq!(resume.run_config(), &RunConfig::new(7));
+
+        let replay = ReplayConfig::new("thread", checkpoint_id, Arc::clone(&checkpointer));
+        assert_eq!(replay.run_config(), &RunConfig::default());
+        let replay = replay.with_run_config(RunConfig::new(8));
+        assert_eq!(replay.run_config(), &RunConfig::new(8));
+
+        let fork = ForkConfig::new("thread", checkpoint_id, checkpointer);
+        assert_eq!(fork.run_config(), &RunConfig::default());
+        let fork = fork.with_run_config(RunConfig::new(9));
+        assert_eq!(fork.run_config(), &RunConfig::new(9));
     }
 
     #[tokio::test]

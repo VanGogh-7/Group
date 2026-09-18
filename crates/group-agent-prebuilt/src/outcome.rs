@@ -7,7 +7,7 @@ use group_agent_core::{
 use group_agent_model::AssistantMessage;
 
 use crate::state::AgentState;
-use crate::{AgentError, AgentOutcome, AgentStopReason};
+use crate::{AgentApprovalRequest, AgentError, AgentOutcome, AgentStopReason};
 
 /// Experimental outcome of one checkpoint-enabled, resumed, or forked Agent
 /// run.
@@ -99,13 +99,14 @@ impl fmt::Debug for AgentRunOutcome {
 
 /// Experimental metadata of a durably suspended Agent run.
 ///
-/// The current graph contains no Interruptible Nodes, so a run cannot suspend
-/// today; the variant is first-class so a later interruptible release does
-/// not change this type's shape. The interrupt payload stays behind the
-/// stored checkpoint and is not exposed here.
+/// An approval-enabled Agent suspends when its Tool node is reached without
+/// an approval decision; the downcast approval request is then exposed
+/// through [`Self::approval_request`]. Any other interrupt payload stays
+/// behind the stored checkpoint and is not exposed here.
 pub struct AgentInterrupted {
     thread_id: ThreadId,
     checkpoint_id: CheckpointId,
+    approval_request: Option<AgentApprovalRequest>,
 }
 
 impl AgentInterrupted {
@@ -113,6 +114,11 @@ impl AgentInterrupted {
         Self {
             thread_id: report.thread_id().clone(),
             checkpoint_id: report.checkpoint_id(),
+            approval_request: report
+                .interrupt()
+                .payload()
+                .downcast_ref::<AgentApprovalRequest>()
+                .cloned(),
         }
     }
 
@@ -127,6 +133,18 @@ impl AgentInterrupted {
     pub const fn checkpoint_id(&self) -> CheckpointId {
         self.checkpoint_id
     }
+
+    /// Returns the pending Tool approval request when the suspension was
+    /// raised for Tool approval.
+    ///
+    /// The calls are exposed through the explicit
+    /// [`AgentApprovalRequest::pending_calls`] accessor so an application can
+    /// present them to a human approver before resuming with an
+    /// [`crate::AgentApprovalDecision`].
+    #[must_use]
+    pub const fn approval_request(&self) -> Option<&AgentApprovalRequest> {
+        self.approval_request.as_ref()
+    }
 }
 
 impl fmt::Debug for AgentInterrupted {
@@ -135,6 +153,7 @@ impl fmt::Debug for AgentInterrupted {
             .debug_struct("AgentInterrupted")
             .field("thread_id", &self.thread_id)
             .field("checkpoint_id", &self.checkpoint_id)
+            .field("has_approval_request", &self.approval_request.is_some())
             .finish()
     }
 }
@@ -296,11 +315,11 @@ impl fmt::Debug for AgentForkReport {
 #[cfg(test)]
 mod tests {
     use group_agent_core::{BranchId, CheckpointId, GraphState as _, RunId, ThreadId};
-    use group_agent_model::{AssistantMessage, Message};
+    use group_agent_model::{AssistantMessage, Message, ToolCall, ToolCallId, ToolName};
 
     use super::{AgentForkReport, AgentInterrupted, AgentReplayReport, AgentRunOutcome};
     use crate::state::{AgentState, AgentUpdate};
-    use crate::{AgentOutcome, AgentStopReason};
+    use crate::{AgentApprovalRequest, AgentOutcome, AgentStopReason};
 
     fn secret_outcome() -> AgentOutcome {
         let mut state = AgentState::new(vec![Message::user("SECRET_QUESTION")]);
@@ -317,6 +336,7 @@ mod tests {
         AgentInterrupted {
             thread_id: ThreadId::from("interrupted-thread"),
             checkpoint_id: CheckpointId::new(),
+            approval_request: None,
         }
     }
 
@@ -369,6 +389,39 @@ mod tests {
         let interrupted_debug = format!("{:?}", AgentRunOutcome::Interrupted(interrupted()));
         assert!(interrupted_debug.contains("Interrupted"));
         assert!(interrupted_debug.contains("interrupted-thread"));
+    }
+
+    #[test]
+    fn interrupted_outcome_exposes_the_approval_request_with_redacted_debug() {
+        let request = AgentApprovalRequest::new(vec![ToolCall::new(
+            ToolCallId::new("SECRET_CALL").expect("valid call id"),
+            ToolName::new("SECRET_TOOL").expect("valid tool name"),
+            serde_json::json!({"q": "SECRET_ARGUMENT"}),
+        )]);
+        let outcome = AgentRunOutcome::Interrupted(AgentInterrupted {
+            thread_id: ThreadId::from("approval-thread"),
+            checkpoint_id: CheckpointId::new(),
+            approval_request: Some(request.clone()),
+        });
+
+        let suspension = outcome.as_interrupted().expect("interrupted variant");
+        assert_eq!(suspension.approval_request(), Some(&request));
+        assert_eq!(
+            suspension
+                .approval_request()
+                .map(|request| request.pending_calls().len()),
+            Some(1)
+        );
+        assert!(interrupted().approval_request().is_none());
+
+        let rendered = format!("{outcome:?}");
+        assert!(rendered.contains("has_approval_request: true"));
+        for marker in ["SECRET_CALL", "SECRET_TOOL", "SECRET_ARGUMENT"] {
+            assert!(
+                !rendered.contains(marker),
+                "Debug must not contain {marker}"
+            );
+        }
     }
 
     #[test]

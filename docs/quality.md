@@ -32,7 +32,11 @@ make Prebuilt stable or make the repository production-ready. Under Plan 028,
 Prebuilt gained opt-in durable execution (checkpointed invoke, latest-head
 Resume, read-only Replay, writable Fork) with a crate-owned canonical JSON
 `AgentSnapshotCodec`; the durable surface is experimental and is not a
-production-readiness claim.
+production-readiness claim. Under Plan 029, Prebuilt gained opt-in durable
+Tool approval (`AgentApprovalRequest`/`AgentApprovalDecision` over Core
+interrupt resume values) and Core gained additive read-only `run_config()`
+accessors on the Resume/Replay/Fork configurations; both surfaces remain
+experimental and are not a production-readiness claim.
 
 ## Current compiler policy
 

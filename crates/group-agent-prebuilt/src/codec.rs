@@ -1,6 +1,8 @@
-use group_agent_core::{CheckpointCodec, CheckpointCodecError, CodecDescriptor};
+use group_agent_core::{
+    CheckpointCodec, CheckpointCodecError, CodecDescriptor, EncodedValue, InterruptPayload,
+};
 
-use crate::AgentSnapshot;
+use crate::{AgentApprovalRequest, AgentSnapshot};
 
 /// Canonical JSON codec for durable Agent snapshots.
 ///
@@ -10,8 +12,13 @@ use crate::AgentSnapshot;
 /// every stored checkpoint, and changing any component requires a deliberate
 /// migration of stored checkpoints.
 ///
-/// Interrupt payloads are rejected by the trait defaults because this crate's
-/// graph contains no Interruptible Nodes.
+/// Interrupt payloads are supported for the experimental
+/// [`AgentApprovalRequest`] type only; every other payload type keeps failing
+/// closed with `UnsupportedInterruptPayload`. The approval interrupt
+/// descriptor (`group-agent-prebuilt-tool-approval`, 1, `json`) is a durable
+/// compatibility identity like the snapshot descriptor
+/// (`group-agent-prebuilt-agent-state`, 1, `json`), and both share the `json`
+/// encoding identity the Runtime enforces across one codec's descriptors.
 ///
 /// Decoding enforces the Model types' invariants — validated identifiers,
 /// extension keys, and token-usage consistency — in addition to JSON
@@ -19,6 +26,10 @@ use crate::AgentSnapshot;
 /// reject fail with a typed [`CheckpointCodecError`] instead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentSnapshotCodec;
+
+fn approval_interrupt_descriptor() -> CodecDescriptor {
+    CodecDescriptor::new("group-agent-prebuilt-tool-approval", 1, "json")
+}
 
 impl CheckpointCodec<AgentSnapshot> for AgentSnapshotCodec {
     fn snapshot_descriptor(&self) -> CodecDescriptor {
@@ -36,6 +47,37 @@ impl CheckpointCodec<AgentSnapshot> for AgentSnapshotCodec {
             CheckpointCodecError::with_source("agent snapshot decoding failed", source)
         })
     }
+
+    fn encode_interrupt(
+        &self,
+        payload: &InterruptPayload,
+    ) -> Result<EncodedValue, CheckpointCodecError> {
+        let Some(request) = payload.downcast_ref::<AgentApprovalRequest>() else {
+            return Err(CheckpointCodecError::unsupported_interrupt(payload));
+        };
+        let bytes = serde_json::to_vec(request).map_err(|source| {
+            CheckpointCodecError::with_source("agent approval payload encoding failed", source)
+        })?;
+        Ok(EncodedValue::new(approval_interrupt_descriptor(), bytes))
+    }
+
+    fn decode_interrupt(
+        &self,
+        value: &EncodedValue,
+    ) -> Result<InterruptPayload, CheckpointCodecError> {
+        let expected = approval_interrupt_descriptor();
+        let actual = value.descriptor();
+        if actual != &expected {
+            return Err(CheckpointCodecError::message(format!(
+                "interrupt descriptor `{actual}` does not match the supported `{expected}`"
+            )));
+        }
+        let request =
+            serde_json::from_slice::<AgentApprovalRequest>(value.bytes()).map_err(|source| {
+                CheckpointCodecError::with_source("agent approval payload decoding failed", source)
+            })?;
+        Ok(InterruptPayload::new(request))
+    }
 }
 
 #[cfg(test)]
@@ -43,14 +85,15 @@ mod tests {
     use std::error::Error as _;
 
     use group_agent_core::{
-        CheckpointCodec as _, CheckpointCodecError, CheckpointState as _, GraphState as _,
-        InterruptPayload,
+        CheckpointCodec as _, CheckpointCodecError, CheckpointState as _, CodecDescriptor,
+        EncodedValue, GraphState as _, InterruptPayload,
     };
-    use group_agent_model::{AssistantMessage, Message};
+    use group_agent_model::{AssistantMessage, Message, ToolCall, ToolCallId, ToolName};
+    use serde_json::json;
 
     use super::AgentSnapshotCodec;
-    use crate::AgentSnapshot;
     use crate::state::{AgentState, AgentUpdate};
+    use crate::{AgentApprovalRequest, AgentSnapshot};
 
     fn mid_run_snapshot() -> AgentSnapshot {
         let mut state = AgentState::new(vec![Message::user("SECRET_QUESTION")]);
@@ -129,15 +172,113 @@ mod tests {
         }
     }
 
+    fn approval_request() -> AgentApprovalRequest {
+        AgentApprovalRequest::new(vec![
+            ToolCall::new(
+                ToolCallId::new("SECRET_CALL_A").expect("valid call id"),
+                ToolName::new("SECRET_TOOL").expect("valid tool name"),
+                json!({"query": "SECRET_ARGUMENT"}),
+            ),
+            ToolCall::new(
+                ToolCallId::new("SECRET_CALL_B").expect("valid call id"),
+                ToolName::new("search").expect("valid tool name"),
+                json!({"q": "rust"}),
+            ),
+        ])
+    }
+
     #[test]
-    fn interrupt_payload_encoding_is_rejected_by_default() {
+    fn approval_interrupt_roundtrips_with_shared_encoding_identity() {
+        let codec = AgentSnapshotCodec;
+        let request = approval_request();
+
+        let encoded = codec
+            .encode_interrupt(&InterruptPayload::new(request.clone()))
+            .expect("approval payload encodes");
+        let descriptor = encoded.descriptor();
+        assert_eq!(descriptor.schema(), "group-agent-prebuilt-tool-approval");
+        assert_eq!(descriptor.schema_version(), 1);
+        assert_eq!(
+            descriptor.encoding(),
+            codec.snapshot_descriptor().encoding(),
+            "interrupt and snapshot descriptors share one encoding identity"
+        );
+
+        let decoded = codec
+            .decode_interrupt(&encoded)
+            .expect("approval payload decodes");
+        let decoded = decoded
+            .downcast_ref::<AgentApprovalRequest>()
+            .expect("decoded payload retains the concrete Rust type");
+        assert_eq!(decoded, &request);
+
+        let reencoded = codec
+            .encode_interrupt(&InterruptPayload::new(decoded.clone()))
+            .expect("decoded payload re-encodes");
+        assert_eq!(encoded, reencoded, "interrupt roundtrip is canonical");
+    }
+
+    #[test]
+    fn unknown_interrupt_payload_types_still_fail_closed() {
         let error = AgentSnapshotCodec
-            .encode_interrupt(&InterruptPayload::new(7_usize))
-            .expect_err("no Interruptible Node exists");
+            .encode_interrupt(&InterruptPayload::new(String::from("opaque")))
+            .expect_err("non-approval payloads have no durable encoding");
 
         assert!(matches!(
             error,
             CheckpointCodecError::UnsupportedInterruptPayload { .. }
         ));
+    }
+
+    #[test]
+    fn interrupt_decode_rejects_mismatched_descriptors() {
+        let codec = AgentSnapshotCodec;
+        let valid = codec
+            .encode_interrupt(&InterruptPayload::new(approval_request()))
+            .expect("approval payload encodes");
+        let mismatched = [
+            CodecDescriptor::new("group-agent-prebuilt-agent-state", 1, "json"),
+            CodecDescriptor::new("group-agent-prebuilt-tool-approval", 2, "json"),
+            CodecDescriptor::new("group-agent-prebuilt-tool-approval", 1, "cbor"),
+        ];
+
+        for descriptor in mismatched {
+            let value = EncodedValue::new(descriptor, valid.bytes().to_vec());
+            let error = codec
+                .decode_interrupt(&value)
+                .expect_err("mismatched descriptor must fail");
+            assert!(matches!(error, CheckpointCodecError::Failed { .. }));
+        }
+    }
+
+    #[test]
+    fn interrupt_decode_rejects_garbage_and_invariant_violating_bytes() {
+        let codec = AgentSnapshotCodec;
+        let descriptor = || CodecDescriptor::new("group-agent-prebuilt-tool-approval", 1, "json");
+        let invalid_call_id =
+            br#"{"pending_calls":[{"id":"","name":"search","arguments":{},"extensions":{}}]}"#;
+
+        for bytes in [b"not json".as_slice(), invalid_call_id.as_slice()] {
+            let value = EncodedValue::new(descriptor(), bytes.to_vec());
+            let error = codec
+                .decode_interrupt(&value)
+                .expect_err("invalid payload bytes must fail");
+            assert!(matches!(error, CheckpointCodecError::Failed { .. }));
+            assert!(error.source().is_some());
+        }
+    }
+
+    #[test]
+    fn approval_request_debug_reports_only_the_pending_count() {
+        let rendered = format!("{:?}", approval_request());
+
+        assert!(rendered.contains("AgentApprovalRequest"));
+        assert!(rendered.contains("pending_calls: 2"));
+        for marker in ["SECRET_CALL", "SECRET_TOOL", "SECRET_ARGUMENT"] {
+            assert!(
+                !rendered.contains(marker),
+                "Debug must not contain {marker}"
+            );
+        }
     }
 }

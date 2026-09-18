@@ -16,10 +16,19 @@
 //! opaque [`AgentSnapshot`], and [`AgentSnapshotCodec`] encodes snapshots as
 //! canonical JSON. Plain `invoke` stays non-durable.
 //!
+//! Durable human approval is experimental and opt-in through
+//! [`AgentConfig::with_tool_approval`]. On the durable methods, a
+//! checkpoint-enabled invocation suspends before executing any Tool side
+//! effect with an [`AgentApprovalRequest`] payload listing the pending calls,
+//! and `resume` consumes a single-attempt [`AgentApprovalDecision`]: approve
+//! executes the pending batch, while reject commits business-error
+//! ToolMessages and the loop continues. The non-durable `invoke` paths fail
+//! closed instead of silently skipping approval.
+//!
 //! Provider adapters, MCP lifecycle, persistence, observability adapters, and
 //! product policy stay outside this crate. Streaming orchestration, provider
 //! construction, MCP lifecycle ownership, retry/fallback, rollback,
-//! exactly-once, approval, structured output, Memory/RAG/PDF/OCR, Multi-Agent,
+//! exactly-once, structured output, Memory/RAG/PDF/OCR, Multi-Agent,
 //! and middleware are not implemented. Local and MCP-backed Tools use the same
 //! injected ToolRuntime boundary.
 //!
@@ -64,6 +73,7 @@
 //! ```
 
 mod agent;
+mod approval;
 mod codec;
 mod error;
 mod outcome;
@@ -71,6 +81,7 @@ mod snapshot;
 mod state;
 
 pub use agent::{AgentOutcome, AgentStopReason, ToolCallingAgent};
+pub use approval::{AgentApprovalDecision, AgentApprovalRequest};
 pub use codec::AgentSnapshotCodec;
 pub use error::{AgentBuildError, AgentError};
 pub use outcome::{AgentForkReport, AgentInterrupted, AgentReplayReport, AgentRunOutcome};
@@ -79,10 +90,12 @@ pub use snapshot::AgentSnapshot;
 /// Experimental version-one configuration for a prebuilt Tool-calling Agent.
 ///
 /// This type is not yet a stable compatibility commitment. Version one limits
-/// the configuration surface to one validated `max_rounds` value.
+/// the configuration surface to one validated `max_rounds` value and the
+/// experimental Tool-approval switch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentConfig {
     max_rounds: usize,
+    tool_approval: bool,
 }
 
 impl AgentConfig {
@@ -104,7 +117,23 @@ impl AgentConfig {
         if max_rounds.checked_mul(2).is_none() {
             return Err(AgentConfigError::MaxStepsOverflow);
         }
-        Ok(Self { max_rounds })
+        Ok(Self {
+            max_rounds,
+            tool_approval: false,
+        })
+    }
+
+    /// Enables or disables experimental durable human approval before Tool
+    /// execution.
+    ///
+    /// When enabled, a checkpoint-enabled invocation durably suspends before
+    /// executing any Tool side effect and resumes with an
+    /// [`crate::AgentApprovalDecision`]. The non-durable `invoke` paths fail
+    /// closed instead of silently skipping approval.
+    #[must_use]
+    pub const fn with_tool_approval(mut self, tool_approval: bool) -> Self {
+        self.tool_approval = tool_approval;
+        self
     }
 
     /// Returns the maximum number of successfully committed model rounds.
@@ -112,11 +141,20 @@ impl AgentConfig {
     pub const fn max_rounds(self) -> usize {
         self.max_rounds
     }
+
+    /// Returns whether Tool execution requires durable human approval.
+    #[must_use]
+    pub const fn tool_approval(&self) -> bool {
+        self.tool_approval
+    }
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_rounds: 8 }
+        Self {
+            max_rounds: 8,
+            tool_approval: false,
+        }
     }
 }
 
@@ -187,6 +225,31 @@ mod tests {
         assert_eq!(
             AgentConfig::new(usize::MAX),
             Err(AgentConfigError::MaxStepsOverflow)
+        );
+    }
+
+    #[test]
+    fn tool_approval_defaults_to_off() {
+        let config = AgentConfig::new(4).expect("round limit is valid");
+
+        assert!(!config.tool_approval());
+        assert!(!AgentConfig::default().tool_approval());
+    }
+
+    #[test]
+    fn tool_approval_builder_and_getter_round_trip() {
+        let enabled = AgentConfig::new(4)
+            .expect("round limit is valid")
+            .with_tool_approval(true);
+        assert!(enabled.tool_approval());
+        assert_eq!(enabled.max_rounds(), 4);
+
+        let disabled = enabled.with_tool_approval(false);
+        assert!(!disabled.tool_approval());
+        assert_ne!(
+            AgentConfig::new(4).expect("round limit is valid"),
+            enabled,
+            "the approval flag participates in equality"
         );
     }
 

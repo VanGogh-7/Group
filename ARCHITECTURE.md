@@ -286,12 +286,24 @@ historical branch. The private graph carries the durable `GraphVersion`
 identity `group-agent-prebuilt/tool-calling-agent/1`, which must change with
 any node or topology change.
 
+Opt-in Tool approval (`AgentConfig::with_tool_approval`) registers the `tools`
+node as an InterruptibleNode: a durable invocation suspends before any Tool
+side effect with an `AgentApprovalRequest` payload (descriptor identity
+`group-agent-prebuilt-tool-approval` version 1, sharing the snapshot codec's
+`json` encoding), and Resume consumes a single-attempt
+`AgentApprovalDecision`. Approval graphs carry the distinct `GraphVersion`
+identity `group-agent-prebuilt/tool-calling-agent/approval/1`, and the
+non-durable invoke paths of an approval-enabled Agent fail closed. Agent
+`resume`, `replay`, and `fork` inherit the Agent's stored step budget when the
+caller leaves the Core default unset; the Core configs expose read-only
+`run_config()` accessors for that decision.
+
 Applications create provider adapters, own MCP sessions and Tool registration,
 select persistence adapters, and supply product prompts and policy. Local and
 MCP-backed Tools enter the Agent through the same ToolRuntime boundary.
 Streaming orchestration, provider construction, MCP lifecycle ownership,
-retry/fallback, Tool rollback, exactly-once, approval, structured output,
-Memory, RAG, PDF/OCR, Multi-Agent, and middleware are not provided. Repository
+retry/fallback, Tool rollback, exactly-once, structured output, Memory, RAG,
+PDF/OCR, Multi-Agent, and middleware are not provided. Repository
 selection, citation rendering, product permissions, UI, and prompt policy
 remain application-owned.
 

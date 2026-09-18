@@ -10,7 +10,8 @@ use group_agent_core::{
 };
 use group_agent_model::Message;
 use group_agent_prebuilt::{
-    AgentConfig, AgentSnapshot, AgentSnapshotCodec, AgentStopReason, ToolCallingAgent,
+    AgentApprovalDecision, AgentConfig, AgentSnapshot, AgentSnapshotCodec, AgentStopReason,
+    ToolCallingAgent,
 };
 use offline_agent::{Script, ScriptedModel, local_runtime};
 
@@ -79,6 +80,65 @@ async fn sqlite_restart_resumes_from_the_committed_head() {
         transcripts.all().len(),
         3,
         "original two calls plus resumed call"
+    );
+
+    std::fs::remove_dir_all(&directory).expect("temporary database cleanup");
+}
+
+#[tokio::test]
+async fn sqlite_restart_resumes_an_interrupted_approval() {
+    let (directory, database_url) = database();
+    let agent = ToolCallingAgent::new(
+        ScriptedModel::one_tool_round().expect("offline scripted model is valid"),
+        local_runtime().expect("offline local ToolRuntime is valid"),
+        AgentConfig::new(2)
+            .expect("two model rounds are valid")
+            .with_tool_approval(true),
+    )
+    .expect("offline agent construction succeeds");
+
+    let first_store = store_at(&database_url).await;
+    let outcome = agent
+        .invoke_with_checkpoint(
+            vec![Message::user("Use the offline label tool.")],
+            CheckpointConfig::new(
+                "sqlite-approval-thread",
+                first_store,
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect("durable invocation succeeds");
+    let interrupted = outcome
+        .as_interrupted()
+        .expect("the approval-enabled agent suspends before Tool execution");
+    assert_eq!(
+        interrupted
+            .approval_request()
+            .map(|request| request.pending_calls().len()),
+        Some(1)
+    );
+    // Dropping the store simulates a process restart; only the database file survives.
+
+    let restarted_store = store_at(&database_url).await;
+    let outcome = agent
+        .resume(
+            ResumeConfig::new("sqlite-approval-thread", restarted_store)
+                .with_resume_value(AgentApprovalDecision::Approve),
+        )
+        .await
+        .expect("approval resume completes from the persisted interrupt after a restart");
+
+    assert!(outcome.is_completed());
+    assert_eq!(outcome.stop_reason(), Some(AgentStopReason::FinalAnswer));
+    let completed = outcome.as_completed().expect("completed outcome");
+    assert_eq!(completed.model_rounds(), 2);
+    assert_eq!(
+        completed
+            .final_message()
+            .expect("FinalAnswer includes a final assistant message")
+            .text_content(),
+        "Offline tool-assisted answer."
     );
 
     std::fs::remove_dir_all(&directory).expect("temporary database cleanup");

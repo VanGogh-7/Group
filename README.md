@@ -51,8 +51,9 @@ fresh exact-version consumer verification remain separately authorized. See
   fail-fast drain, observers, and call-ID-safe ToolMessages;
 - an experimental provider-neutral `ToolCallingAgent` that alternates Model
   and ToolRuntime rounds, returns `FinalAnswer` or `MaxRounds`, and offers
-  opt-in durable execution (checkpointed invoke, Resume, Replay, Fork) over
-  the Core durable ports;
+  opt-in durable execution (checkpointed invoke, Resume, Replay, Fork) and
+  opt-in durable human approval before Tool execution (approve/reject
+  Resume) over the Core durable ports;
 - Genai 0.6.5 adapter with evidence-based fail-closed compatibility;
 - MCP 2.2.0 client adapter with bounded discovery and reusable stdio sessions.
 
@@ -233,6 +234,13 @@ mid-run failure, and a latest-head Resume:
 cargo run --locked -p group-agent-prebuilt --example durable_agent
 ```
 
+The offline `durable_approval` example demonstrates a pre-execution approval
+suspension and an approve-decision Resume:
+
+```bash
+cargo run --locked -p group-agent-prebuilt --example durable_approval
+```
+
 The application still owns provider construction, MCP lifecycle and Tool
 registration, persistence adapters, product prompts/policy, RAG, Memory, and
 UI. Prebuilt's public API remains experimental.
@@ -297,7 +305,7 @@ dropped.
 
 Prebuilt does not provide streaming orchestration, provider client
 construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
-exactly-once, human approval, structured output, Multi-Agent, or middleware.
+exactly-once, structured output, Multi-Agent, or middleware.
 
 ## MSRV
 

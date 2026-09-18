@@ -6,13 +6,15 @@ use std::sync::Arc;
 
 use group_agent_core::{
     CheckpointConfig, CheckpointPolicy, Checkpointer, ForkConfig, GraphRunError,
-    InMemoryCheckpointer, ReplayConfig, ResumeConfig, ThreadId,
+    InMemoryCheckpointer, ReplayConfig, ResumeConfig, RunConfig, ThreadId,
 };
 use group_agent_model::Message;
 use group_agent_prebuilt::{
-    AgentConfig, AgentSnapshot, AgentSnapshotCodec, AgentStopReason, ToolCallingAgent,
+    AgentConfig, AgentError, AgentSnapshot, AgentSnapshotCodec, AgentStopReason, ToolCallingAgent,
 };
-use offline_agent::{RecordedTranscripts, Script, ScriptedModel, empty_runtime, local_runtime};
+use offline_agent::{
+    RecordedTranscripts, Script, ScriptedModel, empty_runtime, flaky_local_runtime, local_runtime,
+};
 
 fn checkpointer() -> Arc<InMemoryCheckpointer<AgentSnapshot>> {
     Arc::new(InMemoryCheckpointer::new(AgentSnapshotCodec))
@@ -22,6 +24,19 @@ fn as_dyn(
     store: &Arc<InMemoryCheckpointer<AgentSnapshot>>,
 ) -> Arc<dyn Checkpointer<AgentSnapshot>> {
     store.clone()
+}
+
+fn graph_run_error(error: &AgentError) -> &GraphRunError {
+    let mut current: Option<&dyn StdError> = StdError::source(error);
+    loop {
+        match current {
+            Some(source) => match source.downcast_ref::<GraphRunError>() {
+                Some(graph_error) => return graph_error,
+                None => current = source.source(),
+            },
+            None => panic!("AgentError retains a Core GraphRunError source"),
+        }
+    }
 }
 
 fn tool_agent() -> ToolCallingAgent {
@@ -314,4 +329,104 @@ async fn resume_of_an_unknown_thread_fails_with_typed_checkpoint_not_found() {
         "unknown-thread resume is a typed CheckpointNotFound"
     );
     assert_eq!(error.to_string(), "agent invocation failed");
+}
+
+#[tokio::test]
+async fn resume_with_an_explicit_run_config_overrides_the_agent_step_budget() {
+    let store = checkpointer();
+    let thread_id = ThreadId::from("resume-explicit-budget");
+    let (agent, _transcripts) = flaky_tool_agent();
+
+    agent
+        .invoke_with_checkpoint(
+            vec![Message::user("Use the offline label tool.")],
+            CheckpointConfig::new(
+                thread_id.clone(),
+                as_dyn(&store),
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect_err("the scripted model fails once on its second call");
+
+    let error = agent
+        .resume(
+            ResumeConfig::new(thread_id.clone(), as_dyn(&store)).with_run_config(RunConfig::new(0)),
+        )
+        .await
+        .expect_err("an explicit zero-step budget stops the resume");
+    let graph_error = graph_run_error(&error);
+    assert!(
+        matches!(
+            graph_error,
+            GraphRunError::MaxStepsExceeded {
+                max_steps: 0,
+                step: 3,
+                ..
+            }
+        ),
+        "the caller-set budget reaches Core unchanged: {graph_error:?}"
+    );
+
+    let head = store
+        .latest(&thread_id)
+        .await
+        .expect("latest loads")
+        .expect("head exists");
+    assert_eq!(head.step(), 2, "the budget failure commits nothing new");
+
+    let outcome = agent
+        .resume(ResumeConfig::new(thread_id.clone(), as_dyn(&store)))
+        .await
+        .expect("a default resume inherits the Agent budget and completes");
+    assert_eq!(outcome.stop_reason(), Some(AgentStopReason::FinalAnswer));
+}
+
+#[tokio::test]
+async fn resume_inherits_the_agent_step_budget_beyond_the_core_default() {
+    const MAX_ROUNDS: usize = 502;
+    let store = checkpointer();
+    let thread_id = ThreadId::from("resume-inherited-budget");
+    let agent = ToolCallingAgent::new(
+        ScriptedModel::tool_loop().expect("offline scripted model is valid"),
+        flaky_local_runtime().expect("offline flaky ToolRuntime is valid"),
+        AgentConfig::new(MAX_ROUNDS).expect("round cap is valid"),
+    )
+    .expect("offline agent construction succeeds");
+
+    agent
+        .invoke_with_checkpoint(
+            vec![Message::user("Use the offline label tool.")],
+            CheckpointConfig::new(
+                thread_id.clone(),
+                as_dyn(&store),
+                CheckpointPolicy::EverySuperstep,
+            ),
+        )
+        .await
+        .expect_err("the flaky Tool fails its first execution");
+
+    let head = store
+        .latest(&thread_id)
+        .await
+        .expect("latest loads")
+        .expect("head exists");
+    assert_eq!(head.step(), 1, "only the model super-step committed");
+
+    // The remaining loop needs 1003 additional nodes. Core's default
+    // 1000-step budget would stop with MaxStepsExceeded at step 1002; the
+    // inherited Agent budget of 2 * MAX_ROUNDS = 1004 covers the loop.
+    let outcome = agent
+        .resume(ResumeConfig::new(thread_id.clone(), as_dyn(&store)))
+        .await
+        .expect("the inherited Agent budget covers the remaining loop");
+    assert!(outcome.is_completed());
+    assert_eq!(outcome.stop_reason(), Some(AgentStopReason::MaxRounds));
+    assert_eq!(
+        outcome
+            .as_completed()
+            .expect("completed outcome")
+            .model_rounds(),
+        MAX_ROUNDS
+    );
 }
