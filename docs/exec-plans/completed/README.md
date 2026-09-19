@@ -41,3 +41,11 @@ code, tests, architecture, or quality documentation.
   entries, and passed full/MSRV verification with independent review.
 - [027 Unify the workspace MSRV](027-unify-msrv.md) - unified all crates at
   Rust 1.88 with stable quality gates, complete MSRV verification, and review.
+- [028 Prebuilt agent durability](028-prebuilt-durability.md) - added opt-in
+  durable execution (checkpointed invoke, Resume, Replay, Fork) for the
+  experimental Prebuilt ToolCallingAgent with accepted independent review.
+- [029 Prebuilt agent tool approval](029-prebuilt-tool-approval.md) - added
+  opt-in durable human approval before Tool side effects with accepted review.
+- [030 Prebuilt agent streaming](030-prebuilt-streaming.md) - added streaming
+  events, preserved caller observers through additive Tool composition, and
+  completed protocol/lifecycle corrections with full gates and independent PASS.

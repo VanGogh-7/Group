@@ -1,13 +1,17 @@
+use std::sync::Arc;
+
 use group_agent_core::{GraphState, StateError};
 use group_agent_model::{AssistantMessage, Message, TokenUsage, ToolCall, ToolMessage};
 
 use crate::AgentStopReason;
+use crate::stream::AgentEventSink;
 
 pub(crate) struct AgentState {
     messages: Vec<Message>,
     model_rounds: usize,
     usage_by_round: Vec<Option<TokenUsage>>,
     stop_reason: Option<AgentStopReason>,
+    sink: Option<Arc<dyn AgentEventSink>>,
 }
 
 impl AgentState {
@@ -17,7 +21,17 @@ impl AgentState {
             model_rounds: 0,
             usage_by_round: Vec::new(),
             stop_reason: None,
+            sink: None,
         }
+    }
+
+    pub(crate) fn with_sink(mut self, sink: Arc<dyn AgentEventSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn sink(&self) -> Option<&Arc<dyn AgentEventSink>> {
+        self.sink.as_ref()
     }
 
     pub(crate) fn messages(&self) -> &[Message] {
@@ -74,6 +88,7 @@ impl AgentState {
             model_rounds,
             usage_by_round,
             stop_reason,
+            sink: None,
         }
     }
 }

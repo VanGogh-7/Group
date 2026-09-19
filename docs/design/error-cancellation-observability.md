@@ -199,6 +199,12 @@ Runtime catches callback panic:
 - a start-event failure prevents the Tool call;
 - a terminal-event failure remains secondary to the true Tool outcome.
 
+`ToolRuntime::with_additional_event_sink` preserves existing observers and
+appends another in installation order. Each callback is independently protected.
+Start delivery short-circuits on the first failure. Terminal delivery reaches
+all observers, with the first failure retained as the secondary diagnostic.
+`with_event_sink` remains a replacement operation.
+
 This prevents observability failure from falsely claiming that a
 non-idempotent action did or did not run.
 
@@ -206,16 +212,22 @@ non-idempotent action did or did not run.
 
 The experimental Agent forwards `RunControl` and `EventConfig` unchanged to
 Core. Cancellation, run timeout, and Model/Tool node timeout therefore retain
-Core classifications and precedence, and observers receive one Core graph
-lifecycle rather than a duplicate Agent event protocol. Default lifecycle
-events contain node metadata, not transcript or payload content.
+Core classifications and precedence. Core observers receive the Core graph
+lifecycle. Opt-in Agent streaming observers additionally receive typed token
+and Tool events; their default formatting redacts payloads. Deltas are validated
+before delivery. The supplied Tool observer is preserved through ordered
+composition, including start rejection and terminal diagnostic semantics.
+A started Tool's observed execution failure emits `ToolCompleted` with
+`is_error: true`, then propagates the typed invocation failure. Graph cancellation,
+timeout, or dropped execution can end a pending Tool without a terminal Tool
+event; no Tool completion is fabricated for a dropped or unstarted call.
 
 An error may follow earlier successfully committed Tool rounds. Those Tools
 may already have produced external side effects, while `AgentError` does not
 return the internal committed transcript. Dropping the top-level Future drops
 locally owned graph, Model, and Tool Futures but does not prove a remote
-operation stopped. Prebuilt provides no rollback, exactly-once, durability,
-automatic retry, or safe-blind-retry guarantee.
+operation stopped. Prebuilt provides opt-in durability through separate APIs,
+but no rollback, exactly-once, automatic retry, or safe-blind-retry guarantee.
 
 ## MCP Session shutdown
 

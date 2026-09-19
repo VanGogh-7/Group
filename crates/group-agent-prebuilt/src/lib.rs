@@ -25,12 +25,19 @@
 //! ToolMessages and the loop continues. The non-durable `invoke` paths fail
 //! closed instead of silently skipping approval.
 //!
+//! Streaming execution is experimental and opt-in through [`ToolCallingAgent::stream`]
+//! and [`ToolCallingAgent::invoke_with_stream_sink`]. Streaming invocations emit
+//! [`AgentStreamEvent`] items—including incremental text tokens, tool call fragments,
+//! tool lifecycle events, and the final completion outcome—as an asynchronous
+//! [`AgentEventStream`] or to a lightweight synchronous [`AgentEventSink`]. Dropping
+//! the stream or invocation drops locally owned model and tool futures without
+//! leaving detached background tasks.
+//!
 //! Provider adapters, MCP lifecycle, persistence, observability adapters, and
-//! product policy stay outside this crate. Streaming orchestration, provider
-//! construction, MCP lifecycle ownership, retry/fallback, rollback,
-//! exactly-once, structured output, Memory/RAG/PDF/OCR, Multi-Agent,
-//! and middleware are not implemented. Local and MCP-backed Tools use the same
-//! injected ToolRuntime boundary.
+//! product policy stay outside this crate. Provider construction, MCP lifecycle
+//! ownership, retry/fallback, rollback, exactly-once, structured output,
+//! Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not implemented. Local
+//! and MCP-backed Tools use the same injected ToolRuntime boundary.
 //!
 //! Core, Model, and Tool retain their stable boundaries. This crate's public
 //! API remains experimental, and its private State, Update, Nodes, router,
@@ -79,6 +86,7 @@ mod error;
 mod outcome;
 mod snapshot;
 mod state;
+mod stream;
 
 pub use agent::{AgentOutcome, AgentStopReason, ToolCallingAgent};
 pub use approval::{AgentApprovalDecision, AgentApprovalRequest};
@@ -86,6 +94,7 @@ pub use codec::AgentSnapshotCodec;
 pub use error::{AgentBuildError, AgentError};
 pub use outcome::{AgentForkReport, AgentInterrupted, AgentReplayReport, AgentRunOutcome};
 pub use snapshot::AgentSnapshot;
+pub use stream::{AgentEventSink, AgentEventStream, AgentStreamEvent};
 
 /// Experimental version-one configuration for a prebuilt Tool-calling Agent.
 ///

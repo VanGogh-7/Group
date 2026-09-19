@@ -253,7 +253,7 @@ may require adapter-level migration without changing the stable base layers.
 ## Experimental prebuilt Agent and application boundary
 
 `group-agent-prebuilt` composes the existing components into this
-non-streaming technical loop:
+technical loop:
 
 ```mermaid
 flowchart LR
@@ -276,6 +276,19 @@ ToolCall dispatch through `ToolRuntime`, and ordinary `FinalAnswer` or
 Core `EventSink`, continues after business Tool errors, stops on Tool
 infrastructure errors, and exposes the complete current failing batch report
 when one exists. There is no hidden retry.
+
+Streaming execution is experimental and opt-in: `ToolCallingAgent::stream`
+returns an asynchronous `AgentEventStream`, and
+`ToolCallingAgent::invoke_with_stream_sink` dispatches to an `AgentEventSink`.
+Streaming invocations emit `AgentStreamEvent` items (model token deltas, tool
+call fragments, tool lifecycle events, approval requests, and completion
+outcome). Dropping the stream or invocation drops the underlying execution
+future and drops locally owned provider and Tool futures without creating
+detached background tasks; remote side-effect cancellation is not guaranteed.
+Provider deltas are validated before publication. Agent Tool events compose with
+existing Tool observers through `with_additional_event_sink`, retaining start
+rejection and secondary terminal diagnostics. Streaming entrypoints currently
+use non-durable invocation and do not provide resumable Tool approval.
 
 Durability is opt-in. The Agent checkpoints each committed super-step through
 Core's `CheckpointConfig<AgentSnapshot>` and `Checkpointer` ports, and
@@ -301,11 +314,10 @@ caller leaves the Core default unset; the Core configs expose read-only
 Applications create provider adapters, own MCP sessions and Tool registration,
 select persistence adapters, and supply product prompts and policy. Local and
 MCP-backed Tools enter the Agent through the same ToolRuntime boundary.
-Streaming orchestration, provider construction, MCP lifecycle ownership,
-retry/fallback, Tool rollback, exactly-once, structured output, Memory, RAG,
-PDF/OCR, Multi-Agent, and middleware are not provided. Repository
-selection, citation rendering, product permissions, UI, and prompt policy
-remain application-owned.
+Provider construction, MCP lifecycle ownership, retry/fallback, Tool
+rollback, exactly-once, structured output, Memory, RAG, PDF/OCR, Multi-Agent,
+and middleware are not provided. Repository selection, citation rendering,
+product permissions, UI, and prompt policy remain application-owned.
 
 ## Further reading
 

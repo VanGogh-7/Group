@@ -2,10 +2,12 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures_util::StreamExt;
 #[cfg(test)]
 use group_agent_core::GraphVersion;
 use group_agent_core::{
@@ -14,8 +16,8 @@ use group_agent_core::{
     RunControl, START, StateGraph,
 };
 use group_agent_model::{
-    AssistantMessage, ChatModel, ChatRequest, Message, TokenUsage, ToolCall, ToolChoice,
-    ToolMessage, ToolResult,
+    AssistantMessage, ChatModel, ChatRequest, ChatStreamCollector, ChatStreamEvent, Message,
+    TokenUsage, ToolCall, ToolChoice, ToolMessage, ToolResult,
 };
 use group_agent_tool::{ToolBatchConfig, ToolRuntime};
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,9 @@ use crate::error::AgentToolBatchFailure;
 use crate::outcome::{AgentForkReport, AgentReplayReport, AgentRunOutcome};
 use crate::snapshot::AgentSnapshot;
 use crate::state::{AgentState, AgentUpdate};
+use crate::stream::{
+    AgentEventSink, AgentEventStream, AgentStreamEvent, ChannelEventSink, YieldNow,
+};
 use crate::{
     AgentApprovalDecision, AgentApprovalRequest, AgentBuildError, AgentConfig, AgentError,
 };
@@ -138,6 +143,7 @@ pub enum AgentStopReason {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone, PartialEq)]
 pub struct AgentOutcome {
     messages: Vec<Message>,
     model_rounds: usize,
@@ -262,7 +268,7 @@ impl fmt::Debug for AgentOutcome {
 /// # }
 /// ```
 pub struct ToolCallingAgent {
-    graph: CompiledGraph<AgentState>,
+    graph: Arc<CompiledGraph<AgentState>>,
     run_config: RunConfig,
     #[cfg(test)]
     compile_probe: CountingModelGraphCompiler,
@@ -303,7 +309,7 @@ impl ToolCallingAgent {
             &CoreModelGraphCompiler,
         )?;
         Ok(Self {
-            graph,
+            graph: Arc::new(graph),
             run_config: RunConfig::new(max_steps),
             #[cfg(test)]
             compile_probe,
@@ -342,8 +348,13 @@ impl ToolCallingAgent {
     /// [`Self::invoke_with_checkpoint`]. There is no rollback, exactly-once,
     /// or automatic-retry guarantee.
     pub async fn invoke(&self, messages: Vec<Message>) -> Result<AgentOutcome, AgentError> {
-        self.invoke_inner(messages, EventConfig::default(), RunControl::default())
-            .await
+        self.invoke_inner(
+            messages,
+            None,
+            EventConfig::default(),
+            RunControl::default(),
+        )
+        .await
     }
 
     /// Experimentally invokes one isolated conversation with caller-supplied
@@ -375,28 +386,111 @@ impl ToolCallingAgent {
         event_config: EventConfig,
         run_control: RunControl,
     ) -> Result<AgentOutcome, AgentError> {
-        self.invoke_inner(messages, event_config, run_control).await
+        self.invoke_inner(messages, None, event_config, run_control)
+            .await
+    }
+
+    /// Experimentally invokes one conversation with streaming token and
+    /// lifecycle events dispatched synchronously to a caller-supplied sink.
+    ///
+    /// The underlying model execution uses streaming when supported by the
+    /// configured model adapter, emitting [`AgentStreamEvent::TextDelta`] and
+    /// [`AgentStreamEvent::ToolCallDelta`] fragments as they arrive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] if the model lacks streaming capability, or if
+    /// model streaming, tool execution, or graph execution fails.
+    pub async fn invoke_with_stream_sink(
+        &self,
+        messages: Vec<Message>,
+        sink: Arc<dyn AgentEventSink>,
+    ) -> Result<AgentOutcome, AgentError> {
+        self.invoke_with_stream_sink_control(
+            messages,
+            sink,
+            EventConfig::default(),
+            RunControl::default(),
+        )
+        .await
+    }
+
+    /// Experimentally invokes one conversation with streaming events and
+    /// caller-supplied Core execution controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] for model, tool, graph, cancellation, or timeout failure.
+    pub async fn invoke_with_stream_sink_control(
+        &self,
+        messages: Vec<Message>,
+        sink: Arc<dyn AgentEventSink>,
+        event_config: EventConfig,
+        run_control: RunControl,
+    ) -> Result<AgentOutcome, AgentError> {
+        self.invoke_inner(messages, Some(sink), event_config, run_control)
+            .await
+    }
+
+    /// Experimentally invokes one conversation as an asynchronous event stream.
+    ///
+    /// Emits [`AgentStreamEvent`] items including incremental text tokens,
+    /// tool call fragments, tool lifecycle events, and the final completion
+    /// outcome.
+    ///
+    /// Dropping the returned [`AgentEventStream`] drops the underlying
+    /// invocation and terminates provider streaming and tool execution
+    /// without leaving detached tasks.
+    pub fn stream(&self, messages: Vec<Message>) -> AgentEventStream {
+        self.stream_with_control(messages, EventConfig::default(), RunControl::default())
+    }
+
+    /// Experimentally invokes one conversation as an asynchronous event stream
+    /// with caller-supplied Core execution controls.
+    pub fn stream_with_control(
+        &self,
+        messages: Vec<Message>,
+        event_config: EventConfig,
+        run_control: RunControl,
+    ) -> AgentEventStream {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(ChannelEventSink::new(sender));
+        let graph = Arc::clone(&self.graph);
+        let run_config = self.run_config.clone();
+        let invocation = Box::pin(async move {
+            let state = AgentState::new(messages).with_sink(sink.clone());
+            let report = graph
+                .invoke_with_control(state, run_config, event_config, run_control)
+                .await
+                .map_err(AgentError::from_graph)?;
+            let outcome = AgentOutcome::from_completed_state(report.into_final_state());
+            sink.on_event(&AgentStreamEvent::Completed(outcome.clone()));
+            Ok(outcome)
+        });
+        AgentEventStream::new(receiver, invocation)
     }
 
     async fn invoke_inner(
         &self,
         messages: Vec<Message>,
+        sink: Option<Arc<dyn AgentEventSink>>,
         event_config: EventConfig,
         run_control: RunControl,
     ) -> Result<AgentOutcome, AgentError> {
+        let mut state = AgentState::new(messages);
+        if let Some(ref s) = sink {
+            state = state.with_sink(Arc::clone(s));
+        }
         let report = self
             .graph
-            .invoke_with_control(
-                AgentState::new(messages),
-                self.run_config.clone(),
-                event_config,
-                run_control,
-            )
+            .invoke_with_control(state, self.run_config.clone(), event_config, run_control)
             .await
             .map_err(AgentError::from_graph)?;
-        Ok(AgentOutcome::from_completed_state(
-            report.into_final_state(),
-        ))
+        let outcome = AgentOutcome::from_completed_state(report.into_final_state());
+        if let Some(ref s) = sink {
+            s.on_event(&AgentStreamEvent::Completed(outcome.clone()));
+        }
+        Ok(outcome)
     }
 
     /// Experimentally invokes one conversation with opt-in durable
@@ -636,16 +730,59 @@ impl Node<AgentState> for ModelNode {
             let request = ChatRequest::new(state.messages().to_vec())
                 .with_tools(definitions)
                 .with_tool_choice(tool_choice);
-            let response = self
-                .model
-                .complete(request)
-                .await
-                .map_err(|source| NodeError::with_source("model completion failed", source))?;
+            let round = state.model_rounds() + 1;
+            let (message, usage) = if let Some(sink) = state.sink() {
+                let mut stream = self
+                    .model
+                    .stream(request)
+                    .await
+                    .map_err(|source| NodeError::with_source("model stream failed", source))?;
 
-            Ok(AgentUpdate::ModelCompleted {
-                message: response.message().clone(),
-                usage: response.usage().cloned(),
-            })
+                sink.on_event(&AgentStreamEvent::ModelStarted { round });
+
+                let mut collector = ChatStreamCollector::new();
+                while let Some(event) = stream.next().await {
+                    let event = event.map_err(|source| {
+                        NodeError::with_source("model stream chunk failed", source)
+                    })?;
+                    let delta = match &event {
+                        ChatStreamEvent::TextDelta(delta) => Some(AgentStreamEvent::TextDelta {
+                            round,
+                            delta: delta.clone(),
+                        }),
+                        ChatStreamEvent::ToolCallDelta(delta) => {
+                            Some(AgentStreamEvent::ToolCallDelta {
+                                round,
+                                delta: delta.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    collector.push(event).map_err(|source| {
+                        NodeError::with_source("stream collection failed", source)
+                    })?;
+                    if let Some(delta) = delta {
+                        sink.on_event(&delta);
+                        YieldNow(false).await;
+                    }
+                }
+
+                let response = collector.finish().map_err(|source| {
+                    NodeError::with_source("stream collection finish failed", source)
+                })?;
+
+                sink.on_event(&AgentStreamEvent::ModelCompleted { round });
+
+                (response.message().clone(), response.usage().cloned())
+            } else {
+                let response =
+                    self.model.complete(request).await.map_err(|source| {
+                        NodeError::with_source("model completion failed", source)
+                    })?;
+                (response.message().clone(), response.usage().cloned())
+            };
+
+            Ok(AgentUpdate::ModelCompleted { message, usage })
         })
     }
 }
@@ -686,8 +823,53 @@ impl ToolNode {
         state: &AgentState,
         calls: &[ToolCall],
     ) -> Result<AgentUpdate, NodeError> {
-        let report = self
-            .runtime
+        let observed_runtime;
+        let runtime = if let Some(sink) = state.sink() {
+            let agent_sink = Arc::clone(sink);
+            let round = state.model_rounds();
+            observed_runtime = self.runtime.clone().with_additional_event_sink(Arc::new(
+                move |event: &group_agent_tool::ToolEvent| {
+                    match event {
+                        group_agent_tool::ToolEvent::ExecutionStarted { context } => {
+                            agent_sink.on_event(&AgentStreamEvent::ToolStarted {
+                                id: context.call_id().clone(),
+                                name: context.tool_name().clone(),
+                                round,
+                            });
+                        }
+                        group_agent_tool::ToolEvent::ExecutionCompleted { context, is_error } => {
+                            agent_sink.on_event(&AgentStreamEvent::ToolCompleted {
+                                id: context.call_id().clone(),
+                                name: context.tool_name().clone(),
+                                round,
+                                is_error: *is_error,
+                            });
+                        }
+                        group_agent_tool::ToolEvent::ExecutionFailed {
+                            context,
+                            kind:
+                                group_agent_tool::ToolRuntimeErrorKind::ExecutionFailed
+                                | group_agent_tool::ToolRuntimeErrorKind::Cancelled,
+                        }
+                        | group_agent_tool::ToolEvent::ExecutionTimedOut { context, .. } => {
+                            agent_sink.on_event(&AgentStreamEvent::ToolCompleted {
+                                id: context.call_id().clone(),
+                                name: context.tool_name().clone(),
+                                round,
+                                is_error: true,
+                            });
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            ));
+            &observed_runtime
+        } else {
+            &self.runtime
+        };
+
+        let report = runtime
             .execute_batch(calls.to_vec(), ToolBatchConfig::default())
             .await
             .map_err(|source| NodeError::with_source("tool batch rejected", source))?;
@@ -766,9 +948,13 @@ impl InterruptibleNode<AgentState> for ToolNode {
         Box::pin(async move {
             let calls = self.validated_pending_calls(state)?;
             if !context.has_resume_value() {
-                return Ok(NodeOutcome::interrupt(AgentApprovalRequest::new(
-                    calls.to_vec(),
-                )));
+                let request = AgentApprovalRequest::new(calls.to_vec());
+                if let Some(sink) = state.sink() {
+                    sink.on_event(&AgentStreamEvent::ApprovalRequired {
+                        request: request.clone(),
+                    });
+                }
+                return Ok(NodeOutcome::interrupt(request));
             }
             let decision = context
                 .require_resume_value::<AgentApprovalDecision>()

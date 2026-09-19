@@ -12,7 +12,7 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 ## Plans
 
-No active Execution Plans.
+None currently active.
 
 On 2026-09-15 the User cancelled publication preparation and requested deletion
 of Plan 025. It was removed, not completed. Historical preflight records remain
@@ -34,3 +34,8 @@ effects, approve/reject Resume decisions, split approval GraphVersion) plus
 the additive Core `run_config()` config getters on 2026-09-18. Independent
 review returned PASS with no findings; the one accepted suggestion
 (cross-configuration resume tests) was implemented before closure.
+
+[Plan 030](../completed/030-prebuilt-streaming.md) completed streaming output
+and token/lifecycle events after correcting observer preservation, protocol
+validation, Tool terminal events, and control coverage. Full stable/MSRV gates
+passed and independent correction review returned PASS.

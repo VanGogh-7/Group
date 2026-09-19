@@ -1080,6 +1080,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "criterion",
+ "futures-core",
+ "futures-util",
  "group-agent-checkpoint-sqlite",
  "group-agent-core",
  "group-agent-model",

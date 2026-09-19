@@ -44,6 +44,9 @@ impl ToolEvent {
 /// `ExecutionStarted` prevents Tool execution. A terminal callback failure is
 /// a secondary diagnostic and never replaces the already determined Tool
 /// success, Tool failure, or timeout.
+/// When composed with [`crate::ToolRuntime::with_additional_event_sink`], start
+/// delivery stops at the first failure; terminal delivery reaches all observers
+/// and retains the first failure as the report's secondary diagnostic.
 pub trait ToolEventSink: Send + Sync {
     fn on_event(&self, event: &ToolEvent) -> Result<(), ToolObserverError>;
 }

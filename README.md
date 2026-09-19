@@ -17,8 +17,8 @@ Genai and MCP adapter configuration surfaces remain experimental because they
 are coupled to fixed upstream releases and evolving protocol behavior.
 
 The repository now also contains the experimental `group-agent-prebuilt`
-non-streaming Tool-calling loop. Its public API is not yet a stable
-compatibility commitment.
+Tool-calling loop with streaming and non-streaming modes. Its public API is not
+yet a stable compatibility commitment.
 
 Phase 2 release preparation was completed for the historical clean candidate
 `9b069d430cae02e74134f37edb8d05b83c2cc6c7`: the full local verification
@@ -50,8 +50,9 @@ fresh exact-version consumer verification remain separately authorized. See
 - immutable Tool Registry, precompiled JSON Schema, timeout, batching,
   fail-fast drain, observers, and call-ID-safe ToolMessages;
 - an experimental provider-neutral `ToolCallingAgent` that alternates Model
-  and ToolRuntime rounds, returns `FinalAnswer` or `MaxRounds`, and offers
-  opt-in durable execution (checkpointed invoke, Resume, Replay, Fork) and
+  and ToolRuntime rounds, returns `FinalAnswer` or `MaxRounds`, offers
+  streaming output and token events (`stream`, `invoke_with_stream_sink`),
+  opt-in durable execution (checkpointed invoke, Resume, Replay, Fork), and
   opt-in durable human approval before Tool execution (approve/reject
   Resume) over the Core durable ports;
 - Genai 0.6.5 adapter with evidence-based fail-closed compatibility;

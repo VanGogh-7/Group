@@ -130,10 +130,19 @@ Genai maps Model data to one provider SDK. MCP maps remote tools into the Tool
 trait. Neither adapter reimplements Tool Registry, validation, timeout, batch,
 fail-fast, or ToolMessage pairing.
 
+Tool observers can be composed with `ToolRuntime::with_additional_event_sink`.
+Installation order determines delivery order. A start callback failure prevents
+Tool execution and stops delivery to later observers. Terminal delivery reaches
+all observers and retains the first failure as the existing secondary diagnostic.
+Each panic remains independently classified by ToolRuntime. `with_event_sink`
+continues to replace all observers; composition on a clone does not alter the
+original runtime.
+
 ## Experimental prebuilt Tool-calling Agent
 
-`group-agent-prebuilt` provides a provider-neutral, non-streaming
-`ToolCallingAgent` above the stable Core, Model, and Tool layers. The
+`group-agent-prebuilt` provides a provider-neutral `ToolCallingAgent`
+above the stable Core, Model, and Tool layers, supporting both standard
+run-to-completion invocation and real-time streaming execution. The
 application injects an already constructed `ChatModel`, an already constructed
 `ToolRuntime`, and caller-owned messages. A private Core graph then repeats
 Model -> Tool -> Model until a response has no ToolCalls (`FinalAnswer`) or the
@@ -154,6 +163,32 @@ does not spawn one task per call, and performs no hidden retry. Per-round usage
 remains aligned rather than merged as though independent responses were one
 cumulative stream.
 
+Streaming execution is provided via `agent.stream(...)` (returning an
+asynchronous `AgentEventStream`) and `agent.invoke_with_stream_sink(...)`
+(dispatching synchronously to an `AgentEventSink`). When streaming is active,
+the internal ModelNode invokes `ChatModel::stream` and accumulates the response
+using `ChatStreamCollector` while emitting `AgentStreamEvent` lifecycle events:
+`ModelStarted`, `TextDelta`, `ToolCallDelta`, `ModelCompleted`, `ApprovalRequired`,
+`ToolStarted`, `ToolCompleted`, and `Completed`. Debug logs redact token and argument
+payloads, reporting only byte/item counts. Polling the stream drives graph
+execution directly in the caller's task without background task spawning, and
+dropping the stream or invocation future drops locally owned Model and Tool
+futures. It does not prove that remote side effects stopped.
+
+Each provider event passes `ChatStreamCollector` validation before its delta is
+published. Streaming composes Agent lifecycle delivery with the supplied Tool
+observer and preserves its start-failure and terminal-diagnostic behavior.
+`ToolCompleted { is_error: true }` covers a started call's business error or
+execution failure; infrastructure failures additionally return typed `AgentError`.
+Rejected calls that never started produce no execution lifecycle. Cancellation,
+graph timeout, or dropping a pending invocation need not produce a terminal
+Tool event because the Tool future never returned an outcome.
+
+The streaming APIs currently use non-durable invocation. With Tool approval
+enabled, `ApprovalRequired` is followed by the typed non-durable interrupt error;
+streaming does not provide a resumable approval session. Use the separate durable
+invocation APIs for checkpointed approval.
+
 The Prebuilt API is experimental. Private State, Update, Nodes, routers,
 topology, and `CompiledGraph` are not public extension points. Durable
 execution is opt-in through Core checkpoint ports and the crate-owned canonical
@@ -161,11 +196,11 @@ JSON `AgentSnapshotCodec`. Opt-in Tool approval durably suspends before any
 Tool side effect with an `AgentApprovalRequest` payload and resumes with a
 single-attempt `AgentApprovalDecision`: approve executes the pending batch,
 while reject commits business-error ToolMessages and the loop continues.
-Streaming, provider construction, MCP lifecycle, fallback/retry, rollback,
-exactly-once, structured output, Memory/RAG/PDF/OCR, Multi-Agent, and
-middleware are not implemented here.
-Provider adapters, MCP session setup and Tool registration, persistence,
-product prompts/policy, RAG, Memory, and UI remain application-owned.
+Provider construction, MCP lifecycle, fallback/retry, rollback, exactly-once,
+structured output, Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not
+implemented here. Provider adapters, MCP session setup and Tool registration,
+persistence, product prompts/policy, RAG, Memory, and UI remain
+application-owned.
 
 ## Direct evidence
 
@@ -179,7 +214,10 @@ product prompts/policy, RAG, Memory, and UI remain application-owned.
 - `crates/group-agent-tool/src/event.rs`
 - `crates/group-agent-tool/tests/tool_runtime.rs`
 - `crates/group-agent-prebuilt/src/`
+- `crates/group-agent-prebuilt/src/stream.rs`
+- `crates/group-agent-prebuilt/tests/streaming.rs`
 - `crates/group-agent-prebuilt/examples/tool_calling_agent.rs`
+- `crates/group-agent-prebuilt/examples/streaming_agent.rs`
 
 Related decisions:
 

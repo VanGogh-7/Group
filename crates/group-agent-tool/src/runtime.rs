@@ -338,6 +338,7 @@ impl fmt::Debug for ToolBatchReport {
 pub struct ToolRuntime {
     registry: ToolRegistry,
     event_sink: Option<SharedToolEventSink>,
+    additional_event_sinks: Vec<SharedToolEventSink>,
 }
 
 impl ToolRuntime {
@@ -347,13 +348,29 @@ impl ToolRuntime {
         Self {
             registry,
             event_sink: None,
+            additional_event_sinks: Vec::new(),
         }
     }
 
-    /// Installs a lightweight synchronous observer.
+    /// Replaces all installed observers with one lightweight synchronous observer.
     #[must_use]
     pub fn with_event_sink(mut self, event_sink: Arc<dyn ToolEventSink>) -> Self {
         self.event_sink = Some(event_sink);
+        self.additional_event_sinks.clear();
+        self
+    }
+
+    /// Appends a synchronous observer without replacing existing observers.
+    ///
+    /// Observers run in installation order. A start-event error or panic stops
+    /// delivery to later observers and prevents Tool execution. Terminal events
+    /// reach every observer even when earlier observers fail; the first failure
+    /// is retained as the report's secondary diagnostic. ToolRuntime catches
+    /// each observer panic independently and never replaces the primary Tool
+    /// outcome with a terminal observer failure.
+    #[must_use]
+    pub fn with_additional_event_sink(mut self, event_sink: Arc<dyn ToolEventSink>) -> Self {
+        self.additional_event_sinks.push(event_sink);
         self
     }
 
@@ -690,14 +707,19 @@ impl ToolRuntime {
     }
 
     fn emit(&self, event: ToolEvent) -> Result<(), ToolObserverFailure> {
-        if let Some(sink) = &self.event_sink {
-            match catch_unwind(AssertUnwindSafe(|| sink.on_event(&event))) {
-                Ok(Ok(())) => {}
-                Ok(Err(source)) => return Err(ToolObserverFailure::returned(source)),
-                Err(_panic_payload) => return Err(ToolObserverFailure::panicked()),
+        let mut first_failure = None;
+        for sink in self.event_sink.iter().chain(&self.additional_event_sinks) {
+            let failure = match catch_unwind(AssertUnwindSafe(|| sink.on_event(&event))) {
+                Ok(Ok(())) => continue,
+                Ok(Err(source)) => ToolObserverFailure::returned(source),
+                Err(_panic_payload) => ToolObserverFailure::panicked(),
+            };
+            if matches!(event, ToolEvent::ExecutionStarted { .. }) {
+                return Err(failure);
             }
+            first_failure.get_or_insert(failure);
         }
-        Ok(())
+        first_failure.map_or(Ok(()), Err)
     }
 }
 
@@ -706,7 +728,10 @@ impl fmt::Debug for ToolRuntime {
         formatter
             .debug_struct("ToolRuntime")
             .field("registry", &self.registry)
-            .field("has_event_sink", &self.event_sink.is_some())
+            .field(
+                "has_event_sink",
+                &(self.event_sink.is_some() || !self.additional_event_sinks.is_empty()),
+            )
             .finish()
     }
 }

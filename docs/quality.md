@@ -26,17 +26,26 @@ Experimental surfaces:
 - any future MCP HTTP or OAuth interface;
 - the `group-agent-prebuilt` public API and its current private graph topology.
 
-The repository contains an experimental non-streaming prebuilt Tool-calling
-loop over the stable Core, Model, and Tool boundaries. This capability does not
-make Prebuilt stable or make the repository production-ready. Under Plan 028,
-Prebuilt gained opt-in durable execution (checkpointed invoke, latest-head
-Resume, read-only Replay, writable Fork) with a crate-owned canonical JSON
-`AgentSnapshotCodec`; the durable surface is experimental and is not a
-production-readiness claim. Under Plan 029, Prebuilt gained opt-in durable
-Tool approval (`AgentApprovalRequest`/`AgentApprovalDecision` over Core
-interrupt resume values) and Core gained additive read-only `run_config()`
-accessors on the Resume/Replay/Fork configurations; both surfaces remain
-experimental and are not a production-readiness claim.
+The repository contains an experimental prebuilt Tool-calling loop over the
+stable Core, Model, and Tool boundaries. This capability does not make Prebuilt
+stable or make the repository production-ready. Under Plan 028, Prebuilt gained
+opt-in durable execution (checkpointed invoke, latest-head Resume, read-only
+Replay, writable Fork) with a crate-owned canonical JSON `AgentSnapshotCodec`;
+the durable surface is experimental and is not a production-readiness claim.
+Under Plan 029, Prebuilt gained opt-in durable Tool approval
+(`AgentApprovalRequest`/`AgentApprovalDecision` over Core interrupt resume
+values) and Core gained additive read-only `run_config()` accessors on the
+Resume/Replay/Fork configurations; both surfaces remain experimental and are
+not a production-readiness claim. Under Plan 030, Prebuilt gained streaming
+execution (`ToolCallingAgent::stream`, `invoke_with_stream_sink`,
+`AgentEventStream`, `AgentEventSink`, `AgentStreamEvent`) with payload-safe
+debug formatting and zero detached tasks; this surface remains experimental.
+[Plan 030](exec-plans/completed/030-prebuilt-streaming.md) review corrections
+preserve supplied Tool observers through the additive `with_additional_event_sink`
+API, validate deltas before delivery, and emit truthful Tool terminal events.
+Fourteen added regression/composition/control tests passed, as did the complete
+`./scripts/verify all` gate and offline streaming example. Independent correction
+review returned PASS. Hosted CI and live-provider integration were not run.
 
 ## Current compiler policy
 
