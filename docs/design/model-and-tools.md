@@ -169,7 +169,7 @@ asynchronous `AgentEventStream`) and `agent.invoke_with_stream_sink(...)`
 the internal ModelNode invokes `ChatModel::stream` and accumulates the response
 using `ChatStreamCollector` while emitting `AgentStreamEvent` lifecycle events:
 `ModelStarted`, `TextDelta`, `ToolCallDelta`, `ModelCompleted`, `ApprovalRequired`,
-`ToolStarted`, `ToolCompleted`, and `Completed`. Debug logs redact token and argument
+`ToolStarted`, `ToolCompleted`, `Completed`, and durable `Interrupted`. Debug logs redact token and argument
 payloads, reporting only byte/item counts. Polling the stream drives graph
 execution directly in the caller's task without background task spawning, and
 dropping the stream or invocation future drops locally owned Model and Tool
@@ -184,10 +184,31 @@ Rejected calls that never started produce no execution lifecycle. Cancellation,
 graph timeout, or dropping a pending invocation need not produce a terminal
 Tool event because the Tool future never returned an outcome.
 
-The streaming APIs currently use non-durable invocation. With Tool approval
-enabled, `ApprovalRequired` is followed by the typed non-durable interrupt error;
-streaming does not provide a resumable approval session. Use the separate durable
-invocation APIs for checkpointed approval.
+Plain `stream` and `invoke_with_stream_sink` remain non-durable. With Tool approval
+enabled, `ApprovalRequired` is followed by the typed non-durable interrupt error.
+Use `stream_with_checkpoint` or `invoke_with_checkpoint_stream_sink` (including
+their control variants) for checkpointed streaming and resumable approval.
+
+`ApprovalRequired` is a provisional notification before saving. Successful
+interrupt persistence emits the terminal `Interrupted(AgentInterrupted)` event,
+whose thread/checkpoint identity and approval request define the durable handoff.
+An interrupt save failure returns a typed error without an `Interrupted` event
+or Tool execution. Normal `Completed` is also emitted only after required saves.
+Model and Tool events can precede State commit; receiving a delta is not evidence
+that its round is recoverable. Event delivery itself is not durable.
+
+`resume_stream` and `resume_with_stream_sink` accept the existing
+`ResumeConfig<AgentSnapshot>`, including Core controls, events, branch selection,
+and the one-attempt `AgentApprovalDecision`. Prebuilt uses Core's generic
+`resume_with_state_initializer` to attach the new sink after restore; it is not
+part of the snapshot and is isolated across concurrent and nested calls. Existing
+ordinary and streaming checkpoints are interchangeable within the same approval
+graph version. Model/Tool events cover newly executed work only. A completed
+checkpoint emits one terminal `Completed` without Model/Tool calls or a new save.
+Each asynchronous stream ends after its successful terminal event or one typed
+error following already buffered events. Sink APIs return the corresponding
+`AgentRunOutcome` or error. No automatic retry or token-history replay occurs.
+Streaming Replay and Fork are not provided.
 
 The Prebuilt API is experimental. Private State, Update, Nodes, routers,
 topology, and `CompiledGraph` are not public extension points. Durable
@@ -215,9 +236,15 @@ application-owned.
 - `crates/group-agent-tool/tests/tool_runtime.rs`
 - `crates/group-agent-prebuilt/src/`
 - `crates/group-agent-prebuilt/src/stream.rs`
+- `crates/group-agent-prebuilt/src/durable_stream.rs`
 - `crates/group-agent-prebuilt/tests/streaming.rs`
+- `crates/group-agent-prebuilt/tests/durable_streaming.rs`
+- `crates/group-agent-prebuilt/tests/durable_streaming_failures.rs`
+- `crates/group-agent-prebuilt/tests/durable_streaming_isolation.rs`
+- `crates/group-agent-prebuilt/tests/durable_streaming_sqlite.rs`
 - `crates/group-agent-prebuilt/examples/tool_calling_agent.rs`
 - `crates/group-agent-prebuilt/examples/streaming_agent.rs`
+- `crates/group-agent-prebuilt/examples/durable_streaming.rs`
 
 Related decisions:
 

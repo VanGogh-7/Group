@@ -211,7 +211,7 @@ User Message
   -> Final Assistant Answer
 ```
 
-`ToolCallingAgent` owns the non-streaming multi-round loop, returns
+`ToolCallingAgent` owns the streaming or non-streaming multi-round loop, returns
 `FinalAnswer` or `MaxRounds`, forwards optional Core control/events, continues
 after business Tool errors, and stops on Tool infrastructure errors without
 hidden retry. Local and MCP-backed Tools use the same ToolRuntime boundary.
@@ -242,6 +242,20 @@ suspension and an approve-decision Resume:
 cargo run --locked -p group-agent-prebuilt --example durable_approval
 ```
 
+Combine streaming with durable approval and Resume:
+
+```bash
+cargo run --locked --offline -p group-agent-prebuilt --example durable_streaming
+```
+
+Use `stream_with_checkpoint` or `invoke_with_checkpoint_stream_sink` to opt in.
+`ApprovalRequired` is provisional; the terminal `Interrupted` event confirms
+that the approval checkpoint was saved. Continue with `resume_stream` or
+`resume_with_stream_sink`, supplying the saved checkpoint identity and an
+explicit `AgentApprovalDecision`. Resume attaches a fresh event sink and emits
+new work only. Tokens are not durably recorded or replayed, and Tool side
+effects are not rolled back on cancellation.
+
 The application still owns provider construction, MCP lifecycle and Tool
 registration, persistence adapters, product prompts/policy, RAG, Memory, and
 UI. Prebuilt's public API remains experimental.
@@ -261,7 +275,7 @@ See:
 | `group-agent-observability-tokio` | bounded Tokio broadcast over `EventSink` | adapter over stable event port |
 | `group-agent-model` | provider-neutral messages, chat, Tool data, streams, errors | compatibility-first base |
 | `group-agent-tool` | Tool Registry, validation, execution, batch, observer | compatibility-first base |
-| `group-agent-prebuilt` | provider-neutral non-streaming Tool-calling orchestration | experimental |
+| `group-agent-prebuilt` | provider-neutral streaming and durable Tool-calling orchestration | experimental |
 | `group-agent-genai` | `genai` 0.6.5 chat adapter | experimental |
 | `group-agent-mcp` | `rmcp` 2.2.0 client Tool backend | experimental |
 
@@ -304,7 +318,7 @@ Group does not currently provide:
 Unsupported provider or MCP content fails closed rather than being silently
 dropped.
 
-Prebuilt does not provide streaming orchestration, provider client
+Prebuilt does not provide streaming Replay/Fork, provider client
 construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
 exactly-once, structured output, Multi-Agent, or middleware.
 

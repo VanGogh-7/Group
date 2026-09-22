@@ -1,6 +1,6 @@
 //! Experimental provider-neutral prebuilt Agent composition for Group.
 //!
-//! This crate is experimental. It currently provides a minimal non-streaming
+//! This crate is experimental. It provides a streaming and non-streaming
 //! Agent backed by a private Group Core graph. It alternates model turns and
 //! optional ToolRuntime-backed bounded Tool batches until a final answer or
 //! the configured model round limit. Business Tool errors can continue as
@@ -32,6 +32,17 @@
 //! [`AgentEventStream`] or to a lightweight synchronous [`AgentEventSink`]. Dropping
 //! the stream or invocation drops locally owned model and tool futures without
 //! leaving detached background tasks.
+//!
+//! [`ToolCallingAgent::stream_with_checkpoint`] and
+//! [`ToolCallingAgent::invoke_with_checkpoint_stream_sink`] combine streaming
+//! with durability. `ApprovalRequired` is provisional; only a terminal
+//! [`AgentStreamEvent::Interrupted`] confirms a saved approval checkpoint.
+//! Continue with [`ToolCallingAgent::resume_stream`] or
+//! [`ToolCallingAgent::resume_with_stream_sink`] and a one-attempt approval
+//! decision. The new invocation attaches its own non-persistent sink after
+//! validated restore. Earlier token events are not replayed. A completed
+//! checkpoint emits only Completed, without model/tool calls or a new save.
+//! Streaming Replay and Fork are not provided.
 //!
 //! Provider adapters, MCP lifecycle, persistence, observability adapters, and
 //! product policy stay outside this crate. Provider construction, MCP lifecycle
@@ -82,6 +93,7 @@
 mod agent;
 mod approval;
 mod codec;
+mod durable_stream;
 mod error;
 mod outcome;
 mod snapshot;

@@ -287,8 +287,19 @@ future and drops locally owned provider and Tool futures without creating
 detached background tasks; remote side-effect cancellation is not guaranteed.
 Provider deltas are validated before publication. Agent Tool events compose with
 existing Tool observers through `with_additional_event_sink`, retaining start
-rejection and secondary terminal diagnostics. Streaming entrypoints currently
-use non-durable invocation and do not provide resumable Tool approval.
+rejection and secondary terminal diagnostics. `stream_with_checkpoint` and
+`invoke_with_checkpoint_stream_sink` opt into checkpointed streaming;
+`resume_stream` and `resume_with_stream_sink` continue from the latest head with
+a fresh invocation-local sink. Core's generic `resume_with_state_initializer`
+attaches transient resources after validated restore without a dependency on
+Prebuilt or sinks. Snapshots and codec identities remain unchanged.
+
+`ApprovalRequired` is provisional. Only `Interrupted`, emitted after a successful
+interrupt save, confirms a resumable suspension and supplies its checkpoint
+identity. A successful stream ends with exactly one `Completed` or `Interrupted`
+event. Errors produce no successful terminal event. Resume streams only newly
+executed work; events are not persisted or replayed. Plain `stream` remains
+non-durable and fails closed when approval needs an interrupt checkpoint.
 
 Durability is opt-in. The Agent checkpoints each committed super-step through
 Core's `CheckpointConfig<AgentSnapshot>` and `Checkpointer` ports, and

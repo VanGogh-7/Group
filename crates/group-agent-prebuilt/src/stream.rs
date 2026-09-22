@@ -7,6 +7,7 @@ use futures_core::Stream;
 use group_agent_model::{ToolCallDelta, ToolCallId, ToolName};
 use tokio::sync::mpsc;
 
+use crate::AgentInterrupted;
 use crate::agent::AgentOutcome;
 use crate::approval::AgentApprovalRequest;
 use crate::error::AgentError;
@@ -40,6 +41,9 @@ pub enum AgentStreamEvent {
         round: usize,
     },
     /// Tool execution requires approval before side effects occur.
+    ///
+    /// This is a provisional notification emitted before checkpoint saving.
+    /// Only [`Self::Interrupted`] confirms a durable, resumable suspension.
     ApprovalRequired {
         /// The pending tool calls requiring an approval decision.
         request: AgentApprovalRequest,
@@ -72,6 +76,12 @@ pub enum AgentStreamEvent {
     },
     /// The agent finished normally with its complete outcome.
     Completed(AgentOutcome),
+    /// The run durably suspended and its interrupt checkpoint was saved.
+    ///
+    /// This terminal event ends the stream. Start a new streaming or ordinary
+    /// Resume with an explicit approval decision to continue. No earlier
+    /// token events are replayed by Resume.
+    Interrupted(AgentInterrupted),
 }
 
 impl fmt::Debug for AgentStreamEvent {
@@ -119,6 +129,9 @@ impl fmt::Debug for AgentStreamEvent {
                 .field("is_error", is_error)
                 .finish(),
             Self::Completed(outcome) => formatter.debug_tuple("Completed").field(outcome).finish(),
+            Self::Interrupted(outcome) => {
+                formatter.debug_tuple("Interrupted").field(outcome).finish()
+            }
         }
     }
 }
@@ -159,7 +172,7 @@ impl AgentEventSink for ChannelEventSink {
     }
 }
 
-type AgentInvocationFuture = Pin<Box<dyn Future<Output = Result<AgentOutcome, AgentError>> + Send>>;
+type AgentInvocationFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>>;
 
 /// An asynchronous stream of events from a running Agent invocation.
 ///
@@ -204,8 +217,8 @@ impl Stream for AgentEventStream {
         // 2. If the invocation future is still active, drive it.
         if let Some(mut invocation) = this.invocation.take() {
             match invocation.as_mut().poll(cx) {
-                Poll::Ready(Ok(_outcome)) => {
-                    // Succeeded: invoke_inner already dispatched Completed event to sink.
+                Poll::Ready(Ok(())) => {
+                    // The invocation already dispatched its terminal outcome event.
                 }
                 Poll::Ready(Err(error)) => {
                     this.pending_error = Some(error);
@@ -354,7 +367,7 @@ mod tests {
         let invocation = Box::pin(async move {
             let _guard = guard;
             // Pending indefinitely
-            std::future::pending::<Result<AgentOutcome, AgentError>>().await
+            std::future::pending::<Result<(), AgentError>>().await
         });
 
         let stream = AgentEventStream::new(rx, invocation);

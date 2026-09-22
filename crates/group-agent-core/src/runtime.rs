@@ -20,7 +20,7 @@ use crate::{
     CheckpointWriteError, CompiledGraph, EventConfig, EventRetention, ExecutionOutcome, ForkConfig,
     GraphEvent, GraphRunError, GraphState, InterruptReport, NodeContext, NodeOutcome, NodePath,
     NodeUpdate, ReplayConfig, ResumeConfig, ResumeTarget, ResumeValue, RunConfig, RunControl,
-    RunFailure, RunId, ThreadId,
+    RunFailure, RunId, SnapshotError, ThreadId,
 };
 
 /// The completed report produced when a graph reaches an empty frontier.
@@ -1041,6 +1041,39 @@ where
         &self,
         resume_config: ResumeConfig<S::Snapshot>,
     ) -> Result<ExecutionOutcome<S>, GraphRunError> {
+        self.resume_with_state_initializer(resume_config, |_| Ok(()))
+            .await
+    }
+
+    /// Restores a checkpoint and initializes transient State resources before
+    /// executing its saved frontier.
+    ///
+    /// The synchronous initializer runs exactly once after checkpoint and
+    /// resume-value validation, successful restore, and control checks. It also
+    /// runs for completed checkpoints, which execute no Nodes and save nothing.
+    /// Use it only to attach invocation-local resources excluded from snapshots;
+    /// preserve restored durable data and the meaning of the saved frontier.
+    /// This is not a historical State editing operation.
+    ///
+    /// The callback must remain lightweight and avoid blocking or external side
+    /// effects. Like `CheckpointState::restore`, it cannot be preempted while
+    /// executing and its panics are not caught. Cancellation and deadlines are
+    /// checked before and after initialization.
+    ///
+    /// # Errors
+    ///
+    /// Initializer errors become [`GraphRunError::RestoreFailed`] with their
+    /// concrete source retained. No resume-success event, Node execution, or
+    /// checkpoint write occurs when initialization fails. Other validation,
+    /// control, and execution failures follow [`Self::resume`].
+    pub async fn resume_with_state_initializer<F>(
+        &self,
+        resume_config: ResumeConfig<S::Snapshot>,
+        initialize: F,
+    ) -> Result<ExecutionOutcome<S>, GraphRunError>
+    where
+        F: FnOnce(&mut S) -> Result<(), SnapshotError> + Send,
+    {
         let invocation_started = Instant::now();
         let ResumeParts {
             thread_id,
@@ -1212,7 +1245,7 @@ where
         if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
             return events.fail(error);
         }
-        let state = match S::restore(checkpoint.snapshot()) {
+        let mut state = match S::restore(checkpoint.snapshot()) {
             Ok(state) => state,
             Err(source) => {
                 return events.fail(GraphRunError::RestoreFailed {
@@ -1225,6 +1258,20 @@ where
                 });
             }
         };
+        if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
+            return events.fail(error);
+        }
+
+        if let Err(source) = initialize(&mut state) {
+            return events.fail(GraphRunError::RestoreFailed {
+                run_id,
+                thread_id,
+                checkpoint_id: checkpoint.id(),
+                superstep: checkpoint.superstep(),
+                step: checkpoint_step,
+                source,
+            });
+        }
         if let Some(error) = control.check(run_id, None, checkpoint_step, control.deadline(None)) {
             return events.fail(error);
         }

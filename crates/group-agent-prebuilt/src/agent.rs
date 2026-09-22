@@ -268,8 +268,8 @@ impl fmt::Debug for AgentOutcome {
 /// # }
 /// ```
 pub struct ToolCallingAgent {
-    graph: Arc<CompiledGraph<AgentState>>,
-    run_config: RunConfig,
+    pub(crate) graph: Arc<CompiledGraph<AgentState>>,
+    pub(crate) run_config: RunConfig,
     #[cfg(test)]
     compile_probe: CountingModelGraphCompiler,
 }
@@ -464,8 +464,8 @@ impl ToolCallingAgent {
                 .await
                 .map_err(AgentError::from_graph)?;
             let outcome = AgentOutcome::from_completed_state(report.into_final_state());
-            sink.on_event(&AgentStreamEvent::Completed(outcome.clone()));
-            Ok(outcome)
+            sink.on_event(&AgentStreamEvent::Completed(outcome));
+            Ok(())
         });
         AgentEventStream::new(receiver, invocation)
     }

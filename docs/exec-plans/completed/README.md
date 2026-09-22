@@ -49,3 +49,6 @@ code, tests, architecture, or quality documentation.
 - [030 Prebuilt agent streaming](030-prebuilt-streaming.md) - added streaming
   events, preserved caller observers through additive Tool composition, and
   completed protocol/lifecycle corrections with full gates and independent PASS.
+- [031 Durable streaming and resumable Tool approval](031-durable-streaming-approval.md)
+  - integrated checkpointed streaming and approval Resume, with explicit transient
+    State initialization, full stable/MSRV gates, and independent PASS review.

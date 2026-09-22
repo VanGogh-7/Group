@@ -47,6 +47,21 @@ Fourteen added regression/composition/control tests passed, as did the complete
 `./scripts/verify all` gate and offline streaming example. Independent correction
 review returned PASS. Hosted CI and live-provider integration were not run.
 
+[Plan 031](exec-plans/completed/031-durable-streaming-approval.md) adds experimental
+checkpointed streaming and streaming Resume, including durable approval handoff
+through `AgentStreamEvent::Interrupted`. The explicitly authorized additive Core
+`resume_with_state_initializer` attaches transient resources after validated
+restore; it does not alter snapshot formats or lineage. Focused public-boundary
+tests cover save failures, approval/rejection, invocation isolation, cancellation,
+observer preservation, and SQLite reopen with a new Agent. The offline example
+passes. `./scripts/verify all` passed after an approved out-of-sandbox rerun
+allowed existing loopback HTTP fixtures to bind ports. Stable Rust 1.98.1 and
+MSRV Rust 1.88.0 each passed 641 workspace tests including doctests, with zero
+failures or ignored tests. Independent review returned PASS with no required
+corrections. Hosted CI, live-provider integration, and runtime performance
+measurement were not run. This remains experimental and is not a
+production-readiness claim.
+
 ## Current compiler policy
 
 All eight crates now share Rust 1.88 as the MSRV under

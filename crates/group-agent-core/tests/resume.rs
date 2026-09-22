@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default)]
 struct ResumeState {
+    resource: Option<Arc<AtomicUsize>>,
     value: usize,
     fail_restore: bool,
     restore_calls: Arc<AtomicUsize>,
@@ -94,6 +95,7 @@ impl CheckpointState for ResumeState {
             ));
         }
         Ok(Self {
+            resource: None,
             value: snapshot.value,
             fail_restore: false,
             restore_calls: Arc::clone(&snapshot.restore_calls),
@@ -105,7 +107,10 @@ struct Add(usize);
 
 #[async_trait]
 impl Node<ResumeState> for Add {
-    async fn run(&self, _state: &ResumeState, _context: &NodeContext) -> Result<usize, NodeError> {
+    async fn run(&self, state: &ResumeState, _context: &NodeContext) -> Result<usize, NodeError> {
+        if let Some(resource) = &state.resource {
+            resource.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self.0)
     }
 }
@@ -238,6 +243,7 @@ async fn create_middle_checkpoint_with_counter(
     let error = graph
         .invoke_with_checkpoint(
             ResumeState {
+                resource: None,
                 value: 0,
                 fail_restore,
                 restore_calls: Arc::clone(&restore_calls),
@@ -1168,5 +1174,198 @@ async fn completed_resume_control_failures_have_stable_event_order() {
                 ..
             }
         ]
+    ));
+}
+
+#[tokio::test]
+async fn resume_initializer_attaches_transient_resource_once_and_completed_resume_does_not_save() {
+    let graph = linear_graph("initializer-v1");
+    let store = new_store();
+    let checkpoint = create_middle_checkpoint(&graph, "initialized", &store, false).await;
+    let resource = Arc::new(AtomicUsize::new(0));
+    let initialized = AtomicUsize::new(0);
+    let report = graph
+        .resume_with_state_initializer(ResumeConfig::new("initialized", store.clone()), |state| {
+            assert_eq!(state.value, 1);
+            initialized.fetch_add(1, Ordering::SeqCst);
+            state.resource = Some(resource.clone());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(initialized.load(Ordering::SeqCst), 1);
+    assert_eq!(resource.load(Ordering::SeqCst), 2);
+    assert_eq!(report.final_state().value, 6);
+    assert_eq!(checkpoint.snapshot().value, 1);
+    let before = store.history(&ThreadId::from("initialized")).await.unwrap();
+    let completed = graph
+        .resume_with_state_initializer(ResumeConfig::new("initialized", store.clone()), |state| {
+            assert!(state.resource.is_none(), "resource is never checkpointed");
+            initialized.fetch_add(1, Ordering::SeqCst);
+            state.resource = Some(resource.clone());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(completed.visited_nodes().is_empty());
+    assert_eq!(initialized.load(Ordering::SeqCst), 2);
+    assert_eq!(resource.load(Ordering::SeqCst), 2);
+    let after = store.history(&ThreadId::from("initialized")).await.unwrap();
+    assert_eq!(
+        before.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        after.iter().map(|c| c.id()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn initializer_failure_retains_source_and_prevents_resume_events_and_writes() {
+    let graph = linear_graph("initializer-failure-v1");
+    let store = new_store();
+    let checkpoint = create_middle_checkpoint(&graph, "init-fail", &store, false).await;
+    let sink = Arc::new(RecordingSink::default());
+    let error = graph
+        .resume_with_state_initializer(
+            ResumeConfig::new("init-fail", store.clone())
+                .with_event_config(EventConfig::default().with_sink(sink.clone())),
+            |_| {
+                Err(SnapshotError::with_source(
+                    "transient resource unavailable",
+                    RestoreRootError,
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, GraphRunError::RestoreFailed { checkpoint_id, step: 1, superstep: 1, .. } if *checkpoint_id == checkpoint.id())
+    );
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<RestoreRootError>()
+    );
+    assert_eq!(
+        store
+            .latest(&ThreadId::from("init-fail"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        checkpoint.id()
+    );
+    assert_eq!(
+        store
+            .history(&ThreadId::from("init-fail"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let events = sink.0.lock().unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [GraphEvent::RunStarted { .. }, GraphEvent::RunFailed { .. }]
+    ));
+}
+
+#[tokio::test]
+async fn invalid_or_failed_restore_does_not_call_initializer() {
+    let graph = linear_graph("initializer-validation-v1");
+    let store = new_store();
+    let checkpoint = create_middle_checkpoint(&graph, "init-validation", &store, false).await;
+    let failed = create_middle_checkpoint(&graph, "init-restore-fail", &store, true).await;
+    let token = CancellationToken::new();
+    token.cancel();
+    for config in [
+        ResumeConfig::new("missing", store.clone()),
+        ResumeConfig::new("init-validation", store.clone()).with_resume_value(42u32),
+        ResumeConfig::new("init-validation", store.clone())
+            .with_control(RunControl::new().with_cancellation_token(token.clone())),
+        ResumeConfig::new("init-restore-fail", store.clone()),
+    ] {
+        graph
+            .resume_with_state_initializer(config, |_| panic!("initializer must not run"))
+            .await
+            .unwrap_err();
+    }
+    let other = linear_graph("incompatible");
+    assert!(matches!(
+        other
+            .resume_with_state_initializer(
+                ResumeConfig::new("init-validation", store.clone()),
+                |_| panic!("incompatible checkpoint")
+            )
+            .await
+            .unwrap_err(),
+        GraphRunError::CheckpointIncompatible { .. }
+    ));
+    graph
+        .resume(ResumeConfig::new("init-validation", store.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        graph
+            .resume_with_state_initializer(
+                ResumeConfig::new("init-validation", store.clone())
+                    .with_checkpoint_id(checkpoint.id()),
+                |_| panic!("stale checkpoint")
+            )
+            .await
+            .unwrap_err(),
+        GraphRunError::ResumeConflict { .. }
+    ));
+    assert_eq!(
+        store
+            .latest(&ThreadId::from("init-restore-fail"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        failed.id()
+    );
+}
+
+#[tokio::test]
+async fn cancellation_during_initializer_prevents_nodes_and_writes() {
+    let graph = linear_graph("initializer-cancel-v1");
+    let store = new_store();
+    let checkpoint = create_middle_checkpoint(&graph, "init-cancel", &store, false).await;
+    let token = CancellationToken::new();
+    let sink = Arc::new(RecordingSink::default());
+    let error = graph
+        .resume_with_state_initializer(
+            ResumeConfig::new("init-cancel", store.clone())
+                .with_control(RunControl::new().with_cancellation_token(token.clone()))
+                .with_event_config(EventConfig::default().with_sink(sink.clone())),
+            |_| {
+                token.cancel();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphRunError::Cancelled {
+            node_id: None,
+            step: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        store
+            .latest(&ThreadId::from("init-cancel"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        checkpoint.id()
+    );
+    assert!(matches!(
+        sink.0.lock().unwrap().as_slice(),
+        [GraphEvent::RunStarted { .. }, GraphEvent::RunFailed { .. }]
     ));
 }

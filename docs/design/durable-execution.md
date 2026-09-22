@@ -79,6 +79,18 @@ Only the saved frontier is resolved, and the resolved indices are reused for
 execution. Restore occurs outside Store locks. Saved counters remain
 cumulative while `max_steps` is an additional budget for this call.
 
+`CompiledGraph::resume_with_state_initializer` additionally accepts a synchronous,
+fallible callback for attaching invocation-local resources after State restore.
+It runs exactly once after validation, successful restore, and control checks,
+including for a completed checkpoint. It must preserve restored durable fields
+and the saved frontier's meaning; it is not a historical editing API. Resources
+attached this way must be excluded from snapshots. Callback failures retain
+their concrete `SnapshotError` under `GraphRunError::RestoreFailed`, before
+resume-success events, Node execution, or checkpoint writes. Cancellation and
+deadlines are checked before and after initialization. Like synchronous restore,
+the callback cannot be preempted mid-call and must remain lightweight. Ordinary
+`resume` delegates with a no-op callback.
+
 ## Replay
 
 Replay loads one exact CheckpointId through `get`. It does not select latest,
@@ -156,4 +168,3 @@ on a database library.
 
 Related decision:
 [ADR-004](../adr/004-storage-neutral-checkpoints.md).
-

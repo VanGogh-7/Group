@@ -132,24 +132,38 @@ fn runtime(fail: bool) -> (ToolRuntime, Arc<AtomicUsize>) {
 async fn invoke(
     agent: &ToolCallingAgent,
     use_sink: bool,
+    durable: bool,
 ) -> (Vec<AgentStreamEvent>, Result<AgentOutcome, AgentError>) {
     if use_sink {
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed = events.clone();
-        let result = agent
-            .invoke_with_stream_sink(
-                vec![Message::user("lookup")],
-                Arc::new(move |event: &AgentStreamEvent| {
-                    observed.lock().unwrap().push(event.clone());
-                }),
-            )
-            .await;
+        let sink = Arc::new(move |event: &AgentStreamEvent| {
+            observed.lock().unwrap().push(event.clone());
+        });
+        let result = if durable {
+            agent
+                .invoke_with_checkpoint_stream_sink(
+                    vec![Message::user("lookup")],
+                    checkpoint_config(),
+                    sink,
+                )
+                .await
+                .map(|outcome| outcome.as_completed().unwrap().clone())
+        } else {
+            agent
+                .invoke_with_stream_sink(vec![Message::user("lookup")], sink)
+                .await
+        };
         let captured = events.lock().unwrap().clone();
         (captured, result)
     } else {
         let mut events = Vec::new();
         let mut result = None;
-        let mut stream = agent.stream(vec![Message::user("lookup")]);
+        let mut stream = if durable {
+            agent.stream_with_checkpoint(vec![Message::user("lookup")], checkpoint_config())
+        } else {
+            agent.stream(vec![Message::user("lookup")])
+        };
         while let Some(item) = stream.next().await {
             match item {
                 Ok(event) => {
@@ -182,7 +196,7 @@ fn source<'a, T: Error + 'static>(error: &'a (dyn Error + 'static)) -> Option<&'
 
 #[tokio::test]
 async fn configured_observer_receives_streaming_tool_events() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         let (runtime, calls) = runtime(false);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = observed.clone();
@@ -193,7 +207,7 @@ async fn configured_observer_receives_streaming_tool_events() {
         let agent =
             ToolCallingAgent::new(model(tool_turns()), runtime, AgentConfig::new(2).unwrap())
                 .unwrap();
-        let (_, result) = invoke(&agent, use_sink).await;
+        let (_, result) = invoke(&agent, use_sink, durable).await;
         assert_eq!(
             result.unwrap().final_message().unwrap().text_content(),
             "done"
@@ -214,7 +228,7 @@ async fn configured_observer_receives_streaming_tool_events() {
 
 #[tokio::test]
 async fn observer_start_error_or_panic_prevents_execution_during_streaming() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         for panics in [false, true] {
             let (runtime, calls) = runtime(false);
             let runtime = runtime.with_event_sink(Arc::new(move |event: &ToolEvent| {
@@ -227,7 +241,7 @@ async fn observer_start_error_or_panic_prevents_execution_during_streaming() {
             let agent =
                 ToolCallingAgent::new(model(tool_turns()), runtime, AgentConfig::new(2).unwrap())
                     .unwrap();
-            let (events, result) = invoke(&agent, use_sink).await;
+            let (events, result) = invoke(&agent, use_sink, durable).await;
             let error = result.expect_err("start observer failure must prevent execution");
             let report = error.tool_batch_report().unwrap();
             let failure = report.results()[0].as_ref().unwrap_err();
@@ -253,7 +267,7 @@ async fn observer_start_error_or_panic_prevents_execution_during_streaming() {
 
 #[tokio::test]
 async fn terminal_observer_failure_preserves_tool_outcome_and_failure_report() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         for fail in [false, true] {
             let (runtime, calls) = runtime(fail);
             let terminals = Arc::new(AtomicUsize::new(0));
@@ -268,7 +282,7 @@ async fn terminal_observer_failure_preserves_tool_outcome_and_failure_report() {
             let agent =
                 ToolCallingAgent::new(model(tool_turns()), runtime, AgentConfig::new(2).unwrap())
                     .unwrap();
-            let (events, result) = invoke(&agent, use_sink).await;
+            let (events, result) = invoke(&agent, use_sink, durable).await;
             if fail {
                 let error = result.unwrap_err();
                 let report = error.tool_batch_report().unwrap();
@@ -300,12 +314,12 @@ async fn terminal_observer_failure_preserves_tool_outcome_and_failure_report() {
 
 #[tokio::test]
 async fn failed_tool_emits_terminal_event_before_agent_error() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         let (runtime, calls) = runtime(true);
         let agent =
             ToolCallingAgent::new(model(tool_turns()), runtime, AgentConfig::new(2).unwrap())
                 .unwrap();
-        let (events, result) = invoke(&agent, use_sink).await;
+        let (events, result) = invoke(&agent, use_sink, durable).await;
         let error = result.unwrap_err();
         let report = error.tool_batch_report().unwrap();
         assert_eq!(
@@ -348,7 +362,7 @@ async fn failed_tool_emits_terminal_event_before_agent_error() {
 
 #[tokio::test]
 async fn rejected_protocol_deltas_are_not_published() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         for case in 0..3 {
             let (turn, accepted_deltas) = match case {
                 0 => (
@@ -379,7 +393,7 @@ async fn rejected_protocol_deltas_are_not_published() {
                 AgentConfig::new(1).unwrap(),
             )
             .unwrap();
-            let (events, result) = invoke(&agent, use_sink).await;
+            let (events, result) = invoke(&agent, use_sink, durable).await;
             let error = result.unwrap_err();
             let protocol =
                 source::<StreamProtocolError>(&error).expect("typed protocol error retained");
@@ -409,14 +423,14 @@ async fn rejected_protocol_deltas_are_not_published() {
 
 #[tokio::test]
 async fn unstarted_tool_failure_does_not_emit_execution_lifecycle() {
-    for use_sink in [false, true] {
+    for (use_sink, durable) in [(false, false), (true, false), (false, true), (true, true)] {
         let agent = ToolCallingAgent::new(
             model(tool_turns()),
             ToolRuntime::new(ToolRegistry::empty()),
             AgentConfig::new(2).unwrap(),
         )
         .unwrap();
-        let (events, result) = invoke(&agent, use_sink).await;
+        let (events, result) = invoke(&agent, use_sink, durable).await;
         let error = result.unwrap_err();
         let report = error.tool_batch_report().unwrap();
         assert_eq!(
@@ -428,4 +442,14 @@ async fn unstarted_tool_failure_does_not_emit_execution_lifecycle() {
             AgentStreamEvent::ToolStarted { .. } | AgentStreamEvent::ToolCompleted { .. }
         )));
     }
+}
+
+fn checkpoint_config() -> group_agent_core::CheckpointConfig<group_agent_prebuilt::AgentSnapshot> {
+    group_agent_core::CheckpointConfig::new(
+        "stream-regression",
+        Arc::new(group_agent_core::InMemoryCheckpointer::new(
+            group_agent_prebuilt::AgentSnapshotCodec,
+        )),
+        group_agent_core::CheckpointPolicy::EverySuperstep,
+    )
 }

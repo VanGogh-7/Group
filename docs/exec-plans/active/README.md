@@ -14,6 +14,10 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 None currently active.
 
+[Plan 031](../completed/031-durable-streaming-approval.md) completed checkpointed
+streaming and resumable Tool approval, including the authorized Core restore
+initializer, full stable/MSRV verification, and independent PASS review.
+
 On 2026-09-15 the User cancelled publication preparation and requested deletion
 of Plan 025. It was removed, not completed. Historical preflight records remain
 under `docs/release/`; they do not authorize resuming publication. Code-review

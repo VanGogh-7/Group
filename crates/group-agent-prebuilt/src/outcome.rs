@@ -103,6 +103,7 @@ impl fmt::Debug for AgentRunOutcome {
 /// an approval decision; the downcast approval request is then exposed
 /// through [`Self::approval_request`]. Any other interrupt payload stays
 /// behind the stored checkpoint and is not exposed here.
+#[derive(Clone, PartialEq)]
 pub struct AgentInterrupted {
     thread_id: ThreadId,
     checkpoint_id: CheckpointId,

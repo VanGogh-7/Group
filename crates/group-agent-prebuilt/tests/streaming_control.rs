@@ -6,13 +6,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
-use group_agent_core::{EventConfig, GraphRunError, RunControl};
-use group_agent_model::{
-    ChatEventStream, ChatModel, ChatModelAdapter, ChatResponse, ChatStreamEvent, FinishReason,
-    Message, ModelCapabilities, ModelError, ModelId, ModelMetadata, ProviderId, ToolCallDelta,
-    ToolCallId, ToolDefinition, ToolName, ValidatedChatRequest,
+use group_agent_core::{
+    CheckpointConfig, CheckpointPolicy, EventConfig, GraphRunError, InMemoryCheckpointer,
+    ResumeConfig, RunControl,
 };
-use group_agent_prebuilt::{AgentConfig, AgentStreamEvent, ToolCallingAgent};
+use group_agent_model::{
+    AssistantMessage, ChatEventStream, ChatModel, ChatModelAdapter, ChatResponse, ChatStreamEvent,
+    FinishReason, Message, ModelCapabilities, ModelError, ModelId, ModelMetadata, ProviderId,
+    ToolCall, ToolCallDelta, ToolCallId, ToolDefinition, ToolName, ValidatedChatRequest,
+};
+use group_agent_prebuilt::{
+    AgentApprovalDecision, AgentConfig, AgentSnapshotCodec, AgentStreamEvent, ToolCallingAgent,
+};
 use group_agent_tool::{
     Tool, ToolBehavior, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRuntime,
 };
@@ -52,7 +57,17 @@ impl ChatModelAdapter for PendingModel {
         &self.metadata
     }
     async fn complete_raw(&self, _: ValidatedChatRequest) -> Result<ChatResponse, ModelError> {
-        panic!("streaming must never fall back to completion")
+        Ok(ChatResponse::new(
+            AssistantMessage::new(
+                Vec::new(),
+                vec![ToolCall::new(
+                    ToolCallId::new("pending-call").unwrap(),
+                    ToolName::new("pending-tool").unwrap(),
+                    serde_json::json!({}),
+                )],
+            ),
+            FinishReason::ToolCalls,
+        ))
     }
     async fn stream_raw(&self, _: ValidatedChatRequest) -> Result<ChatEventStream, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -105,131 +120,205 @@ enum Stop {
     Drop,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Plain,
+    Checkpoint,
+    Resume,
+}
+
 async fn exercise_control(stop: Stop) {
-    for pending_model in [true, false] {
-        for use_sink in [false, true] {
-            let probe = Arc::new(Probe::default());
-            let calls = Arc::new(AtomicUsize::new(0));
-            let model = ChatModel::from_adapter(PendingModel {
-                metadata: ModelMetadata::new(
-                    ProviderId::new("offline").unwrap(),
-                    ModelId::new("controlled-stream").unwrap(),
-                    ModelCapabilities::new()
-                        .with_streaming(true)
-                        .with_tool_calling(true),
-                ),
-                probe: Arc::clone(&probe),
-                pending_model,
-                calls: Arc::clone(&calls),
-            })
-            .unwrap();
-            let mut registry = ToolRegistry::builder();
-            if !pending_model {
-                registry
-                    .register(PendingTool {
-                        definition: ToolDefinition::new(
-                            ToolName::new("pending-tool").unwrap(),
-                            "Wait for cancellation",
-                            serde_json::json!({"type":"object"}),
-                        ),
-                        probe: Arc::clone(&probe),
-                    })
-                    .unwrap();
-            }
-            let agent = ToolCallingAgent::new(
-                model,
-                ToolRuntime::new(registry.build()),
-                AgentConfig::new(2).unwrap(),
-            )
-            .unwrap();
-            let token = CancellationToken::new();
-            let duration = Duration::from_secs(5);
-            let control = match stop {
-                Stop::Cancel => RunControl::new().with_cancellation_token(token.clone()),
-                Stop::RunTimeout => RunControl::new().with_run_timeout(duration),
-                Stop::NodeTimeout => RunControl::new().with_node_timeout(duration),
-                Stop::Drop => RunControl::new(),
-            };
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let observed = Arc::clone(&events);
-            let mut invocation = Box::pin(async {
-                if use_sink {
-                    agent
-                        .invoke_with_stream_sink_control(
-                            vec![Message::user("wait")],
-                            Arc::new(move |event: &AgentStreamEvent| {
-                                observed.lock().unwrap().push(event.clone());
-                            }),
-                            EventConfig::default(),
-                            control,
+    for mode in [Mode::Plain, Mode::Checkpoint, Mode::Resume] {
+        for pending_model in [true, false] {
+            for use_sink in [false, true] {
+                let probe = Arc::new(Probe::default());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let model = ChatModel::from_adapter(PendingModel {
+                    metadata: ModelMetadata::new(
+                        ProviderId::new("offline").unwrap(),
+                        ModelId::new("controlled-stream").unwrap(),
+                        ModelCapabilities::new()
+                            .with_streaming(true)
+                            .with_tool_calling(true),
+                    ),
+                    probe: Arc::clone(&probe),
+                    pending_model,
+                    calls: Arc::clone(&calls),
+                })
+                .unwrap();
+                let mut registry = ToolRegistry::builder();
+                if !pending_model || mode == Mode::Resume {
+                    registry
+                        .register(PendingTool {
+                            definition: ToolDefinition::new(
+                                ToolName::new("pending-tool").unwrap(),
+                                "Wait for cancellation",
+                                serde_json::json!({"type":"object"}),
+                            ),
+                            probe: Arc::clone(&probe),
+                        })
+                        .unwrap();
+                }
+                let agent = ToolCallingAgent::new(
+                    model,
+                    ToolRuntime::new(registry.build()),
+                    AgentConfig::new(2)
+                        .unwrap()
+                        .with_tool_approval(mode == Mode::Resume),
+                )
+                .unwrap();
+                let store = Arc::new(InMemoryCheckpointer::new(AgentSnapshotCodec));
+                let checkpoint = || {
+                    CheckpointConfig::new(
+                        "control",
+                        store.clone(),
+                        CheckpointPolicy::EverySuperstep,
+                    )
+                };
+                if mode == Mode::Resume {
+                    let outcome = agent
+                        .invoke_with_checkpoint(
+                            vec![Message::user("prepare approval")],
+                            checkpoint(),
                         )
                         .await
-                        .map(|_| ())
-                } else {
-                    let mut stream = agent.stream_with_control(
-                        vec![Message::user("wait")],
-                        EventConfig::default(),
-                        control,
-                    );
-                    while let Some(event) = stream.next().await {
-                        observed.lock().unwrap().push(event?);
-                    }
-                    Ok(())
-                }
-            });
-            tokio::select! {
-                result = &mut invocation => panic!("unexpected completion: {result:?}"),
-                () = probe.started.notified() => {}
-            }
-            assert_eq!(probe.entered.load(Ordering::SeqCst), 1);
-            assert_eq!(probe.dropped.load(Ordering::SeqCst), 0);
-            match stop {
-                Stop::Drop => drop(invocation),
-                _ => {
-                    if matches!(stop, Stop::Cancel) {
-                        token.cancel();
-                    } else {
-                        tokio::time::advance(duration).await;
-                    }
-                    let error = invocation.await.expect_err("control must fail the run");
-                    let graph = error
-                        .source()
-                        .unwrap()
-                        .downcast_ref::<GraphRunError>()
                         .unwrap();
-                    let step = if pending_model { 1 } else { 2 };
-                    match stop {
-                        Stop::Cancel => assert!(
-                            matches!(graph, GraphRunError::Cancelled { step: s, .. } if *s == step)
-                        ),
-                        Stop::RunTimeout => assert!(
-                            matches!(graph, GraphRunError::RunTimedOut { step: s, timeout, .. } if *s == step && *timeout == duration)
-                        ),
-                        Stop::NodeTimeout => assert!(
-                            matches!(graph, GraphRunError::NodeTimedOut { step: s, timeout, .. } if *s == step && *timeout == duration)
-                        ),
-                        Stop::Drop => unreachable!(),
-                    }
-                    assert!(error.tool_batch_report().is_none());
+                    assert!(outcome.is_interrupted());
                 }
-            }
-            assert_eq!(
-                probe.dropped.load(Ordering::SeqCst),
-                1,
-                "{stop:?}, model={pending_model}, sink={use_sink}"
-            );
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "no subsequent model round");
-            let events = events.lock().unwrap();
-            assert!(!events.iter().any(|event| matches!(
-                event,
-                AgentStreamEvent::Completed(_) | AgentStreamEvent::ToolCompleted { .. }
-            )));
-            if pending_model {
-                assert!(
-                    !events
-                        .iter()
-                        .any(|event| matches!(event, AgentStreamEvent::ModelCompleted { .. }))
+                let token = CancellationToken::new();
+                let duration = Duration::from_secs(5);
+                let control = match stop {
+                    Stop::Cancel => RunControl::new().with_cancellation_token(token.clone()),
+                    Stop::RunTimeout => RunControl::new().with_run_timeout(duration),
+                    Stop::NodeTimeout => RunControl::new().with_node_timeout(duration),
+                    Stop::Drop => RunControl::new(),
+                };
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let observed = Arc::clone(&events);
+                let mut invocation = Box::pin(async {
+                    let resume = || {
+                        ResumeConfig::new("control", store.clone())
+                            .with_control(control.clone())
+                            .with_resume_value(if pending_model {
+                                AgentApprovalDecision::Reject
+                            } else {
+                                AgentApprovalDecision::Approve
+                            })
+                    };
+                    if use_sink {
+                        let sink = Arc::new(move |event: &AgentStreamEvent| {
+                            observed.lock().unwrap().push(event.clone());
+                        });
+                        match mode {
+                            Mode::Plain => agent
+                                .invoke_with_stream_sink_control(
+                                    vec![Message::user("wait")],
+                                    sink,
+                                    EventConfig::default(),
+                                    control.clone(),
+                                )
+                                .await
+                                .map(|_| ()),
+                            Mode::Checkpoint => agent
+                                .invoke_with_checkpoint_stream_sink_control(
+                                    vec![Message::user("wait")],
+                                    EventConfig::default(),
+                                    control.clone(),
+                                    checkpoint(),
+                                    sink,
+                                )
+                                .await
+                                .map(|_| ()),
+                            Mode::Resume => agent
+                                .resume_with_stream_sink(resume(), sink)
+                                .await
+                                .map(|_| ()),
+                        }
+                    } else {
+                        let mut stream = match mode {
+                            Mode::Plain => agent.stream_with_control(
+                                vec![Message::user("wait")],
+                                EventConfig::default(),
+                                control.clone(),
+                            ),
+                            Mode::Checkpoint => agent.stream_with_checkpoint_control(
+                                vec![Message::user("wait")],
+                                EventConfig::default(),
+                                control.clone(),
+                                checkpoint(),
+                            ),
+                            Mode::Resume => agent.resume_stream(resume()),
+                        };
+                        while let Some(event) = stream.next().await {
+                            observed.lock().unwrap().push(event?);
+                        }
+                        Ok(())
+                    }
+                });
+                tokio::select! {
+                    result = &mut invocation => panic!("unexpected completion: {result:?}"),
+                    () = probe.started.notified() => {}
+                }
+                assert_eq!(probe.entered.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.dropped.load(Ordering::SeqCst), 0);
+                match stop {
+                    Stop::Drop => drop(invocation),
+                    _ => {
+                        if matches!(stop, Stop::Cancel) {
+                            token.cancel();
+                        } else {
+                            tokio::time::advance(duration).await;
+                        }
+                        let error = invocation.await.expect_err("control must fail the run");
+                        let graph = error
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<GraphRunError>()
+                            .unwrap();
+                        let step = if pending_model {
+                            if mode == Mode::Resume { 3 } else { 1 }
+                        } else {
+                            2
+                        };
+                        match stop {
+                            Stop::Cancel => assert!(
+                                matches!(graph, GraphRunError::Cancelled { step: s, .. } if *s == step)
+                            ),
+                            Stop::RunTimeout => assert!(
+                                matches!(graph, GraphRunError::RunTimedOut { step: s, timeout, .. } if *s == step && *timeout == duration)
+                            ),
+                            Stop::NodeTimeout => assert!(
+                                matches!(graph, GraphRunError::NodeTimedOut { step: s, timeout, .. } if *s == step && *timeout == duration)
+                            ),
+                            Stop::Drop => unreachable!(),
+                        }
+                        assert!(error.tool_batch_report().is_none());
+                    }
+                }
+                assert_eq!(
+                    probe.dropped.load(Ordering::SeqCst),
+                    1,
+                    "{stop:?}, model={pending_model}, sink={use_sink}"
                 );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(mode != Mode::Resume || pending_model),
+                    "no subsequent model round"
+                );
+                let events = events.lock().unwrap();
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentStreamEvent::Completed(_)
+                        | AgentStreamEvent::Interrupted(_)
+                        | AgentStreamEvent::ToolCompleted { .. }
+                )));
+                if pending_model {
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, AgentStreamEvent::ModelCompleted { .. }))
+                    );
+                }
             }
         }
     }

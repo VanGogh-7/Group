@@ -26,8 +26,12 @@ impl AgentState {
     }
 
     pub(crate) fn with_sink(mut self, sink: Arc<dyn AgentEventSink>) -> Self {
-        self.sink = Some(sink);
+        self.set_sink(sink);
         self
+    }
+
+    pub(crate) fn set_sink(&mut self, sink: Arc<dyn AgentEventSink>) {
+        self.sink = Some(sink);
     }
 
     pub(crate) fn sink(&self) -> Option<&Arc<dyn AgentEventSink>> {
