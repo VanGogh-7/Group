@@ -55,7 +55,8 @@ fresh exact-version consumer verification remain separately authorized. See
   opt-in durable execution (checkpointed invoke, Resume, Replay, Fork), and
   opt-in durable human approval before Tool execution (approve/reject
   Resume) over the Core durable ports;
-- Genai 0.6.5 adapter with evidence-based fail-closed compatibility;
+- Genai 0.6.5 adapter with fail-closed compatibility and opt-in native
+  OpenAI Chat tool streaming;
 - MCP 2.2.0 client adapter with bounded discovery and reusable stdio sessions.
 
 ## Architecture at a glance
@@ -160,6 +161,7 @@ The Genai mapping example does not require a live API key:
 
 ```bash
 cargo run -p group-agent-genai --example genai_model
+cargo run -p group-agent-genai --example openai_chat_model
 cargo check -p group-agent-genai --example genai_node
 ```
 
@@ -293,6 +295,8 @@ Group currently supports:
 - provider-neutral complete and stream calls;
 - audited Genai text streaming paths and non-streaming ToolCalls under the
   documented target policy;
+- opt-in native OpenAI Chat text/tool streaming with bounded decoding and
+  local HTTP coverage through durable approval and SQLite reopen;
 - local Tool execution and MCP stdio-backed Tools;
 - experimental Model -> Tool -> Model orchestration with `FinalAnswer` and
   `MaxRounds` outcomes;

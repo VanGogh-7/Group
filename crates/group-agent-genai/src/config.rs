@@ -78,7 +78,7 @@ pub enum GenaiContentPolicy {
 /// Streaming behavior allowed by this adapter instance.
 ///
 /// genai 0.6.5 is not safe for OpenAI Responses streaming or OpenAI Chat tool
-/// streaming. Consequently this policy has no public tool-streaming mode.
+/// streaming. `OpenAiChat` uses Group's strict protocol implementation instead.
 /// Enabled variants require an injected Client bound to
 /// `genai::adapter::AdapterKind::OpenAI`. The adapter also validates the exact
 /// resolved stream target before polling, so a custom resolver cannot expand
@@ -93,6 +93,9 @@ pub enum GenaiStreamingPolicy {
     TextOnly,
     /// Permit the adapter-audited OpenAI Chat text-only path.
     AuditedTextOnly,
+    /// Permit text and tool streaming through Group's strict OpenAI Chat path.
+    /// Requires `GenaiChatModelAdapter::new_with_stable_target`.
+    OpenAiChat,
 }
 
 /// Bounds for online stream normalization.
@@ -102,6 +105,8 @@ pub struct GenaiStreamingLimits {
     max_reasoning_bytes: usize,
     max_thought_signature_bytes: usize,
     max_thought_signatures_per_tool_call: usize,
+    max_sse_event_bytes: usize,
+    max_tool_argument_bytes: usize,
 }
 
 impl GenaiStreamingLimits {
@@ -113,6 +118,8 @@ impl GenaiStreamingLimits {
             max_reasoning_bytes: 16 * 1024 * 1024,
             max_thought_signature_bytes: 4 * 1024 * 1024,
             max_thought_signatures_per_tool_call: 1_024,
+            max_sse_event_bytes: 1024 * 1024,
+            max_tool_argument_bytes: 16 * 1024 * 1024,
         }
     }
 
@@ -121,6 +128,30 @@ impl GenaiStreamingLimits {
     pub const fn with_max_tool_calls(mut self, maximum: u32) -> Self {
         self.max_tool_calls = maximum;
         self
+    }
+
+    /// Bounds one normalized SSE event (including field names and comments)
+    /// on the strict OpenAI Chat path. The default is 1 MiB.
+    #[must_use]
+    pub const fn with_max_sse_event_bytes(mut self, maximum: usize) -> Self {
+        self.max_sse_event_bytes = maximum;
+        self
+    }
+
+    /// Bounds aggregate retained argument bytes across all streamed tool calls
+    /// on the strict OpenAI Chat path. The default is 16 MiB.
+    #[must_use]
+    pub const fn with_max_tool_argument_bytes(mut self, maximum: usize) -> Self {
+        self.max_tool_argument_bytes = maximum;
+        self
+    }
+
+    pub(crate) const fn max_sse_event_bytes(self) -> usize {
+        self.max_sse_event_bytes
+    }
+
+    pub(crate) const fn max_tool_argument_bytes(self) -> usize {
+        self.max_tool_argument_bytes
     }
 
     /// Sets the maximum retained reasoning byte count.

@@ -12,7 +12,11 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 ## Plans
 
-None currently active.
+No active execution plans.
+
+[Plan 032](../completed/032-provider-tool-streaming.md) completed opt-in native
+OpenAI Chat tool streaming and local HTTP-to-durable-approval integration,
+with full stable/MSRV verification and independent PASS review.
 
 [Plan 031](../completed/031-durable-streaming-approval.md) completed checkpointed
 streaming and resumable Tool approval, including the authorized Core restore

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod wire;
+
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

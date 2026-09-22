@@ -10,6 +10,21 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GenaiAdapterConfigError {
+    /// Strict streaming needs the transport owned by the stable constructor.
+    #[error("OpenAiChat streaming requires new_with_stable_target")]
+    OpenAiChatRequiresStableTarget,
+    /// A client setting is outside the strict streaming profile.
+    #[error("OpenAiChat does not support client setting `{field}`")]
+    UnsupportedOpenAiChatSetting {
+        /// Static setting name, never its value.
+        field: &'static str,
+    },
+    /// Building the shared HTTP client failed. Default formatting is redacted.
+    #[error("OpenAiChat HTTP client construction failed")]
+    OpenAiChatClientBuild(#[source] Box<ModelError>),
+    /// The endpoint could not be resolved. Default formatting is redacted.
+    #[error("OpenAiChat endpoint resolution failed")]
+    OpenAiChatEndpoint(#[source] Box<ModelError>),
     /// The requested genai model was empty.
     #[error("requested genai model must not be empty")]
     EmptyRequestedModel,
@@ -46,6 +61,26 @@ pub enum GenaiAdapterConfigError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GenaiMappingError {
+    /// A strict OpenAI Chat frame violates its supported protocol.
+    #[error("OpenAI Chat stream protocol violation in `{field}`")]
+    InvalidOpenAiChatField {
+        /// Static schema or lifecycle field name, never provider content.
+        field: &'static str,
+    },
+    /// A strict OpenAI Chat JSON frame could not be decoded.
+    #[error("OpenAI Chat stream JSON decoding failed")]
+    OpenAiChatJson(#[source] serde_json::Error),
+    /// A strict SSE line was not valid UTF-8.
+    #[error("OpenAI Chat stream UTF-8 decoding failed")]
+    OpenAiChatUtf8(#[source] std::str::Utf8Error),
+    /// A strict stream exceeded a configured byte bound.
+    #[error("OpenAI Chat stream `{field}` exceeds byte maximum {maximum}")]
+    OpenAiChatByteLimit {
+        /// Static resource name.
+        field: &'static str,
+        /// Configured byte maximum.
+        maximum: usize,
+    },
     /// A request passed to the standalone mapper was not facade-valid.
     #[error("group chat request validation failed")]
     InvalidGroupRequest(#[source] RequestValidationError),
@@ -267,6 +302,8 @@ impl GenaiMappingError {
                 ModelErrorKind::UnsupportedCapability(ModelCapability::ToolCalling)
             }
             Self::NegativeTokenCount { .. }
+            | Self::OpenAiChatJson(_)
+            | Self::OpenAiChatUtf8(_)
             | Self::InvalidTokenUsage(_)
             | Self::UsageDetailSerialization { .. }
             | Self::ToolArgumentsSerialization(_)
@@ -277,6 +314,8 @@ impl GenaiMappingError {
             | Self::InvalidResponsesRawField { .. }
             | Self::InvalidResponsesToolArguments(_) => ModelErrorKind::Decode,
             Self::UnsupportedResponseContent { .. }
+            | Self::InvalidOpenAiChatField { .. }
+            | Self::OpenAiChatByteLimit { .. }
             | Self::InvalidIdentifier { .. }
             | Self::ExtensionConstruction { .. }
             | Self::DuplicateStreamStart

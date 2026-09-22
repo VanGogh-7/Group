@@ -36,6 +36,8 @@ experimental.
 
 Adapter documents include current upstream-version, protocol, and lifecycle
 limits. Genai and MCP public configuration surfaces remain experimental.
+The Genai guide includes opt-in native OpenAI Chat tool streaming and its
+HTTP-to-durable-approval integration boundaries.
 
 ## Decisions
 

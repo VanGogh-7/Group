@@ -52,3 +52,6 @@ code, tests, architecture, or quality documentation.
 - [031 Durable streaming and resumable Tool approval](031-durable-streaming-approval.md)
   - integrated checkpointed streaming and approval Resume, with explicit transient
     State initialization, full stable/MSRV gates, and independent PASS review.
+- [032 Reliable provider tool-call streaming](032-provider-tool-streaming.md)
+  - added opt-in native OpenAI Chat tool streaming, bounded protocol validation,
+    and HTTP-to-SQLite approval recovery with full gates and independent PASS.

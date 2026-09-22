@@ -103,8 +103,9 @@ assistant response are rejected.
 
 Provider-reported model identity becomes the Group response model. Resolved
 and provider model names, adapter kind, and raw stop reason are retained under
-redacted Extensions. Missing stop reason becomes `Other("unspecified")`; it is
-never fabricated as Stop.
+redacted Extensions. On Genai-backed paths, missing stop reason becomes
+`Other("unspecified")`; it is never fabricated as Stop. The strict OpenAI Chat
+stream requires an explicit supported finish reason.
 
 ## Extensions and continuation
 
@@ -188,17 +189,19 @@ source.
 
 ## Streaming and cancellation
 
-Streaming is fail-closed by default. There is no public protocol profile or
-unchecked override. An enabled `GenaiStreamingPolicy` requires the injected
-Client itself to be bound to `AdapterKind::OpenAI`; unbound, Responses, and all
-other AdapterKind values fail during adapter construction.
+Streaming is disabled by default. `TextOnly` and `AuditedTextOnly` use the
+pinned Genai text stream. `OpenAiChat` is an explicit opt-in to Group's native
+strict Chat protocol implementation, described below. There is no unchecked
+protocol override. Every enabled policy requires an OpenAI Chat binding;
+unbound, Responses, and other adapter kinds fail during construction.
 
 | Path | genai 0.6.5 |
 | --- | --- |
 | OpenAI Chat non-streaming text | Supported with dynamic or stable resolution |
 | OpenAI Chat non-streaming ToolCall | Supported only with an exact stable target |
 | OpenAI Chat text-only streaming | Supported with trusted binding |
-| OpenAI Chat streaming with tools | Unsupported |
+| OpenAI Chat streaming with tools through Genai | Unsupported |
+| Native OpenAI Chat text/tool streaming (`OpenAiChat`) | Supported only with an exact stable target and restricted configuration |
 | OpenAI Responses non-streaming text | Supported with dynamic or stable resolution |
 | OpenAI Responses non-streaming ToolCall | Supported only with stable-target post-capture verification |
 | OpenAI Responses signature continuation | Supported only with a stable target; verified by a real two-turn HTTP fixture |
@@ -210,8 +213,9 @@ OpenAI Chat 0.6.5 consumes only the first ToolCall delta when one SSE event
 contains multiple calls. OpenAI Responses 0.6.5 can skip malformed events,
 trace raw event data, and synthesize a successful End at transport EOF. These
 losses occur before Group receives an event, so the adapter cannot repair them.
-Requests that may produce a new ToolCall and all Responses streaming requests
-therefore return `UnsupportedCapability(Streaming)` before HTTP dispatch.
+On the Genai-backed policies, requests that may produce a new ToolCall and all
+Responses streaming requests therefore return `UnsupportedCapability(Streaming)`
+before HTTP dispatch. The native policy does not use Genai's stream parser.
 
 genai resolves a `ServiceTarget` once while constructing
 `ChatStreamResponse`; the resulting stream is lazy and exposes that exact
@@ -242,11 +246,110 @@ Reasoning is never emitted as TextDelta. When retention is enabled it is
 bounded and placed in response Extensions. A normal transport EOF without End
 produces an explicit Protocol ModelError. The first item error is terminal.
 
-The returned Group stream owns the genai stream directly. There is no channel
-or forwarding task. Dropping a completion Future or stream drops the genai
+The returned Group stream owns its provider stream directly. There is no channel
+or forwarding task. Dropping a completion Future or stream drops the provider
 owner; Group node timeout and cancellation therefore release the in-flight
 HTTP request. This is an ownership guarantee, not a promise about when an
 operating system closes a particular TCP connection.
+
+### Native OpenAI Chat tool streaming
+
+`GenaiStreamingPolicy::OpenAiChat` requires
+`GenaiChatModelAdapter::new_with_stable_target` with matching
+`AdapterKind::OpenAI` bindings. `new(genai::Client, config)` rejects this policy:
+Genai does not expose the injected client's transport or configuration.
+
+```rust
+# use genai::{ClientConfig, ServiceTarget, adapter::AdapterKind};
+# use group_agent_genai::{GenaiAdapterConfig, GenaiChatModelAdapter, GenaiStreamingPolicy};
+# fn build(target: ServiceTarget, config: GenaiAdapterConfig)
+# -> Result<GenaiChatModelAdapter, Box<dyn std::error::Error>> {
+let adapter = GenaiChatModelAdapter::new_with_stable_target(
+    ClientConfig::default().with_adapter_kind(AdapterKind::OpenAI),
+    target,
+    config.with_streaming_policy(GenaiStreamingPolicy::OpenAiChat),
+)?;
+# Ok(adapter)
+# }
+```
+
+The constructor builds one reqwest client using the supplied WebConfig and
+shares it with Genai's non-streaming path. Proxy, timeout, default headers, and
+connection configuration stay application-owned. This opt-in client disables
+HTTP retries and redirects in both modes. `AuthData::Key` and
+`RequestOverride` work in both modes. `AuthData::None` is supported only by the
+native stream; Genai's unchanged non-streaming path rejects it before HTTP.
+Environment-indirected and multi-key auth are rejected; supply explicitly
+resolved credentials. `RequestOverride` retains its URL/header semantics.
+Ordinary endpoint resolution follows Genai's URL join rules and preserves the
+base query: `/v1/` appends `chat/completions`, while `/v1` replaces the last path
+segment. Invalid endpoints fail at construction with a typed, redacted error.
+No credentials are discovered by the native path.
+
+The restricted client ChatOptions subset is temperature, top-p, maximum tokens,
+stops, ToolChoice, and capture settings. Group's per-request values and capture
+policy take precedence as on the pinned Genai path; in particular, an empty
+per-request stop list does not inherit client stops. Namespaces are removed
+from the wire model name. Genai reasoning-effort model suffixes, reasoning
+options, response formats, verbosity, seed, service tier, cache options,
+`extra_body`, and ChatOptions `extra_headers` are rejected at construction.
+Use WebConfig `default_headers` for shared headers. `max_tokens` versus
+`max_completion_tokens` follows Genai 0.6.5's model-family convention.
+
+Requests preserve ordered text messages, tool definitions, ToolCall IDs,
+structured JSON arguments, Tool results, and Auto/None/Required/Named choices.
+`previous_response_id` and reasoning/signature continuation are unsupported on
+this path and fail before HTTP. Explicit `store` is forwarded as a Chat request
+field. Parallel-call request controls remain unsupported; multiple returned
+calls are preserved and dispatched by ToolRuntime's existing batch policy.
+
+The decoder processes all tool calls and text within each SSE frame, with
+stable provider indices and incremental arguments. It handles UTF-8 fragments,
+an initial BOM, CR/LF/CRLF separators, multiline data, and usage tails. Only one
+choice (index zero) is supported. Missing/changing identities, duplicate tool
+IDs, unsupported tool/content kinds (including refusal and reasoning fields),
+unknown finish reasons, malformed JSON, and premature EOF fail permanently.
+ToolCalls require `finish_reason: tool_calls`; truncation or filtering during
+tool generation is an error. `[DONE]` and valid complete argument JSON are
+required before `Finished`. Events from a malformed frame are not published.
+`ResponseStarted` metadata is emitted once at logical completion. The `[DONE]`
+marker ends ownership without waiting for socket EOF; subsequent bytes are
+outside the response. HTTP errors preserve status and typed sources without
+reading provider error bodies. Default Group formatting remains payload-safe.
+
+Limits specific to this path:
+
+- `with_max_sse_event_bytes`: 1 MiB by default, counting normalized event bytes
+  including field names, comments, and separators (CRLF counts as one newline).
+- `with_max_tool_argument_bytes`: 16 MiB by default across all calls combined.
+- `with_max_tool_calls`: 1,024 by default; bounds count, entries per frame, and
+  provider indices (indices must be below the limit).
+
+These are decoder admission/retention bounds, not total process-memory bounds.
+One HTTP chunk, JSON parsing overhead, emitted event queues owned by callers,
+and downstream collectors are separate. No transcript text is retained in the
+decoder. Arguments append to one buffer per call and are parsed once at finish;
+there is no sparse-vector allocation or repeated cumulative-argument copy.
+The provider-neutral collector also applies its own limits.
+
+Run the offline configuration example and actual HTTP/SQLite fixtures:
+
+```bash
+cargo run --locked --offline -p group-agent-genai --example openai_chat_model
+cargo test --locked -p group-agent-genai --test openai_chat
+```
+
+The integration fixtures cover approval/rejection after explicitly closing and
+reopening SQLite with a new Agent, recovery after a later model failure, and
+Core cancellation/timeout. Protocol/JSON failures produce no approval or Tool
+execution. ToolRuntime validates the registered schema before executing a Tool;
+approval does not bypass that validation. Saved Tool results prevent repeating
+that committed work, but crash windows around external side effects remain.
+The fixtures use local HTTP only; they are not live-provider certification or
+an actual process-kill test, and no provider quota has been consumed.
+
+Protocol references: [OpenAI Chat streaming events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
+and [SSE framing](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream).
 
 ## Errors and limits
 

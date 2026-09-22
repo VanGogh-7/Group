@@ -26,6 +26,7 @@ pub struct GenaiChatModelAdapter {
     metadata: ModelMetadata,
     bound_adapter_kind: Option<AdapterKind>,
     stable_target: Option<ServiceTarget>,
+    openai_chat: Option<crate::openai_chat::OpenAiChat>,
 }
 
 impl GenaiChatModelAdapter {
@@ -35,7 +36,7 @@ impl GenaiChatModelAdapter {
         client: genai::Client,
         config: GenaiAdapterConfig,
     ) -> Result<Self, GenaiAdapterConfigError> {
-        Self::new_inner(client, config, None)
+        Self::new_inner(client, config, None, None)
     }
 
     /// Creates an adapter whose requests use one immutable service target.
@@ -46,6 +47,10 @@ impl GenaiChatModelAdapter {
     /// `ServiceTargetResolver`; consequently genai dispatches the supplied
     /// target without a second mutable resolution step. Target authentication
     /// and endpoint data are never exposed by this adapter's `Debug`.
+    /// With `GenaiStreamingPolicy::OpenAiChat`, this also enables native
+    /// text/tool streaming through one shared HTTP client built from WebConfig.
+    /// That opt-in client disables retries and redirects for both completion
+    /// modes and rejects unsupported client options before dispatch.
     pub fn new_with_stable_target(
         client_config: ClientConfig,
         target: ServiceTarget,
@@ -60,14 +65,26 @@ impl GenaiChatModelAdapter {
         if bound_adapter_kind != target.model.adapter_kind {
             return Err(GenaiAdapterConfigError::StableTargetAdapterMismatch);
         }
-        let client = genai::Client::builder().with_config(client_config).build();
-        Self::new_inner(client, config, Some(target))
+        let openai_chat = if config.streaming_policy() == GenaiStreamingPolicy::OpenAiChat {
+            Some(crate::openai_chat::OpenAiChat::new(
+                &client_config,
+                &target,
+            )?)
+        } else {
+            None
+        };
+        let mut builder = genai::Client::builder().with_config(client_config);
+        if let Some(transport) = &openai_chat {
+            builder = builder.with_reqwest(transport.client());
+        }
+        Self::new_inner(builder.build(), config, Some(target), openai_chat)
     }
 
     fn new_inner(
         client: genai::Client,
         config: GenaiAdapterConfig,
         stable_target: Option<ServiceTarget>,
+        openai_chat: Option<crate::openai_chat::OpenAiChat>,
     ) -> Result<Self, GenaiAdapterConfigError> {
         let metadata = config.model().metadata().clone();
         metadata
@@ -77,9 +94,14 @@ impl GenaiChatModelAdapter {
             return Err(GenaiAdapterConfigError::ParallelToolCallsUnsupported);
         }
         let bound_adapter_kind = client.adapter_kind();
+        if config.streaming_policy() == GenaiStreamingPolicy::OpenAiChat && openai_chat.is_none() {
+            return Err(GenaiAdapterConfigError::OpenAiChatRequiresStableTarget);
+        }
         match config.streaming_policy() {
             GenaiStreamingPolicy::Disabled => {}
-            GenaiStreamingPolicy::TextOnly | GenaiStreamingPolicy::AuditedTextOnly => {
+            GenaiStreamingPolicy::TextOnly
+            | GenaiStreamingPolicy::AuditedTextOnly
+            | GenaiStreamingPolicy::OpenAiChat => {
                 if !metadata.capabilities().streaming() {
                     return Err(GenaiAdapterConfigError::StreamingCapabilityMissing);
                 }
@@ -100,6 +122,7 @@ impl GenaiChatModelAdapter {
             metadata,
             bound_adapter_kind,
             stable_target,
+            openai_chat,
         })
     }
 
@@ -113,7 +136,7 @@ impl GenaiChatModelAdapter {
         ) {
             return Err(GenaiMappingError::StreamingDisabled);
         }
-        if request_may_produce_tool_call(request) {
+        if request_may_produce_tool_call(request) && self.openai_chat.is_none() {
             return Err(GenaiMappingError::ToolStreamingUnsupported);
         }
         Ok(())
@@ -201,6 +224,17 @@ impl ChatModelAdapter for GenaiChatModelAdapter {
         let mapped = map_request(request, &self.config).map_err(|error| {
             error.into_model_error(self.metadata.provider(), self.metadata.model())
         })?;
+        if let Some(transport) = &self.openai_chat {
+            let target = self.stable_target.as_ref().ok_or_else(|| {
+                GenaiMappingError::UntrustedToolCallBinding
+                    .into_model_error(self.metadata.provider(), self.metadata.model())
+            })?;
+            return transport
+                .stream(target, mapped, self.config.clone())
+                .map_err(|error| {
+                    error.into_model_error(self.metadata.provider(), self.metadata.model())
+                });
+        }
         let response = self
             .client
             .exec_chat_stream(

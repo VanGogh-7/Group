@@ -12,9 +12,13 @@
 //! Streaming is fail-closed by default. Enabling it requires a Client bound to
 //! [`genai::adapter::AdapterKind::OpenAI`], and the exact resolved stream
 //! identity is checked before its lazy HTTP stream is polled. With genai 0.6.5,
-//! OpenAI Chat text-only streaming is supported, while OpenAI Chat tool
-//! streaming and every OpenAI Responses streaming request are rejected before
-//! HTTP dispatch. Non-streaming tool generation is allowed only through
+//! OpenAI Chat text-only streaming is supported. The opt-in
+//! [`GenaiStreamingPolicy::OpenAiChat`] instead uses Group's bounded native
+//! Chat decoder and enables text and tool streaming with a stable target.
+//! It shares a configured HTTP client with Genai, disables retries/redirects,
+//! and rejects unsupported options explicitly. Other policies reject tool
+//! streaming; every OpenAI Responses streaming request remains unsupported.
+//! Non-streaming tool generation is allowed only through
 //! [`GenaiChatModelAdapter::new_with_stable_target`], which binds verification
 //! and dispatch to one exact [`genai::ServiceTarget`]. For OpenAI Responses,
 //! genai first captures the complete raw value; Group then applies a
@@ -34,7 +38,7 @@
 //! A thought-signature chunk on the audited OpenAI Chat text-only stream is a
 //! terminal protocol error; its content is neither retained nor exposed.
 //! Dropping a completion future or returned event stream drops the underlying
-//! genai future or stream; no forwarding task or channel is created.
+//! provider future or stream; no forwarding task or channel is created.
 //!
 //! ```
 //! use genai::{Client, adapter::AdapterKind};
@@ -73,6 +77,7 @@ mod adapter;
 mod config;
 mod error;
 pub mod extensions;
+mod openai_chat;
 mod request;
 mod response;
 mod stream;

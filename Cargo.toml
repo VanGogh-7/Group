@@ -22,6 +22,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 async-trait = "0.1.91"
+bytes = "=1.12.1"
 criterion = { version = "0.7.0", default-features = false, features = [
     "async_tokio",
     "cargo_bench_support",
@@ -30,6 +31,7 @@ futures-util = "0.3.31"
 futures-core = "0.3.31"
 futures-executor = "0.3.31"
 genai = "=0.6.5"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream"] }
 indexmap = "2.14.0"
 jsonschema = { version = "0.49.2", default-features = false }
 petgraph = "0.8.3"

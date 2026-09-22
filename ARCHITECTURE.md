@@ -135,7 +135,11 @@ error.
 Provider-specific request mapping, response decoding, continuation metadata,
 protocol trust, and provider errors remain in adapters. The current Genai
 adapter is fixed to `genai` 0.6.5 and deliberately fails closed for unsupported
-or untrustworthy streaming paths.
+or untrustworthy streaming paths. Its opt-in `OpenAiChat` policy uses private
+native request/SSE mapping because upstream loses multi-tool deltas. The stable
+constructor shares one configured HTTP client with Genai; retries and redirects
+are disabled on that opt-in client. Only this adapter depends directly on
+reqwest/bytes. Core, Model, and Prebuilt remain protocol-neutral.
 
 See [Model and Tools Design](docs/design/model-and-tools.md) and
 [Genai Adapter](docs/adapters/genai.md).

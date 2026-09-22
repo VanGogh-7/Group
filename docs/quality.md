@@ -62,6 +62,23 @@ corrections. Hosted CI, live-provider integration, and runtime performance
 measurement were not run. This remains experimental and is not a
 production-readiness claim.
 
+[Plan 032](exec-plans/completed/032-provider-tool-streaming.md) adds experimental
+opt-in `GenaiStreamingPolicy::OpenAiChat`, bounded native Chat SSE/tool-argument
+decoding, two byte-limit configuration methods, and typed errors. The adapter
+keeps Genai 0.6.5 and shares the application's WebConfig transport between
+native streaming and Genai completions; the new mode disables retries and
+redirects. Core, checkpoint formats, codecs, and lineage are unchanged.
+Nineteen public tests cover protocol/error/control matrices, request parity,
+and actual HTTP tool streaming through approval, SQLite close/reopen with a
+new Agent, approval/rejection, and saved-result recovery. The offline example
+passes. `./scripts/verify all` passed on Rust 1.98.1 and Rust 1.88.0 with 660
+workspace tests including doctests per compiler, zero failures or ignored
+tests, strict Clippy, all-target checks, and benchmark compilation. Independent
+read-only review returned PASS after request-mapping and endpoint corrections.
+Live providers, hosted CI, process-kill recovery, and measured performance were
+not tested. This is not certification of arbitrary OpenAI-compatible endpoints
+or a production-readiness claim.
+
 ## Current compiler policy
 
 All eight crates now share Rust 1.88 as the MSRV under
