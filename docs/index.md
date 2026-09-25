@@ -35,6 +35,10 @@ experimental.
   ([Plan 034](exec-plans/completed/034-structured-output.md)): implemented bounded JSON schema
   profile, typed results and recovery contract behind `structured-output`.
 
+- [Stage 23: Durable two-Agent sequence](specs/023-durable-agent-sequence.md)
+  ([Plan 035](exec-plans/completed/035-durable-agent-sequence.md)): fixed sequential
+  handoff and shared durable execution behind `agent-sequence`.
+
 ## Adapters
 
 - [Genai Adapter](adapters/genai.md)

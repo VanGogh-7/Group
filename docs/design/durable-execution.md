@@ -3,6 +3,41 @@
 This document describes the current checkpoint, replay, and branch contracts.
 The stable public boundary is storage-neutral; SQLite is one adapter.
 
+## Two-Agent sequence durability
+
+AgentSequence uses one parent Checkpointer<SequenceSnapshot>; there are no child
+stores to coordinate. Durable start requires EverySuperstep. Resume and Fork
+explicitly force EverySuperstep regardless of supplied Core policy. Approval
+Resume requires an explicit latest checkpoint pin and a SequenceApprovalDecision
+whose stage matches the active node. Approve/reject reuse existing ToolRuntime
+semantics. Missing, stale, wrong-type or wrong-stage decisions do no Tool work.
+
+SequenceSnapshotCodec uses `group-agent-prebuilt-agent-sequence-state/1/json`
+and `group-agent-prebuilt-agent-sequence-approval/1/json`; the slash-separated text
+here represents descriptor fields. Existing Agent descriptors and SQLite
+migrations are unchanged. Snapshots contain phase plus canonical first/optional
+second Agent snapshots. They exclude sinks, models, Tools, mapper code and derived
+validated JSON. Decode/restore checks transcript pairing and phase/round structure;
+node guards check active frontier, configured budgets and completed output before
+model/mapper/Tool effects. Completed zero-node recovery also validates results.
+
+The graph identity hashes the application revision and ordered stage IDs, limits,
+approval flags and output contract IDs using the encoding in
+[Stage 23](../specs/023-durable-agent-sequence.md). Bump revision when mapper,
+prompt or Tool semantics change. The digest is configuration identity, not a
+signature of application code or Store content. Mismatch fails before execution
+or branch creation. Fork guards and final conversion can fail after branch
+creation; no rollback is implied.
+
+From a saved first FinalAnswer, Resume may rerun the pure mapper but does not
+rerun the first Agent. Once handoff messages are saved, the mapper is not rerun.
+Saved second approval, Tool results and completed sequence similarly resume their
+own boundary. An external effect before its checkpoint save can remain unknown
+and may repeat; CAS does not grant exclusive execution. Callers coordinate
+concurrent approval attempts. Replay writes no lineage but may re-execute model,
+mapper and Tool work from unfinished checkpoints; it is not effect-free inspection.
+
+
 ## Prebuilt structured result recovery
 
 Prebuilt's optional `structured-output` feature adds

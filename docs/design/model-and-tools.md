@@ -4,6 +4,40 @@ Model defines provider-neutral data and calls. Tool owns execution policy.
 Provider and MCP adapters depend on these layers; the layers do not depend
 back on adapters.
 
+## Experimental two-Agent sequence
+
+Enable Prebuilt `agent-sequence` to construct two `AgentStage` values with separate
+models, ToolRuntime values, AgentConfig limits and required StructuredOutput
+contracts. `AgentSequence::new(revision, first, second, mapper)` compiles once.
+Invoke input initializes only the first stage. The mapper receives its validated
+JSON output and returns the second stage's initial messages. Full transcripts,
+system prompts and Tool results are not forwarded automatically. The mapper must
+be synchronous, bounded and free of external side effects; purity is an
+application contract, not a property Rust can prove.
+
+First-stage MaxRounds stops without handoff. Second-stage MaxRounds stops with no
+final_output. Only the second FinalAnswer yields `SequenceOutcome::final_output`;
+both stage outcomes remain inspectable. A mapper error or invalid message sequence
+prevents the second model call. Construction rejects duplicate/invalid stage IDs,
+unsupported output capability and combined step-bound overflow.
+
+`SequenceStreamEvent::Stage` scopes existing Agent events by stage. Handoff and
+approval notifications are provisional; only the parent's saved Interrupted or
+Completed terminal confirms persistence. Tokens are also provisional until their
+model response passes validation and commits. Existing Tool observers compose.
+Invocation-local sinks are restored, never serialized. Stream drop owns and drops
+the active future; there is no detached stage task. Model token forwarding yields
+cooperatively as in standalone Agent streams. Synchronous observer/mapper code
+must not block and cannot be preempted while executing.
+
+SequenceError preserves graph failures as immediate GraphRunError sources; stage
+attribution identifies the failing saved result or active stage when known. Output
+conversion retains concrete sources and stage identity. Default formatting excludes
+messages, results, mapper source text and approval arguments. Explicit source
+inspection may reveal application data. Dynamic supervisors, parallel workers,
+shared memory and agent-as-tool remain outside this API.
+
+
 ## Optional structured output
 
 With `structured-output`, construct `StructuredOutput::new(name, schema)` and
@@ -245,7 +279,7 @@ Tool side effect with an `AgentApprovalRequest` payload and resumes with a
 single-attempt `AgentApprovalDecision`: approve executes the pending batch,
 while reject commits business-error ToolMessages and the loop continues.
 Provider construction, MCP lifecycle, fallback/retry, rollback, exactly-once,
-structured output, Memory/RAG/PDF/OCR, Multi-Agent, and middleware are not
+Memory/RAG/PDF/OCR, dynamic Multi-Agent scheduling, and middleware are not
 implemented here. Provider adapters, MCP session setup and Tool registration,
 persistence, product prompts/policy, RAG, Memory, and UI remain
 application-owned.

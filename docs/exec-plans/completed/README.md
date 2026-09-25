@@ -16,6 +16,9 @@ code, tests, architecture, or quality documentation.
 
 ## Plans
 
+- [Stage 23 - Durable two-Agent sequence](035-durable-agent-sequence.md) - fixed
+  typed handoff, isolated stage state and shared durable approval recovery.
+
 - [Stage 22 - Structured output](034-structured-output.md) - bounded JSON contracts,
   typed results, native provider mapping and durable recovery.
 

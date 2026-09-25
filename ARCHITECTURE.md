@@ -4,6 +4,22 @@ This document is the source of truth for Group's current repository
 architecture. It describes present contracts, not the order in which they were
 implemented. Code and executable tests take precedence if this document drifts.
 
+## Optional two-Agent sequence
+
+Prebuilt's `agent-sequence` feature enables experimental `AgentSequence`: two
+independently configured AgentStage values, one pure synchronous handoff mapper,
+and one private Core graph. Stage nodes borrow disjoint AgentState values and
+return tagged updates; Runtime alone commits them. One parent thread/lineage owns
+all checkpoints and controls. Stage IDs attribute events and approvals, not
+independent child runs. There is no nested Agent invocation or extra scheduler.
+
+The feature implies `structured-output` and activates existing optional sha2 in
+Prebuilt. Existing single-Agent node paths, graph IDs and codec bytes remain
+unchanged. Sequence snapshots/approval descriptors are new independent version-one
+formats. Application revision plus ordered stage configuration/output identities
+bind recovery. See [Stage 23](docs/specs/023-durable-agent-sequence.md).
+
+
 ## Optional structured output
 
 Model, Genai and Prebuilt expose an opt-in `structured-output` feature. Model
@@ -344,7 +360,7 @@ Applications create provider adapters, own MCP sessions and Tool registration,
 select persistence adapters, and supply product prompts and policy. Local and
 MCP-backed Tools enter the Agent through the same ToolRuntime boundary.
 Provider construction, MCP lifecycle ownership, retry/fallback, Tool
-rollback, exactly-once, structured output, Memory, RAG, PDF/OCR, Multi-Agent,
+rollback, exactly-once, Memory, RAG, PDF/OCR, dynamic Multi-Agent scheduling,
 and middleware are not provided. Repository selection, citation rendering,
 product permissions, UI, and prompt policy remain application-owned.
 

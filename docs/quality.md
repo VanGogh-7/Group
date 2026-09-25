@@ -3,6 +3,26 @@
 This file is the current quality ledger. It records known debt and release
 readiness without turning those items into product stages.
 
+## Stage 23 durable sequence
+
+[Plan 035](exec-plans/completed/035-durable-agent-sequence.md) adds experimental
+opt-in `AgentSequence`: fixed typed handoff between isolated Agent stages on one
+Core graph and lineage. Shared-helper and final implementation reviews returned
+PASS after strengthening restored frontier/budget checks and error attribution.
+Final stable all-feature tests passed 714 tests/doctests. The unified verification
+passed, including Rust 1.88 full tests; subsequently added boundary/codec tests
+also passed on stable and 1.88. Six isolated feature/compiler consumer checks,
+the offline example and seven real process-kill/SQLite recovery scenarios passed.
+
+Existing single-Agent formats/identities and Core/Tool/SQLite/Model/Genai production
+code remain unchanged. Prebuilt adds only an optional existing sha2 edge and
+independent sequence descriptors. No package versions/checksums changed. This is
+local capability validation; hosted CI, live provider integration, publication
+and runtime timing were not run. Mapper purity, semantic revisioning and external
+side-effect coordination remain application responsibilities. Replay can repeat
+effects; Fork validation can fail after branch creation. These results do not
+establish release-candidate or production-readiness status.
+
 ## Stage 22 structured output
 
 [Plan 034](exec-plans/completed/034-structured-output.md) adds opt-in bounded JSON

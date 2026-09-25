@@ -14,6 +14,10 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 No plans are currently active.
 
+[Plan 035 - Stage 23: Durable two-Agent sequence](../completed/035-durable-agent-sequence.md)
+completed fixed sequential composition, typed handoff, scoped streaming and
+approval recovery, with stable/MSRV gates and independent implementation PASS.
+
 [Plan 034 - Stage 22: Structured output](../completed/034-structured-output.md)
 completed typed JSON results, native provider mapping and durable recovery,
 with stable/MSRV verification and independent implementation PASS review.

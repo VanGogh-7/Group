@@ -42,6 +42,16 @@ cargo run -p group-agent-prebuilt --features structured-output --example structu
 See [structured output](docs/specs/022-structured-output.md) for the supported
 schema profile and explicit Genai provider configuration.
 
+For a fixed two-Agent workflow with isolated messages/tools and durable approval,
+enable Prebuilt's experimental `agent-sequence` feature:
+
+```bash
+cargo run -p group-agent-prebuilt --features agent-sequence --example agent_sequence
+```
+
+See [two-Agent composition](docs/specs/023-durable-agent-sequence.md) for handoff,
+revision identity and recovery boundaries.
+
 ## Core capabilities
 
 - strongly typed `GraphState`, Node, and Update boundaries;
