@@ -168,3 +168,32 @@ on a database library.
 
 Related decision:
 [ADR-004](../adr/004-storage-neutral-checkpoints.md).
+
+## Process termination recovery example
+
+The offline Prebuilt integration test is a runnable process-recovery example:
+
+```bash
+cargo test --locked -p group-agent-prebuilt --test process_recovery
+```
+
+It launches a real worker process with a file-backed SQLite store, waits for an
+explicit checkpoint-boundary marker, forcibly terminates and reaps that worker,
+and launches a new process with a new Agent and checkpointer. On Unix it also
+asserts SIGKILL termination. Three scenarios cover:
+
+- a persisted approval interrupt followed by approval and one Tool execution;
+- the same interrupt followed by rejection and zero Tool executions;
+- a persisted Tool result followed by final model work without another Tool
+  execution.
+
+The fixture uses an offline streaming model and a file-backed Tool execution
+journal shared by both processes. The recovery worker checks the restored
+transcript, cumulative rounds, final answer, and completed durable head. Process
+waits are bounded and child guards kill/reap workers on assertion failure.
+
+This demonstrates process termination after known committed boundaries, not
+power-loss recovery or termination during a SQLite transaction. The external
+effect window before the Tool result checkpoint remains: a resumed invocation
+may repeat an effect that happened without a saved result. Applications must
+handle that window; this example does not provide exactly-once execution.

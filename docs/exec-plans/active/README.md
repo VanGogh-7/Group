@@ -14,6 +14,10 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 No active execution plans.
 
+[Plan 033](../completed/033-process-recovery.md) completed process-termination
+recovery verification at persisted approval and saved Tool-result boundaries,
+with full stable/MSRV verification and independent PASS review.
+
 [Plan 032](../completed/032-provider-tool-streaming.md) completed opt-in native
 OpenAI Chat tool streaming and local HTTP-to-durable-approval integration,
 with full stable/MSRV verification and independent PASS review.

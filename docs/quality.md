@@ -79,6 +79,23 @@ Live providers, hosted CI, process-kill recovery, and measured performance were
 not tested. This is not certification of arbitrary OpenAI-compatible endpoints
 or a production-readiness claim.
 
+[Plan 033](exec-plans/completed/033-process-recovery.md) adds offline process
+termination recovery tests using real child processes and file-backed SQLite.
+After a readiness marker confirms the saved boundary, the parent kills/reaps the
+worker (asserting SIGKILL on Unix), then starts a fresh recovery process. Approval,
+rejection, and saved-Tool-result recovery pass; a cross-process execution journal
+proves the saved Tool call is not repeated. Restored result content and identity,
+transcript, rounds, final answer, and completed head are checked. Independent
+read-only review returned PASS after strengthening result assertions.
+`GROUP_VERIFY_OFFLINE=1 ./scripts/verify all` passed on Rust 1.98.1 and 1.88.0:
+664 workspace tests including doctests per compiler, zero failures or ignored
+tests, plus strict Clippy, formatting, all-target checks, and benchmark compilation.
+No production code, public API, dependency, or durable format changed. Evidence
+covers termination after known commits, not power loss, interruption inside a
+transaction, or external-effect exactly-once execution. Hosted CI, live providers,
+and measured performance were not run. The runnable example is documented in
+[Durable Execution Design](design/durable-execution.md#process-termination-recovery-example).
+
 ## Current compiler policy
 
 All eight crates now share Rust 1.88 as the MSRV under

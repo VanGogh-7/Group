@@ -55,3 +55,7 @@ code, tests, architecture, or quality documentation.
 - [032 Reliable provider tool-call streaming](032-provider-tool-streaming.md)
   - added opt-in native OpenAI Chat tool streaming, bounded protocol validation,
     and HTTP-to-SQLite approval recovery with full gates and independent PASS.
+
+- [Plan 033 - Process termination recovery verification](033-process-recovery.md)
+  - verified fresh-process recovery after forced termination at saved approval
+    and Tool-result boundaries, without changing production APIs or formats.
