@@ -4,6 +4,33 @@ Model defines provider-neutral data and calls. Tool owns execution policy.
 Provider and MCP adapters depend on these layers; the layers do not depend
 back on adapters.
 
+## Optional structured output
+
+With `structured-output`, construct `StructuredOutput::new(name, schema)` and
+attach it with `ChatRequest::with_structured_output`. Metadata must explicitly
+advertise `ModelCapabilities::with_structured_output(true)`. Unsupported
+requests fail before dispatch. The facade validates complete responses and
+holds streaming `Finished` until raw stream EOF and successful validation.
+Text deltas are provisional. Invalid output produces one error then permanent
+EOF; dropping the wrapper drops the raw stream. No retry or JSON repair occurs.
+
+The closed `group-json-output/1` profile requires a root object, every property
+required, and `additionalProperties: false` on each object. It admits nested
+objects, arrays, primitive types, nullable types, string enums and descriptions.
+Other keywords, references and composition are rejected. Limits are 64 KiB
+encoded schema, depth 8, 256 properties, 256 enum entries, and 16 KiB combined
+property-name/description/enum-string bytes. Names are 1-64 ASCII alphanumeric,
+underscore or hyphen bytes. Every response round, including Tool commentary,
+is limited to 1 MiB text. Final JSON rejects duplicate keys and depth over 64.
+
+Intermediate ToolCalls responses retain Tool semantics. A final response must
+finish with Stop and satisfy the contract. `ValidatedJsonOutput::deserialize<T>`
+is local Rust extraction with a distinct typed error; it cannot rerun a model
+or Tool. Schema validity does not establish business truth. Error formatting
+hides payloads; explicitly traversing underlying source errors can expose them.
+See [Stage 22](../specs/022-structured-output.md) for exact identity and limits.
+
+
 ## Model domain
 
 `group-agent-model` owns:

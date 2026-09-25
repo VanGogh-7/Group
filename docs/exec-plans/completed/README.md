@@ -16,6 +16,9 @@ code, tests, architecture, or quality documentation.
 
 ## Plans
 
+- [Stage 22 - Structured output](034-structured-output.md) - bounded JSON contracts,
+  typed results, native provider mapping and durable recovery.
+
 - [H-001 Repository Harness Migration](000-repository-harness-migration.md) -
   established the documentation, planning, review, and verification Harness.
 - [H-001.1 Repository Harness Corrections](001-repository-harness-corrections.md)

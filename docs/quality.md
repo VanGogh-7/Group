@@ -3,6 +3,23 @@
 This file is the current quality ledger. It records known debt and release
 readiness without turning those items into product stages.
 
+## Stage 22 structured output
+
+[Plan 034](exec-plans/completed/034-structured-output.md) adds opt-in bounded JSON
+contracts, typed extraction, exact native Genai Chat mapping, and contract-bound
+Prebuilt durable recovery. Independent implementation review returned PASS after
+correcting malformed completed-snapshot handling and two error-source/context
+issues. Full `./scripts/verify all`, final stable all-feature tests (694 passed),
+MSRV checks, 12 isolated consumer feature/compiler checks and the offline example
+passed. Real process-kill/SQLite recovery and loopback HTTP lifecycle tests passed.
+
+Model defaults, Core/Tool/SQLite production code, existing snapshots/codecs and
+plain graph identities are unchanged. Lockfile package versions/checksums are
+unchanged; Model adds optional existing jsonschema/sha2 edges. This feature remains
+experimental. Hosted CI, live provider calls, package publication and runtime
+performance measurement were not run; benchmark compilation is not measurement.
+These local checks do not establish a release candidate SHA or hosted CI status.
+
 ## Current architecture review result
 
 The full repository architecture review found no blocking responsibility

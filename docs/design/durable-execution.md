@@ -3,6 +3,31 @@
 This document describes the current checkpoint, replay, and branch contracts.
 The stable public boundary is storage-neutral; SQLite is one adapter.
 
+## Prebuilt structured result recovery
+
+Prebuilt's optional `structured-output` feature adds
+`ToolCallingAgent::new_with_output(model, tools, config, contract)` and
+`AgentOutcome::structured_output()`. AgentConfig remains Copy. Plain Agents and
+MaxRounds outcomes return no structured result. Valid final responses are
+checked by the Model facade before the model update is committed.
+
+Structured Agents use new graph version identities incorporating SHA-256 of
+compact canonical JSON `["group-json-output/1", name, schema]`, recursively
+sorting object keys while preserving arrays. Schema annotations and contract
+name affect identity. Plain/approval identities and snapshot/codec bytes are
+unchanged. Changed contract or plain-mode recovery fails Core compatibility
+checks before execution or Fork branch creation.
+
+Validated values are transient and absent from snapshots. Completed Resume,
+Replay and Fork revalidate saved final Assistant text; missing final messages
+also fail. Conversion errors directly expose `StructuredOutputError`, while
+runtime failures still expose `GraphRunError`. Conversion occurs after Core
+returns: a Fork may already have created its branch and checkpoint when output
+validation fails. Replay is read-only; a failed conversion cannot roll back a
+prior Core write. The digest prevents configuration drift, not malicious Store
+tampering. No exactly-once execution claim is made.
+
+
 ## Capability split
 
 Durability does not add Clone or Serde bounds to `GraphState`.

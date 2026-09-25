@@ -29,6 +29,12 @@ Prebuilt composes stable Core, Model, and Tool boundaries but does not make its
 private graph topology a public extension point. Its current public API remains
 experimental.
 
+## Optional capabilities
+
+- [Stage 22: Structured output and typed results](specs/022-structured-output.md)
+  ([Plan 034](exec-plans/completed/034-structured-output.md)): implemented bounded JSON schema
+  profile, typed results and recovery contract behind `structured-output`.
+
 ## Adapters
 
 - [Genai Adapter](adapters/genai.md)

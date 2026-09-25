@@ -4,6 +4,20 @@ This document is the source of truth for Group's current repository
 architecture. It describes present contracts, not the order in which they were
 implemented. Code and executable tests take precedence if this document drifts.
 
+## Optional structured output
+
+Model, Genai and Prebuilt expose an opt-in `structured-output` feature. Model
+owns immutable compiled contracts and response validation; it adds optional
+`jsonschema` (without default features) and `sha2` dependencies, and enables
+Model serde. It gains no runtime or transport dependency. Genai and Prebuilt
+forward the feature to Model. Existing default features remain unchanged.
+
+Genai maps contracts through an explicitly configured native OpenAI Chat path.
+Prebuilt attaches the same contract to every model request and derives a new
+graph identity from its canonical digest. Core, Tool, SQLite, snapshots and
+codec identities are unchanged. See the [Stage 22 contract](docs/specs/022-structured-output.md).
+
+
 ## Purpose
 
 Group is a strongly typed, asynchronous state-graph runtime for Rust agents. It

@@ -31,6 +31,17 @@ target. The tag, dependency-ordered crates.io publication and index checks, and
 fresh exact-version consumer verification remain separately authorized. See
 [Quality and Release Status](docs/quality.md).
 
+The optional `structured-output` feature adds bounded JSON contracts and typed
+results across complete, streaming and durable recovery paths. Try the offline
+example:
+
+```bash
+cargo run -p group-agent-prebuilt --features structured-output --example structured_output
+```
+
+See [structured output](docs/specs/022-structured-output.md) for the supported
+schema profile and explicit Genai provider configuration.
+
 ## Core capabilities
 
 - strongly typed `GraphState`, Node, and Update boundaries;

@@ -10,6 +10,30 @@ contract rather than the stage history. The adapter does not change
 `group-agent-core`, the checkpoint contract, or the provider-neutral Model
 crate.
 
+## Optional structured JSON results
+
+Enable `structured-output` in Genai and Model (and Prebuilt when used).
+Construct a stable OpenAI Chat target, select `GenaiStreamingPolicy::OpenAiChat`,
+and advertise `with_structured_output(true)`. Declaring support without that
+native transport is rejected. Responses, dynamic resolvers and audited-text
+streaming do not support this capability.
+
+Structured complete and stream requests use the same native request builder,
+HTTP client, endpoint/auth configuration and generation mapping. They send
+`response_format: {"type":"json_schema","json_schema":{"name":name,"strict":true,"schema":schema}}`
+without rewriting the schema. Conflicting upstream response-format defaults
+are rejected. Ordinary completions retain the existing Genai path. Native
+structured completion bodies are capped at 4 MiB; stream limits remain active.
+Non-null refusal strings (including empty ones) are typed OutputValidation
+failures; malformed refusal fields are Protocol errors. Source chains remain
+available while default error text excludes response payloads.
+
+`[DONE]` closes the logical native stream; validation does not wait for HTTP
+connection EOF. Cancellation/drop closes active transport, and no hidden retry
+or fallback occurs. Local HTTP fixtures validate mapping and lifecycle only;
+live provider support remains unverified and must be explicitly opted into.
+
+
 ## Construction and ownership
 
 The application owns authentication, endpoint resolution, model mapping, and

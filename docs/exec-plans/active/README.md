@@ -12,7 +12,11 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 ## Plans
 
-No active execution plans.
+No plans are currently active.
+
+[Plan 034 - Stage 22: Structured output](../completed/034-structured-output.md)
+completed typed JSON results, native provider mapping and durable recovery,
+with stable/MSRV verification and independent implementation PASS review.
 
 [Plan 033](../completed/033-process-recovery.md) completed process-termination
 recovery verification at persisted approval and saved Tool-result boundaries,
