@@ -93,6 +93,12 @@ impl GenaiChatModelAdapter {
         if metadata.capabilities().parallel_tool_calls() {
             return Err(GenaiAdapterConfigError::ParallelToolCallsUnsupported);
         }
+        #[cfg(feature = "structured-output")]
+        if metadata.capabilities().structured_output() && openai_chat.is_none() {
+            return Err(GenaiAdapterConfigError::UnsupportedOpenAiChatSetting {
+                field: "structured output requires native stable Chat target",
+            });
+        }
         let bound_adapter_kind = client.adapter_kind();
         if config.streaming_policy() == GenaiStreamingPolicy::OpenAiChat && openai_chat.is_none() {
             return Err(GenaiAdapterConfigError::OpenAiChatRequiresStableTarget);
@@ -183,6 +189,23 @@ impl ChatModelAdapter for GenaiChatModelAdapter {
         &self,
         request: ValidatedChatRequest,
     ) -> Result<ChatResponse, ModelError> {
+        #[cfg(feature = "structured-output")]
+        if let Some(output) = request.structured_output().cloned() {
+            let transport = self
+                .openai_chat
+                .as_ref()
+                .expect("capability requires native transport");
+            let target = self
+                .stable_target
+                .as_ref()
+                .expect("native transport has stable target");
+            let mapped = map_request(request, &self.config).map_err(|error| {
+                error.into_model_error(self.metadata.provider(), self.metadata.model())
+            })?;
+            return transport
+                .complete(target, mapped, &output, self.config.clone())
+                .await;
+        }
         let may_produce_tool_call = request_may_produce_tool_call(&request);
         let capture_responses_continuation =
             matches!(self.bound_adapter_kind, Some(AdapterKind::OpenAIResp))
@@ -221,6 +244,8 @@ impl ChatModelAdapter for GenaiChatModelAdapter {
         self.validate_stream_request(&request).map_err(|error| {
             error.into_model_error(self.metadata.provider(), self.metadata.model())
         })?;
+        #[cfg(feature = "structured-output")]
+        let output = request.structured_output().cloned();
         let mapped = map_request(request, &self.config).map_err(|error| {
             error.into_model_error(self.metadata.provider(), self.metadata.model())
         })?;
@@ -230,7 +255,13 @@ impl ChatModelAdapter for GenaiChatModelAdapter {
                     .into_model_error(self.metadata.provider(), self.metadata.model())
             })?;
             return transport
-                .stream(target, mapped, self.config.clone())
+                .stream(
+                    target,
+                    mapped,
+                    self.config.clone(),
+                    #[cfg(feature = "structured-output")]
+                    output.as_ref(),
+                )
                 .map_err(|error| {
                     error.into_model_error(self.metadata.provider(), self.metadata.model())
                 });

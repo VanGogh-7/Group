@@ -23,6 +23,8 @@ struct Call {
 /// Source: https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
 pub(super) struct Decoder {
     config: GenaiAdapterConfig,
+    #[cfg(feature = "structured-output")]
+    structured: bool,
     calls: BTreeMap<u32, Call>,
     ids: BTreeSet<String>,
     argument_bytes: usize,
@@ -35,9 +37,15 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    pub(super) fn new(config: GenaiAdapterConfig, resolved_model: String) -> Self {
+    pub(super) fn new(
+        config: GenaiAdapterConfig,
+        resolved_model: String,
+        #[cfg(feature = "structured-output")] structured: bool,
+    ) -> Self {
         Self {
             config,
+            #[cfg(feature = "structured-output")]
+            structured,
             resolved_model,
             calls: BTreeMap::new(),
             ids: BTreeSet::new(),
@@ -55,6 +63,10 @@ impl Decoder {
             return self.finish();
         }
         let value: Value = serde_json::from_str(data).map_err(GenaiMappingError::OpenAiChatJson)?;
+        self.push_value(value)
+    }
+
+    pub(super) fn push_value(&mut self, value: Value) -> Result<(), GenaiMappingError> {
         let object = value.as_object().ok_or_else(|| invalid("chunk"))?;
         if object.get("error").is_some_and(|e| !e.is_null()) {
             return Err(invalid("provider error"));
@@ -88,6 +100,17 @@ impl Decoder {
                 .ok_or_else(|| invalid("delta"))?;
             if optional_string(delta.get("role"), "role")?.is_some_and(|role| role != "assistant") {
                 return Err(invalid("role"));
+            }
+            #[cfg(feature = "structured-output")]
+            if self.structured
+                && let Some(refusal) = delta.get("refusal").filter(|v| !v.is_null())
+            {
+                if !refusal.is_string() {
+                    return Err(invalid("refusal"));
+                }
+                return Err(GenaiMappingError::StructuredOutput(
+                    group_agent_model::StructuredOutputError::Refused,
+                ));
             }
             // Unsupported content is rejected rather than silently omitted.
             for field in [

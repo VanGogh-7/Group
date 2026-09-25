@@ -20,6 +20,9 @@ group-agent-model = { version = "0.1.0", path = "../group-agent-model" }
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+structured-output = ["group-agent-model/structured-output"]
+
 [dev-dependencies]
 criterion.workspace = true
 sqlx.workspace = true

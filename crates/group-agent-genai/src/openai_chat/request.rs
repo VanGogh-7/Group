@@ -85,6 +85,8 @@ pub(super) fn build(
     target: &ServiceTarget,
     defaults: &ChatOptions,
     mapped: MappedChatRequest,
+    streaming: bool,
+    #[cfg(feature = "structured-output")] output: Option<&group_agent_model::StructuredOutput>,
 ) -> Result<reqwest::RequestBuilder, GenaiMappingError> {
     let request = mapped.request;
     let options = mapped.options;
@@ -155,6 +157,18 @@ pub(super) fn build(
         body["store"] = json!(value);
     }
 
+    body["stream"] = json!(streaming);
+    if !streaming {
+        body.as_object_mut()
+            .expect("request object")
+            .remove("stream_options");
+    }
+    #[cfg(feature = "structured-output")]
+    if let Some(output) = output {
+        body["response_format"] = json!({"type":"json_schema","json_schema":{
+            "name":output.name(),"strict":true,"schema":output.schema()
+        }});
+    }
     let mut builder = match &target.auth {
         AuthData::RequestOverride { headers, .. } => {
             let mut builder = client.post(endpoint.clone());
@@ -172,7 +186,14 @@ pub(super) fn build(
         }
     };
     builder = builder
-        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
         .json(&body);
     Ok(builder)
 }

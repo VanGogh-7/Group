@@ -61,6 +61,9 @@ pub enum GenaiAdapterConfigError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GenaiMappingError {
+    #[cfg(feature = "structured-output")]
+    #[error("structured output rejected")]
+    StructuredOutput(#[source] group_agent_model::StructuredOutputError),
     /// A strict OpenAI Chat frame violates its supported protocol.
     #[error("OpenAI Chat stream protocol violation in `{field}`")]
     InvalidOpenAiChatField {
@@ -287,6 +290,8 @@ impl GenaiMappingError {
 
     fn model_error_kind(&self) -> ModelErrorKind {
         match self {
+            #[cfg(feature = "structured-output")]
+            Self::StructuredOutput(_) => ModelErrorKind::OutputValidation,
             Self::InvalidGroupRequest(_)
             | Self::InvalidExtensionType { .. }
             | Self::UnknownRequestExtension { .. }

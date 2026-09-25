@@ -1,3 +1,5 @@
+#[cfg(feature = "structured-output")]
+mod complete;
 mod decode;
 mod request;
 mod sse;
@@ -52,8 +54,18 @@ impl OpenAiChat {
         target: &ServiceTarget,
         mapped: MappedChatRequest,
         config: GenaiAdapterConfig,
+        #[cfg(feature = "structured-output")] output: Option<&group_agent_model::StructuredOutput>,
     ) -> Result<ChatEventStream, GenaiMappingError> {
-        let request = request::build(&self.client, &self.endpoint, target, &self.defaults, mapped)?;
+        let request = request::build(
+            &self.client,
+            &self.endpoint,
+            target,
+            &self.defaults,
+            mapped,
+            true,
+            #[cfg(feature = "structured-output")]
+            output,
+        )?;
         let state = StreamState {
             request: Some(request),
             response: None,
@@ -62,6 +74,8 @@ impl OpenAiChat {
             decoder: decode::Decoder::new(
                 config.clone(),
                 target.model.model_name.as_str().to_owned(),
+                #[cfg(feature = "structured-output")]
+                output.is_some(),
             ),
             config,
         };
