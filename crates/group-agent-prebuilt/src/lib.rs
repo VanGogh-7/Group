@@ -99,6 +99,7 @@ mod outcome;
 mod snapshot;
 mod state;
 mod stream;
+mod structured_output;
 
 pub use agent::{AgentOutcome, AgentStopReason, ToolCallingAgent};
 pub use approval::{AgentApprovalDecision, AgentApprovalRequest};

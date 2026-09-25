@@ -29,6 +29,7 @@ use crate::state::{AgentState, AgentUpdate};
 use crate::stream::{
     AgentEventSink, AgentEventStream, AgentStreamEvent, ChannelEventSink, YieldNow,
 };
+use crate::structured_output::OutputContract;
 use crate::{
     AgentApprovalDecision, AgentApprovalRequest, AgentBuildError, AgentConfig, AgentError,
 };
@@ -145,6 +146,8 @@ pub enum AgentStopReason {
 /// ```
 #[derive(Clone, PartialEq)]
 pub struct AgentOutcome {
+    #[cfg(feature = "structured-output")]
+    pub(crate) output: Option<group_agent_model::ValidatedJsonOutput>,
     messages: Vec<Message>,
     model_rounds: usize,
     usage_by_round: Vec<Option<TokenUsage>>,
@@ -156,11 +159,19 @@ impl AgentOutcome {
         let (messages, model_rounds, usage_by_round, stop_reason) = state.into_parts();
         let stop_reason = stop_reason.expect("a completed model graph commits a stop reason");
         Self {
+            #[cfg(feature = "structured-output")]
+            output: None,
             messages,
             model_rounds,
             usage_by_round,
             stop_reason,
         }
+    }
+
+    /// Returns locally validated JSON only for a structured final answer.
+    #[cfg(feature = "structured-output")]
+    pub fn structured_output(&self) -> Option<&group_agent_model::ValidatedJsonOutput> {
+        self.output.as_ref()
     }
 
     /// Returns the complete ordered conversation transcript.
@@ -268,6 +279,7 @@ impl fmt::Debug for AgentOutcome {
 /// # }
 /// ```
 pub struct ToolCallingAgent {
+    pub(crate) output: OutputContract,
     pub(crate) graph: Arc<CompiledGraph<AgentState>>,
     pub(crate) run_config: RunConfig,
     #[cfg(test)]
@@ -286,6 +298,42 @@ impl ToolCallingAgent {
         tools: ToolRuntime,
         config: AgentConfig,
     ) -> Result<Self, AgentBuildError> {
+        Self::new_inner(model, tools, config, OutputContract::default())
+    }
+
+    /// Constructs an agent whose final answers must satisfy an output contract.
+    /// Structured checkpoints require this same contract on every restore.
+    #[cfg(feature = "structured-output")]
+    pub fn new_with_output(
+        model: ChatModel,
+        tools: ToolRuntime,
+        config: AgentConfig,
+        output: group_agent_model::StructuredOutput,
+    ) -> Result<Self, AgentBuildError> {
+        if !model.metadata().capabilities().structured_output() {
+            return Err(AgentBuildError::OutputConfiguration(
+                group_agent_model::ModelError::unsupported(
+                    group_agent_model::ModelCapability::StructuredOutput,
+                    model.metadata(),
+                ),
+            ));
+        }
+        Self::new_inner(
+            model,
+            tools,
+            config,
+            OutputContract {
+                value: Some(output),
+            },
+        )
+    }
+
+    fn new_inner(
+        model: ChatModel,
+        tools: ToolRuntime,
+        config: AgentConfig,
+        output: OutputContract,
+    ) -> Result<Self, AgentBuildError> {
         let max_steps = config
             .max_rounds()
             .checked_mul(2)
@@ -298,6 +346,7 @@ impl ToolCallingAgent {
             tools,
             config.max_rounds(),
             config.tool_approval(),
+            output.clone(),
             &compile_probe,
         )?;
         #[cfg(not(test))]
@@ -306,9 +355,11 @@ impl ToolCallingAgent {
             tools,
             config.max_rounds(),
             config.tool_approval(),
+            output.clone(),
             &CoreModelGraphCompiler,
         )?;
         Ok(Self {
+            output,
             graph: Arc::new(graph),
             run_config: RunConfig::new(max_steps),
             #[cfg(test)]
@@ -457,13 +508,16 @@ impl ToolCallingAgent {
         let sink = Arc::new(ChannelEventSink::new(sender));
         let graph = Arc::clone(&self.graph);
         let run_config = self.run_config.clone();
+        let output = self.output.clone();
         let invocation = Box::pin(async move {
             let state = AgentState::new(messages).with_sink(sink.clone());
             let report = graph
                 .invoke_with_control(state, run_config, event_config, run_control)
                 .await
                 .map_err(AgentError::from_graph)?;
-            let outcome = AgentOutcome::from_completed_state(report.into_final_state());
+            let outcome = output.validate(AgentOutcome::from_completed_state(
+                report.into_final_state(),
+            ))?;
             sink.on_event(&AgentStreamEvent::Completed(outcome));
             Ok(())
         });
@@ -486,7 +540,9 @@ impl ToolCallingAgent {
             .invoke_with_control(state, self.run_config.clone(), event_config, run_control)
             .await
             .map_err(AgentError::from_graph)?;
-        let outcome = AgentOutcome::from_completed_state(report.into_final_state());
+        let outcome = self.output.validate(AgentOutcome::from_completed_state(
+            report.into_final_state(),
+        ))?;
         if let Some(ref s) = sink {
             s.on_event(&AgentStreamEvent::Completed(outcome.clone()));
         }
@@ -571,7 +627,7 @@ impl ToolCallingAgent {
             )
             .await
             .map_err(AgentError::from_graph)?;
-        AgentRunOutcome::from_execution(outcome)
+        AgentRunOutcome::from_execution(outcome, &self.output)
     }
 
     /// Experimentally resumes the latest committed checkpoint of one logical
@@ -611,7 +667,7 @@ impl ToolCallingAgent {
             .resume(resume_config)
             .await
             .map_err(AgentError::from_graph)?;
-        AgentRunOutcome::from_execution(outcome)
+        AgentRunOutcome::from_execution(outcome, &self.output)
     }
 
     /// Experimentally re-executes from one exact historical checkpoint without
@@ -647,7 +703,7 @@ impl ToolCallingAgent {
             .replay(replay_config)
             .await
             .map_err(AgentError::from_graph)?;
-        Ok(AgentReplayReport::from_replay(report))
+        AgentReplayReport::from_replay(report, &self.output)
     }
 
     /// Experimentally creates a writable branch from one exact historical
@@ -684,7 +740,7 @@ impl ToolCallingAgent {
             .fork(fork_config)
             .await
             .map_err(AgentError::from_graph)?;
-        AgentForkReport::from_fork(report)
+        AgentForkReport::from_fork(report, &self.output)
     }
 
     #[cfg(test)]
@@ -699,6 +755,7 @@ impl ToolCallingAgent {
 }
 
 struct ModelNode {
+    output: OutputContract,
     model: ChatModel,
     tools: ToolRuntime,
 }
@@ -730,6 +787,7 @@ impl Node<AgentState> for ModelNode {
             let request = ChatRequest::new(state.messages().to_vec())
                 .with_tools(definitions)
                 .with_tool_choice(tool_choice);
+            let request = self.output.request(request);
             let round = state.model_rounds() + 1;
             let (message, usage) = if let Some(sink) = state.sink() {
                 let mut stream = self
@@ -1098,6 +1156,7 @@ fn compile_agent_graph<C: ModelGraphCompiler>(
     tools: ToolRuntime,
     max_rounds: usize,
     tool_approval: bool,
+    output: OutputContract,
     compiler: &C,
 ) -> Result<CompiledGraph<AgentState>, AgentBuildError> {
     let mut graph = StateGraph::new();
@@ -1106,9 +1165,13 @@ fn compile_agent_graph<C: ModelGraphCompiler>(
     } else {
         AGENT_GRAPH_VERSION
     });
+    if let Some(version) = output.version(tool_approval) {
+        graph.set_version(version);
+    }
     graph.add_node(
         MODEL_NODE_ID,
         ModelNode {
+            output,
             model,
             tools: tools.clone(),
         },

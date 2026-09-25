@@ -7,6 +7,7 @@ use group_agent_core::{
 use group_agent_model::AssistantMessage;
 
 use crate::state::AgentState;
+use crate::structured_output::OutputContract;
 use crate::{AgentApprovalRequest, AgentError, AgentOutcome, AgentStopReason};
 
 /// Experimental outcome of one checkpoint-enabled, resumed, or forked Agent
@@ -25,11 +26,12 @@ pub enum AgentRunOutcome {
 impl AgentRunOutcome {
     pub(crate) fn from_execution(
         outcome: ExecutionOutcome<AgentState>,
+        output: &OutputContract,
     ) -> Result<Self, AgentError> {
         match outcome {
-            ExecutionOutcome::Completed(report) => Ok(Self::Completed(
+            ExecutionOutcome::Completed(report) => Ok(Self::Completed(output.validate(
                 AgentOutcome::from_completed_state(report.into_final_state()),
-            )),
+            )?)),
             ExecutionOutcome::Interrupted(report) => {
                 Ok(Self::Interrupted(AgentInterrupted::from_report(&report)))
             }
@@ -174,18 +176,21 @@ pub struct AgentReplayReport {
 }
 
 impl AgentReplayReport {
-    pub(crate) fn from_replay(report: ReplayReport<AgentState>) -> Self {
-        Self {
+    pub(crate) fn from_replay(
+        report: ReplayReport<AgentState>,
+        output: &OutputContract,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
             run_id: report.run_id(),
             source_thread_id: report.source_thread_id().clone(),
             source_checkpoint_id: report.source_checkpoint_id(),
             source_step: report.source_step(),
             source_superstep: report.source_superstep(),
             steps: report.steps(),
-            outcome: AgentRunOutcome::Completed(AgentOutcome::from_completed_state(
-                report.into_final_state(),
-            )),
-        }
+            outcome: AgentRunOutcome::Completed(output.validate(
+                AgentOutcome::from_completed_state(report.into_final_state()),
+            )?),
+        })
     }
 
     /// Returns the invocation identifier assigned to the replay.
@@ -259,13 +264,16 @@ pub struct AgentForkReport {
 }
 
 impl AgentForkReport {
-    pub(crate) fn from_fork(report: ForkReport<AgentState>) -> Result<Self, AgentError> {
+    pub(crate) fn from_fork(
+        report: ForkReport<AgentState>,
+        output: &OutputContract,
+    ) -> Result<Self, AgentError> {
         Ok(Self {
             branch_id: report.branch_id(),
             source_thread_id: report.source_thread_id().clone(),
             source_checkpoint_id: report.source_checkpoint_id(),
             run_id: report.run_id(),
-            outcome: AgentRunOutcome::from_execution(report.into_outcome())?,
+            outcome: AgentRunOutcome::from_execution(report.into_outcome(), output)?,
         })
     }
 

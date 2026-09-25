@@ -18,6 +18,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
+[features]
+structured-output = ["group-agent-model/structured-output"]
+
 [dev-dependencies]
 async-trait.workspace = true
 criterion.workspace = true
@@ -31,3 +34,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[example]]
+name = "structured_output"
+required-features = ["structured-output"]

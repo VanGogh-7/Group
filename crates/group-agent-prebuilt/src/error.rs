@@ -11,6 +11,9 @@ use group_agent_tool::ToolBatchReport;
 /// source chain.
 #[non_exhaustive]
 pub enum AgentBuildError {
+    /// The model does not support the requested output contract.
+    #[cfg(feature = "structured-output")]
+    OutputConfiguration(group_agent_model::ModelError),
     /// Registering the private model graph failed.
     GraphBuild(GraphBuildError),
     /// Compiling the private model graph failed.
@@ -20,6 +23,10 @@ pub enum AgentBuildError {
 impl fmt::Display for AgentBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "structured-output")]
+            Self::OutputConfiguration(_) => {
+                formatter.write_str("agent output configuration failed")
+            }
             Self::GraphBuild(_) => formatter.write_str("agent graph construction failed"),
             Self::GraphCompile(_) => formatter.write_str("agent graph compilation failed"),
         }
@@ -29,6 +36,8 @@ impl fmt::Display for AgentBuildError {
 impl fmt::Debug for AgentBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let phase = match self {
+            #[cfg(feature = "structured-output")]
+            Self::OutputConfiguration(_) => "output",
             Self::GraphBuild(_) => "build",
             Self::GraphCompile(_) => "compile",
         };
@@ -43,6 +52,8 @@ impl fmt::Debug for AgentBuildError {
 impl StdError for AgentBuildError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            #[cfg(feature = "structured-output")]
+            Self::OutputConfiguration(source) => Some(source),
             Self::GraphBuild(source) => Some(source),
             Self::GraphCompile(source) => Some(source),
         }
@@ -122,6 +133,8 @@ pub struct AgentError {
 
 /// Private immediate-source classification for [`AgentError`].
 enum AgentErrorSource {
+    #[cfg(feature = "structured-output")]
+    Output(group_agent_model::StructuredOutputError),
     Graph(GraphRunError),
     UnknownOutcome(UnknownExecutionOutcome),
 }
@@ -140,6 +153,12 @@ impl fmt::Display for UnknownExecutionOutcome {
 impl StdError for UnknownExecutionOutcome {}
 
 impl AgentError {
+    #[cfg(feature = "structured-output")]
+    pub(crate) fn from_output(source: group_agent_model::StructuredOutputError) -> Self {
+        Self {
+            source: AgentErrorSource::Output(source),
+        }
+    }
     pub(crate) const fn from_graph(source: GraphRunError) -> Self {
         Self {
             source: AgentErrorSource::Graph(source),
@@ -194,6 +213,8 @@ impl fmt::Debug for AgentError {
 impl StdError for AgentError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match &self.source {
+            #[cfg(feature = "structured-output")]
+            AgentErrorSource::Output(source) => Some(source),
             AgentErrorSource::Graph(source) => Some(source),
             AgentErrorSource::UnknownOutcome(source) => Some(source),
         }

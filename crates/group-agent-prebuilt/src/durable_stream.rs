@@ -47,6 +47,7 @@ impl ToolCallingAgent {
         let sink = Arc::new(ChannelEventSink::new(sender));
         let graph = Arc::clone(&self.graph);
         let run_config = self.run_config.clone();
+        let output = self.output.clone();
         let invocation = Box::pin(async move {
             let execution = graph
                 .invoke_with_checkpoint(
@@ -58,7 +59,10 @@ impl ToolCallingAgent {
                 )
                 .await
                 .map_err(AgentError::from_graph)?;
-            dispatch_outcome(AgentRunOutcome::from_execution(execution)?, sink.as_ref());
+            dispatch_outcome(
+                AgentRunOutcome::from_execution(execution, &output)?,
+                sink.as_ref(),
+            );
             Ok(())
         });
         AgentEventStream::new(receiver, invocation)
@@ -121,7 +125,7 @@ impl ToolCallingAgent {
             )
             .await
             .map_err(AgentError::from_graph)?;
-        let outcome = AgentRunOutcome::from_execution(execution)?;
+        let outcome = AgentRunOutcome::from_execution(execution, &self.output)?;
         dispatch_outcome_ref(&outcome, sink.as_ref());
         Ok(outcome)
     }
@@ -138,6 +142,7 @@ impl ToolCallingAgent {
         let sink = Arc::new(ChannelEventSink::new(sender));
         let graph = Arc::clone(&self.graph);
         let resume_config = self.streaming_resume_config(resume_config);
+        let output = self.output.clone();
         let invocation = Box::pin(async move {
             let execution = graph
                 .resume_with_state_initializer(resume_config, |state| {
@@ -146,7 +151,10 @@ impl ToolCallingAgent {
                 })
                 .await
                 .map_err(AgentError::from_graph)?;
-            dispatch_outcome(AgentRunOutcome::from_execution(execution)?, sink.as_ref());
+            dispatch_outcome(
+                AgentRunOutcome::from_execution(execution, &output)?,
+                sink.as_ref(),
+            );
             Ok(())
         });
         AgentEventStream::new(receiver, invocation)
@@ -177,7 +185,7 @@ impl ToolCallingAgent {
             })
             .await
             .map_err(AgentError::from_graph)?;
-        let outcome = AgentRunOutcome::from_execution(execution)?;
+        let outcome = AgentRunOutcome::from_execution(execution, &self.output)?;
         dispatch_outcome_ref(&outcome, sink.as_ref());
         Ok(outcome)
     }
