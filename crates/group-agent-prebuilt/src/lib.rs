@@ -91,6 +91,7 @@
 //! ```
 
 mod agent;
+mod agent_nodes;
 mod approval;
 mod codec;
 mod durable_stream;
