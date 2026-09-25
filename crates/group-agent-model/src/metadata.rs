@@ -88,6 +88,9 @@ string_id!(
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ModelCapability {
+    /// Native structured output with facade validation.
+    #[cfg(feature = "structured-output")]
+    StructuredOutput,
     /// Incremental response streaming.
     Streaming,
     /// Tool definitions and tool calls.
@@ -101,6 +104,8 @@ pub enum ModelCapability {
 /// Provider-neutral capabilities declared by a model implementation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ModelCapabilities {
+    #[cfg(feature = "structured-output")]
+    structured_output: bool,
     streaming: bool,
     tool_calling: bool,
     parallel_tool_calls: bool,
@@ -112,11 +117,24 @@ impl ModelCapabilities {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            #[cfg(feature = "structured-output")]
+            structured_output: false,
             streaming: false,
             tool_calling: false,
             parallel_tool_calls: false,
             usage_reporting: false,
         }
+    }
+
+    /// Declares native structured output support.
+    #[cfg(feature = "structured-output")]
+    pub const fn with_structured_output(mut self, supported: bool) -> Self {
+        self.structured_output = supported;
+        self
+    }
+    #[cfg(feature = "structured-output")]
+    pub const fn structured_output(self) -> bool {
+        self.structured_output
     }
 
     /// Enables or disables streaming.
@@ -151,6 +169,8 @@ impl ModelCapabilities {
     #[must_use]
     pub const fn supports(self, capability: ModelCapability) -> bool {
         match capability {
+            #[cfg(feature = "structured-output")]
+            ModelCapability::StructuredOutput => self.structured_output,
             ModelCapability::Streaming => self.streaming,
             ModelCapability::ToolCalling => self.tool_calling,
             ModelCapability::ParallelToolCalls => self.parallel_tool_calls,

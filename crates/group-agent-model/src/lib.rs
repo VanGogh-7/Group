@@ -62,3 +62,11 @@ pub use stream::{
     ChatStreamCollector, ChatStreamEvent, StreamProtocolError, ToolCallDelta, collect_chat_stream,
 };
 pub use tool::{ToolCall, ToolCallId, ToolChoice, ToolDefinition, ToolName, ToolResult};
+
+#[cfg(feature = "structured-output")]
+mod structured_output;
+#[cfg(feature = "structured-output")]
+pub use structured_output::{
+    OutputDecodeError, OutputSchemaError, StructuredOutput, StructuredOutputError,
+    ValidatedJsonOutput,
+};

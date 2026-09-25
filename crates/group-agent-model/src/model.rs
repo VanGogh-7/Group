@@ -183,6 +183,12 @@ impl ValidatedChatRequest {
         &self.request
     }
 
+    /// Returns the admitted output contract.
+    #[cfg(feature = "structured-output")]
+    pub fn structured_output(&self) -> Option<&crate::StructuredOutput> {
+        self.request.structured_output()
+    }
+
     /// Returns ordered conversation messages.
     #[must_use]
     pub fn messages(&self) -> &[Message] {
@@ -273,9 +279,19 @@ impl ChatModel {
     /// either boundary prevents raw adapter dispatch.
     pub async fn complete(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
         self.validate_common(&request)?;
-        self.adapter
+        #[cfg(feature = "structured-output")]
+        let output = request.structured_output().cloned();
+        let response = self
+            .adapter
             .complete_raw(ValidatedChatRequest::from_validated(request))
-            .await
+            .await?;
+        #[cfg(feature = "structured-output")]
+        if let Some(output) = output {
+            output
+                .validate_response(&response)
+                .map_err(crate::StructuredOutputError::into_model_error)?;
+        }
+        Ok(response)
     }
 
     /// Validates and starts one incremental response.
@@ -287,14 +303,26 @@ impl ChatModel {
     pub async fn stream(&self, request: ChatRequest) -> Result<ChatEventStream, ModelError> {
         self.validate_common(&request)?;
         self.require_capability(ModelCapability::Streaming)?;
-        self.adapter
+        #[cfg(feature = "structured-output")]
+        let output = request.structured_output().cloned();
+        let stream = self
+            .adapter
             .stream_raw(ValidatedChatRequest::from_validated(request))
-            .await
+            .await?;
+        #[cfg(feature = "structured-output")]
+        if let Some(output) = output {
+            return Ok(crate::structured_output::stream::validate(stream, output));
+        }
+        Ok(stream)
     }
 
     fn validate_common(&self, request: &ChatRequest) -> Result<(), ModelError> {
         request.validate().map_err(ModelError::invalid_request)?;
 
+        #[cfg(feature = "structured-output")]
+        if request.structured_output().is_some() {
+            self.require_capability(ModelCapability::StructuredOutput)?;
+        }
         let parallel = request.generation().parallel_tool_calls() == Some(true);
         let has_tool_history = request.messages().iter().any(|message| {
             message

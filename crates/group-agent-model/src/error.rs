@@ -10,6 +10,9 @@ type BoxedError = Box<dyn StdError + Send + Sync + 'static>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ModelErrorKind {
+    /// A structured response violated its output contract.
+    #[cfg(feature = "structured-output")]
+    OutputValidation,
     /// Provider-neutral request validation failed.
     InvalidRequest,
     /// The request or operation requires an undeclared capability.
@@ -201,6 +204,8 @@ impl ModelError {
 
 const fn default_retryability(kind: &ModelErrorKind) -> Retryability {
     match kind {
+        #[cfg(feature = "structured-output")]
+        ModelErrorKind::OutputValidation => Retryability::Never,
         ModelErrorKind::RateLimited
         | ModelErrorKind::ProviderUnavailable
         | ModelErrorKind::Timeout => Retryability::Retryable,

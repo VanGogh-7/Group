@@ -15,9 +15,12 @@ futures-core.workspace = true
 futures-util.workspace = true
 serde = { workspace = true, optional = true }
 serde_json.workspace = true
+jsonschema = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [features]
+structured-output = ["serde", "dep:jsonschema", "dep:sha2"]
 serde = ["dep:serde"]
 
 [dev-dependencies]

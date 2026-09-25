@@ -152,6 +152,8 @@ impl fmt::Debug for GenerationConfig {
 /// A complete provider-neutral chat request.
 #[derive(Clone, PartialEq)]
 pub struct ChatRequest {
+    #[cfg(feature = "structured-output")]
+    output: Option<crate::StructuredOutput>,
     messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
     tool_choice: ToolChoice,
@@ -164,12 +166,26 @@ impl ChatRequest {
     #[must_use]
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
+            #[cfg(feature = "structured-output")]
+            output: None,
             messages,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             generation: GenerationConfig::default(),
             extensions: Extensions::new(),
         }
+    }
+
+    /// Requests native structured output with local response validation.
+    #[cfg(feature = "structured-output")]
+    pub fn with_structured_output(mut self, output: crate::StructuredOutput) -> Self {
+        self.output = Some(output);
+        self
+    }
+    /// Returns the immutable output contract, if requested.
+    #[cfg(feature = "structured-output")]
+    pub fn structured_output(&self) -> Option<&crate::StructuredOutput> {
+        self.output.as_ref()
     }
 
     /// Sets declared tools.
