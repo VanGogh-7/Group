@@ -1096,6 +1096,7 @@ dependencies = [
  "group-agent-tool",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
 ]

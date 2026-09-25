@@ -293,3 +293,8 @@ mod tests {
 
 #[cfg(test)]
 mod agent_tests;
+
+#[cfg(feature = "agent-sequence")]
+mod sequence;
+#[cfg(feature = "agent-sequence")]
+pub use sequence::*;
