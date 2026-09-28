@@ -298,3 +298,8 @@ mod agent_tests;
 mod sequence;
 #[cfg(feature = "agent-sequence")]
 pub use sequence::*;
+
+#[cfg(feature = "agent-branch")]
+mod branch;
+#[cfg(feature = "agent-branch")]
+pub use branch::*;

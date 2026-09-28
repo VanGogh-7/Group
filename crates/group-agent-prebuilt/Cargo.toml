@@ -20,6 +20,7 @@ sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [features]
+agent-branch = ["agent-sequence"]
 agent-sequence = ["structured-output", "dep:sha2"]
 structured-output = ["group-agent-model/structured-output"]
 
@@ -44,3 +45,7 @@ required-features = ["structured-output"]
 [[example]]
 name = "agent_sequence"
 required-features = ["agent-sequence"]
+
+[[example]]
+name = "agent_branch"
+required-features = ["agent-branch"]
