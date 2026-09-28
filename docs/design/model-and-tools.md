@@ -4,6 +4,29 @@ Model defines provider-neutral data and calls. Tool owns execution policy.
 Provider and MCP adapters depend on these layers; the layers do not depend
 back on adapters.
 
+## Experimental conditional Agent branching
+
+`AgentBranch::new(revision, first, b, c, selector)` compiles one fixed conditional
+workflow behind `agent-branch` (which enables `agent-sequence`). AgentStage inputs
+retain their existing types and constructors. BranchSelector consumes validated
+A output and returns BranchSelection::B(messages), C(messages), or Complete.
+Messages are admitted before the selection Update; no transcript is implicitly
+forwarded. The unselected stage performs no model or Tool calls.
+
+BranchOutcome::selected distinguishes B, C, Complete and None (A MaxRounds).
+Complete exposes A's validated result; B/C exposes the selected stage's result;
+any MaxRounds has no final output. Match the target before deserializing different
+application-owned output types. A exhaustion never invokes the selector.
+
+Branch events tag stages and emit one parent terminal. Selection and approval
+proposals are provisional; successful checkpointed terminal reports confirm
+persistence. Streams and invocation-local sinks use existing control and observer
+semantics, with no detached stage tasks. Event channels remain unbounded.
+Selector error sources remain reachable; unwinding selector panics become
+SelectorPanicked without retaining the payload. The application's panic hook
+still runs and abort builds cannot recover. Bounded synchronous callbacks cannot
+be preempted mid-call. See [Stage 24](../specs/024-durable-agent-branching.md).
+
 ## Experimental two-Agent sequence
 
 Enable Prebuilt `agent-sequence` to construct two `AgentStage` values with separate

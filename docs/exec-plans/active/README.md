@@ -14,6 +14,11 @@ finished, mark the Plan Completed and move it to `../completed/`.
 
 No plans are currently active.
 
+[Plan 036 - Stage 24: Durable conditional Agent branching](../completed/036-durable-agent-branching.md)
+completed fixed B/C/direct-completion selection, durable approval and streaming
+recovery, with stable/MSRV gates, independent review PASS and user acceptance.
+See the [Agent Workflow Roadmap](../../roadmap.md) for later candidates.
+
 [Plan 035 - Stage 23: Durable two-Agent sequence](../completed/035-durable-agent-sequence.md)
 completed fixed sequential composition, typed handoff, scoped streaming and
 approval recovery, with stable/MSRV gates and independent implementation PASS.

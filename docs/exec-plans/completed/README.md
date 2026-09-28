@@ -16,6 +16,9 @@ code, tests, architecture, or quality documentation.
 
 ## Plans
 
+- [Stage 24 - Durable conditional Agent branching](036-durable-agent-branching.md) -
+  fixed B/C/direct completion, saved selection and scoped approval/stream recovery.
+
 - [Stage 23 - Durable two-Agent sequence](035-durable-agent-sequence.md) - fixed
   typed handoff, isolated stage state and shared durable approval recovery.
 

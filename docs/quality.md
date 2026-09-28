@@ -3,6 +3,41 @@
 This file is the current quality ledger. It records known debt and release
 readiness without turning those items into product stages.
 
+## Stage 24 conditional branching
+
+[Plan 036](exec-plans/completed/036-durable-agent-branching.md) implements experimental
+`agent-branch`: a validated A result selects fixed B, C or direct completion.
+Checkpointed runs persist selection before downstream effects; saved selection
+recovery does not repeat A or the selector. Existing Agent/Sequence formats and
+Core/Model/Tool/SQLite production code remain unchanged. No new package or lockfile
+change; the feature deliberately implies `agent-sequence` for existing AgentStage.
+
+Unified verification passed, including Rust 1.88 all-feature tests, and a separate
+stable workspace all-feature run passed: 742 tests/doctests per compiler with
+zero failures or ignored tests. Public coverage includes 16 marker-driven real
+process kill/reap scenarios, branch identity/codec and corruption checks, saved
+selection and approval recovery, source classification, stream/sink and controls.
+Independent standalone Branch consumers passed on stable and Rust 1.88. Final
+review disposition and feature-isolation evidence are recorded in Plan 036.
+
+Per-node guards prevent unselected execution but cannot preflight a forged mixed
+frontier atomically: a valid selected node may call externally before another
+node fails. This is directly characterized in tests. Selector unwind panic
+conversion does not control the application panic hook or abort builds. Pure
+bounded selectors, revision bumps, external effect coordination and trusted
+checkpoint storage remain application duties. No live providers, hosted CI,
+publication, power-loss/exactly-once or measured performance claim. The user accepted Stage 24 on 2026-09-28; Plan 036 is completed.
+
+### Existing codec diagnostic debt
+
+Source inspection during Stage 24 review found that SequenceSnapshotCodec still
+attaches serde_json errors directly to CheckpointCodecError, whose derived Debug
+can expose malformed input in source formatting. This older codec is outside
+Plan 036's compatibility-preserving Branch implementation; it was not changed
+and no independent old-code reproduction was run. Track a bounded follow-up for
+payload-safe direct codec diagnostics. The new Branch codec wraps those sources
+safely and has a direct regression test retaining concrete source reachability.
+
 ## Stage 23 durable sequence
 
 [Plan 035](exec-plans/completed/035-durable-agent-sequence.md) adds experimental

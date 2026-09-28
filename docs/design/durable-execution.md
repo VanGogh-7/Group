@@ -3,6 +3,32 @@
 This document describes the current checkpoint, replay, and branch contracts.
 The stable public boundary is storage-neutral; SQLite is one adapter.
 
+## Conditional Agent branch durability
+
+AgentBranch persists a closed B/C/Complete selection and only the selected
+conversation in one parent lineage. A-final saved before selection may rerun the
+pure selector; after selection saves, recovery never reruns A or the selector.
+Direct Complete recovers with zero external calls. Approval and saved Tool-result
+boundaries preserve the active stage and exact ToolMessage identity/content.
+
+BranchSnapshotCodec uses `group-agent-prebuilt-agent-branch-state/1/json` and
+`group-agent-prebuilt-agent-branch-approval/1/json`. Existing Agent/Sequence bytes,
+identities and SQLite migrations are unchanged. The identity hashes revision and
+ordered A/B/C IDs, limits, approval flags and output contracts, including the
+unselected stage. Application semantic changes require a revision bump.
+
+Start requires EverySuperstep; Resume/Fork force it. BranchApprovalDecision must
+match the saved stage and latest checkpoint pin. Resume is latest-only; Replay
+writes no lineage but may repeat effects; Fork may create a branch before semantic
+validation fails. CAS is not execution locking and no exactly-once guarantee exists.
+
+Restore and per-node guards reject phase, selection, budget and output mismatch.
+They do not perform whole-frontier preflight: a forged multi-node frontier can
+invoke a valid selected node before an invalid sibling fails, although unselected
+nodes perform no work. Tests characterize this limit directly. Models/Tools,
+selectors and sinks are absent from snapshots; Resume restores transient sinks.
+See [Stage 24](../specs/024-durable-agent-branching.md) for formats and failure matrix.
+
 ## Two-Agent sequence durability
 
 AgentSequence uses one parent Checkpointer<SequenceSnapshot>; there are no child

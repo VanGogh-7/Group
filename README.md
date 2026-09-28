@@ -52,6 +52,18 @@ cargo run -p group-agent-prebuilt --features agent-sequence --example agent_sequ
 See [two-Agent composition](docs/specs/023-durable-agent-sequence.md) for handoff,
 revision identity and recovery boundaries.
 
+For a fixed conditional workflow, `agent-branch` adds `AgentBranch`: A selects
+B, C or direct completion. Checkpointed runs save the selection before
+downstream execution.
+
+```bash
+cargo run -p group-agent-prebuilt --features agent-branch --example agent_branch
+```
+
+See [conditional branching](docs/specs/024-durable-agent-branching.md) for typed
+results, approval, identity and recovery limits. The feature also enables
+`agent-sequence`; all composition APIs remain experimental.
+
 ## Core capabilities
 
 - strongly typed `GraphState`, Node, and Update boundaries;

@@ -4,6 +4,21 @@ This document is the source of truth for Group's current repository
 architecture. It describes present contracts, not the order in which they were
 implemented. Code and executable tests take precedence if this document drifts.
 
+## Optional conditional Agent branching
+
+Prebuilt `agent-branch` enables experimental AgentBranch with fixed A/B/C stages.
+A pure synchronous selector returns B messages, C messages, or Complete; Runtime
+commits that choice before a read-only router selects the next node. Durable
+execution saves every super-step before downstream effects. Only A and the
+selected downstream hold transcripts; Core owns the single graph and lineage.
+
+The feature implies `agent-sequence` to reuse unchanged AgentStage types and
+private Model/Tool operations. Branch state, approval descriptor and graph
+identity are independent. Existing Agent/Sequence formats and Core APIs remain
+unchanged. Per-node restore guards prevent unselected work but do not provide
+whole-frontier preflight against a forged multi-node checkpoint. See
+[Stage 24](docs/specs/024-durable-agent-branching.md).
+
 ## Optional two-Agent sequence
 
 Prebuilt's `agent-sequence` feature enables experimental `AgentSequence`: two

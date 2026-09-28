@@ -58,6 +58,11 @@ log and do not duplicate every historical correction.
 
 ## Execution Plans
 
+- [Agent Workflow Roadmap](roadmap.md): proposed branching, bounded feedback and
+  fixed parallel join; Stage 24 implementation in Plan 036.
+- [Stage 24 contract](specs/024-durable-agent-branching.md): fixed durable
+  conditional branching; locally verified, independently reviewed and accepted.
+
 - [Execution Plan Guide](exec-plans/README.md)
 - [Execution Plan Template](exec-plans/TEMPLATE.md)
 - [Active Plans](exec-plans/active/README.md)
