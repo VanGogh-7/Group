@@ -355,9 +355,15 @@ Group does not currently provide:
 Unsupported provider or MCP content fails closed rather than being silently
 dropped.
 
-Prebuilt does not provide streaming Replay/Fork, provider client
-construction, MCP lifecycle ownership, retry/fallback, Tool rollback,
-exactly-once, structured output, Multi-Agent, or middleware.
+Prebuilt supports opt-in structured output and fixed Agent composition through
+experimental `agent-sequence` (A-to-B) and `agent-branch` (A selects B, C or direct
+completion). It does not provide arbitrary or dynamically scheduled Multi-Agent
+workflows, bounded Writer/Reviewer feedback loops, or a prebuilt parallel Agent
+join. These exclusions do not limit Core's graph loops or parallel super-steps.
+
+Prebuilt does not provide streaming Replay/Fork, provider client construction,
+MCP lifecycle ownership, retry/fallback, Tool rollback, exactly-once, or
+middleware.
 
 ## MSRV
 
